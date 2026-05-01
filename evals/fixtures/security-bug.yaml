@@ -1,0 +1,89 @@
+id: security-bug
+name: "Security bug — SQL injection in changed file"
+description: >-
+  A high-severity security-category finding on a TypeScript source file. The
+  provider emits one finding inside a touched hunk; the publisher posts it as
+  an inline comment under summary-plus-inline. Exercises comment_usefulness
+  and publication_cap_behavior.
+
+config_overrides:
+  mode: summary-plus-inline
+  thresholds:
+    severity_floor:
+      inline: medium
+    confidence_floor:
+      inline: 0.7
+  comment_cap:
+    per_pr: 5
+    per_file: 1
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 42
+    head:
+      sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+octokit_responses:
+  pulls_get:
+    number: 42
+    head:
+      sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      ref: feature/security-bug
+    base:
+      sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      ref: main
+  pulls_list_files:
+    - filename: src/db/queries.ts
+      status: modified
+      additions: 3
+      deletions: 1
+      patch: |
+        @@ -1,3 +1,4 @@
+         export function getUser(id) {
+        -  return db.query("SELECT * FROM users WHERE id=" + id);
+        +  return db.query(`SELECT * FROM users WHERE id=${id}`);
+         }
+
+provider_script:
+  - kind: output
+    output:
+      findings:
+        - path: src/db/queries.ts
+          line: 2
+          severity: high
+          category: security
+          message: "Possible SQL injection via string concatenation in security-sensitive query"
+          rationale: "User-controlled id flows into a SQL string without parameterisation; switch to a parameterised query."
+          confidence: 0.92
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 1
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 1
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: ["security"]
+    expected_categories: ["security"]
+    rejection_reasons: []
+
+metrics:
+  - comment_usefulness
+  - publication_cap_behavior

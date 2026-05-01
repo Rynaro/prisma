@@ -1,0 +1,71 @@
+id: harmless-refactor
+name: "Harmless rename refactor"
+description: >-
+  A semantically-neutral identifier rename. The provider correctly emits no
+  findings; the validator and publisher therefore have nothing to act on. The
+  scenario guards against false-positive emission on benign diffs.
+
+config_overrides:
+  mode: summary-plus-inline
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 45
+    head:
+      sha: "1111111111111111111111111111111111111111"
+
+octokit_responses:
+  pulls_get:
+    number: 45
+    head:
+      sha: "1111111111111111111111111111111111111111"
+      ref: feature/harmless-refactor
+    base:
+      sha: "2222222222222222222222222222222222222222"
+      ref: main
+  pulls_list_files:
+    - filename: src/util/format.ts
+      status: modified
+      additions: 1
+      deletions: 1
+      patch: |
+        @@ -1,3 +1,3 @@
+        -export const fmt = (s) => s.trim();
+        +export const formatString = (s) => s.trim();
+         export const upper = (s) => s.toUpperCase();
+
+provider_script:
+  - kind: output
+    output:
+      findings: []
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: []
+    rejection_reasons: []
+
+metrics:
+  - false_positive_rate

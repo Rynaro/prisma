@@ -1,0 +1,33 @@
+{
+  "name": "@prisma-bot/github-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "dev:app": "tsx watch src/main.ts",
+    "dev:worker": "tsx watch src/worker.ts",
+    "start:app": "tsx src/main.ts",
+    "start:worker": "tsx src/worker.ts"
+  },
+  "dependencies": {
+    "@prisma-bot/config": "workspace:*",
+    "@prisma-bot/core": "workspace:*",
+    "@prisma-bot/github": "workspace:*",
+    "@prisma-bot/provider-anthropic": "workspace:*",
+    "@prisma-bot/provider-fake": "workspace:*",
+    "@prisma-bot/shared": "workspace:*",
+    "bullmq": "5.34.10",
+    "fastify": "5.2.0",
+    "ioredis": "5.4.2",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "tsx": "4.19.2"
+  }
+}

@@ -1,0 +1,103 @@
+id: duplicate-issue-across-hunks
+name: "Two findings share a dedupe_key"
+description: >-
+  One source file with two hunks that both express the same logical issue.
+  The provider returns two findings sharing the same canonicalised message
+  and path, so the validator computes identical `dedupe_key` values for
+  both. The publisher's planner collapses the duplicate within-run; one
+  survives as an inline comment, one lands in the dropped bucket with
+  reason_code `dedupe_collapsed`.
+
+config_overrides:
+  mode: summary-plus-inline
+  thresholds:
+    severity_floor:
+      inline: medium
+    confidence_floor:
+      inline: 0.7
+  comment_cap:
+    per_pr: 5
+    per_file: 1
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 49
+    head:
+      sha: "9999999999999999999999999999999999999999"
+
+octokit_responses:
+  pulls_get:
+    number: 49
+    head:
+      sha: "9999999999999999999999999999999999999999"
+      ref: feature/duplicate-issue
+    base:
+      sha: "0000000000000000000000000000000000000000"
+      ref: main
+  pulls_list_files:
+    - filename: src/lib/parse.ts
+      status: modified
+      additions: 4
+      deletions: 0
+      patch: |
+        @@ -1,3 +1,5 @@
+         function parseHeader(s) {
+        +  // duplicated logic — first occurrence
+        +  return JSON.parse(s);
+         }
+
+        @@ -10,3 +12,5 @@
+         function parseFooter(s) {
+        +  // duplicated logic — second occurrence
+        +  return JSON.parse(s);
+         }
+
+provider_script:
+  - kind: output
+    output:
+      findings:
+        - path: src/lib/parse.ts
+          line: 2
+          severity: medium
+          category: correctness
+          message: "Unhandled JSON.parse error path; wrap in a try/catch and surface a typed error"
+          rationale: "JSON.parse throws on invalid input; the unhandled exception will crash the request handler."
+          confidence: 0.82
+        - path: src/lib/parse.ts
+          line: 13
+          severity: medium
+          category: correctness
+          message: "Unhandled JSON.parse error path; wrap in a try/catch and surface a typed error"
+          rationale: "Same defensive-coding gap as the parseHeader path; both call sites need the wrapper."
+          confidence: 0.78
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 2
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 1
+    summary_count: 0
+    dropped_count: 1
+    publication_state: succeeded
+    summary_contains: ["dedupe_collapsed"]
+    expected_categories: ["correctness"]
+    rejection_reasons: ["dedupe_collapsed"]
+
+metrics:
+  - duplicate_suppression

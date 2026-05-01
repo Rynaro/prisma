@@ -1,0 +1,81 @@
+id: malformed-provider-output
+name: "Provider returns invalid JSON shape"
+description: >-
+  The provider raises a `schema_validation` ProviderError to simulate a
+  malformed `ProviderReviewOutput`. The orchestrator catches the throwable,
+  records a validator-stage `provider_output_zod_failed` rejection, and
+  publishes a summary-only Checks run with no findings. The job state is
+  `succeeded` per `docs/publication-policy.md` § Malformed (drop with audit
+  log; do not mark failed_terminal). Per the spec's APIVR note: the
+  FakeProvider validates outputs through ProviderReviewOutputSchema before
+  returning, so a literal malformed YAML payload would crash the fake at
+  scenario load. We instead use a `kind: error` step with `kind:
+  schema_validation` to drive the orchestrator's
+  `provider.error.schema_validation` branch.
+
+config_overrides:
+  mode: summary-plus-inline
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 48
+    head:
+      sha: "7777777777777777777777777777777777777777"
+
+octokit_responses:
+  pulls_get:
+    number: 48
+    head:
+      sha: "7777777777777777777777777777777777777777"
+      ref: feature/malformed
+    base:
+      sha: "8888888888888888888888888888888888888888"
+      ref: main
+  pulls_list_files:
+    - filename: src/lib/runner.ts
+      status: modified
+      additions: 2
+      deletions: 0
+      patch: |
+        @@ -1,2 +1,4 @@
+         export function run() {
+        +  console.log('starting');
+        +  return 42;
+         }
+
+provider_script:
+  - kind: error
+    error:
+      kind: schema_validation
+      message: "ProviderReviewOutput failed Zod validation"
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 0
+    rejection_reasons: ["provider_output_zod_failed"]
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: []
+    rejection_reasons: []
+
+metrics:
+  - provider_schema_failure_handling

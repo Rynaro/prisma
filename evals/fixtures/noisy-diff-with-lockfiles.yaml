@@ -1,0 +1,96 @@
+id: noisy-diff-with-lockfiles
+name: "Source code plus package-lock.json"
+description: >-
+  The PR touches a TypeScript source file and a regenerated package-lock.json.
+  The prefilter excludes the lockfile (with reason `lockfile`, per the
+  unconditional lockfile policy in packages/core/src/prefilter) and forwards
+  only the source file to the provider. Exercises the selective-skip arm of
+  large_diff_degradation and false_positive_rate (no spurious lockfile
+  finding is produced).
+
+config_overrides:
+  mode: summary-plus-inline
+  exclude_generated: true
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 47
+    head:
+      sha: "5555555555555555555555555555555555555555"
+
+octokit_responses:
+  pulls_get:
+    number: 47
+    head:
+      sha: "5555555555555555555555555555555555555555"
+      ref: feature/noisy-diff
+    base:
+      sha: "6666666666666666666666666666666666666666"
+      ref: main
+  pulls_list_files:
+    - filename: package-lock.json
+      status: modified
+      additions: 4
+      deletions: 2
+      patch: |
+        @@ -10,6 +10,8 @@
+           "dependencies": {
+        -    "left-pad": "1.3.0"
+        +    "left-pad": "1.3.0",
+        +    "right-pad": "1.0.0"
+           }
+    - filename: src/api/users.ts
+      status: modified
+      additions: 2
+      deletions: 1
+      patch: |
+        @@ -1,3 +1,4 @@
+         export async function getUser(id) {
+        -  return await db.findUser(id);
+        +  return await db.findUserById(id);
+        +  // logged via call site
+         }
+
+provider_script:
+  - kind: output
+    output:
+      findings:
+        - path: src/api/users.ts
+          line: 2
+          severity: medium
+          category: correctness
+          message: "Method rename may break callers across the repository"
+          rationale: "The findUser to findUserById rename is unguarded; verify all call sites are updated to avoid runtime breakage."
+          confidence: 0.75
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: ["package-lock.json"]
+    skipped_reasons: ["lockfile"]
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 1
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 1
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: ["correctness"]
+    rejection_reasons: []
+
+metrics:
+  - false_positive_rate
+  - large_diff_degradation

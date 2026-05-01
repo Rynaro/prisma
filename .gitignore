@@ -1,0 +1,20 @@
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+.turbo/
+.pnpm-store/
+.env
+.env.local
+.env.*.local
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea/
+.vscode/
+evals/last-report.md
+
+# Per-developer tool state (not project assets)
+.claude/
+.eidolons/

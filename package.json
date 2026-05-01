@@ -1,0 +1,26 @@
+{
+  "name": "@prisma-bot/root",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Vendor-independent AI code review bot for GitHub pull requests (workspace root).",
+  "engines": {
+    "node": ">=22 <23",
+    "pnpm": ">=9 <10"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "typecheck": "pnpm -r --parallel run typecheck",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@types/node": "22.10.5",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2",
+    "vitest": "2.1.8"
+  }
+}

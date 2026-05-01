@@ -1,0 +1,37 @@
+scenarios:
+  - id: security-bug
+    name: "Security bug — SQL injection in changed file"
+    fixture: fixtures/security-bug.yaml
+    tags: ["security", "publication_cap_behavior", "comment_usefulness"]
+  - id: missing-tests
+    name: "Missing tests for new public function"
+    fixture: fixtures/missing-tests.yaml
+    tags: ["tests", "comment_usefulness", "confidence_threshold_behavior"]
+  - id: risky-migration
+    name: "Risky DB migration without rollback"
+    fixture: fixtures/risky-migration.yaml
+    tags: ["migration", "comment_usefulness", "publication_cap_behavior"]
+  - id: harmless-refactor
+    name: "Harmless rename refactor"
+    fixture: fixtures/harmless-refactor.yaml
+    tags: ["false_positive_rate"]
+  - id: generated-files
+    name: "Diff is only generated files"
+    fixture: fixtures/generated-files.yaml
+    tags: ["large_diff_degradation"]
+  - id: noisy-diff-with-lockfiles
+    name: "Source code plus package-lock.json"
+    fixture: fixtures/noisy-diff-with-lockfiles.yaml
+    tags: ["false_positive_rate", "large_diff_degradation"]
+  - id: malformed-provider-output
+    name: "Provider returns invalid JSON shape"
+    fixture: fixtures/malformed-provider-output.yaml
+    tags: ["provider_schema_failure_handling"]
+  - id: duplicate-issue-across-hunks
+    name: "Two findings share a dedupe_key"
+    fixture: fixtures/duplicate-issue-across-hunks.yaml
+    tags: ["duplicate_suppression"]
+  - id: oversized-pr
+    name: "PR exceeds max_files"
+    fixture: fixtures/oversized-pr.yaml
+    tags: ["large_diff_degradation"]

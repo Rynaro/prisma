@@ -1,0 +1,66 @@
+id: oversized-pr
+name: "PR exceeds max_files"
+description: >-
+  The PR contains 6 changed files, one above the configured max_files cap
+  (5). The prefilter short-circuits with reason `too_many_files`; the
+  orchestrator publishes summary-only output regardless of the configured
+  `summary-plus-inline` mode (per docs/publication-policy.md § Diff too
+  large) and the provider is never called. Exercises the oversized arm of
+  large_diff_degradation. The 6-file changed-file payload lives in
+  `oversized-pr/files.json` (referenced via `from_file`).
+
+config_overrides:
+  mode: summary-plus-inline
+  max_files: 5
+  max_changed_lines: 200
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 99
+    head:
+      sha: "ababababababababababababababababababababab"
+
+octokit_responses:
+  pulls_get:
+    number: 99
+    head:
+      sha: "ababababababababababababababababababababab"
+      ref: feature/oversized-pr
+    base:
+      sha: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      ref: main
+  pulls_list_files:
+    from_file: oversized-pr/files.json
+
+provider_script: []
+
+expectations:
+  prefilter:
+    outcome: oversized
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 0
+  provider:
+    calls: 0
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: []
+    rejection_reasons: []
+
+metrics:
+  - large_diff_degradation

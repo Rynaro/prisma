@@ -1,0 +1,71 @@
+id: generated-files
+name: "Diff is only generated files"
+description: >-
+  The PR touches only built artefacts under dist/. The prefilter excludes them
+  via the built-in generated-file detection; the orchestrator therefore skips
+  the provider entirely and the publisher emits a "no analyzable files"
+  summary. Exercises the prefilter's exclusion arm of large_diff_degradation.
+
+config_overrides:
+  mode: summary-plus-inline
+  exclude_generated: true
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 46
+    head:
+      sha: "3333333333333333333333333333333333333333"
+
+octokit_responses:
+  pulls_get:
+    number: 46
+    head:
+      sha: "3333333333333333333333333333333333333333"
+      ref: feature/generated-files
+    base:
+      sha: "4444444444444444444444444444444444444444"
+      ref: main
+  pulls_list_files:
+    - filename: dist/bundle.js
+      status: modified
+      additions: 2
+      deletions: 1
+      patch: |
+        @@ -1,3 +1,4 @@
+         var a=1;
+        -var b=2;
+        +var b=3;
+        +var c=4;
+
+provider_script: []
+
+expectations:
+  prefilter:
+    outcome: all-excluded
+    skipped_paths: ["dist/bundle.js"]
+    skipped_reasons: ["generated"]
+    files_sent_to_provider: 0
+  provider:
+    calls: 0
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: []
+    rejection_reasons: []
+
+metrics:
+  - large_diff_degradation

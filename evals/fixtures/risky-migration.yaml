@@ -1,0 +1,87 @@
+id: risky-migration
+name: "Risky DB migration without rollback"
+description: >-
+  A high-severity migration-category finding on a destructive ALTER TABLE
+  without a rollback. The finding clears all floors and is published inline
+  under summary-plus-inline. Exercises comment_usefulness and
+  publication_cap_behavior.
+
+config_overrides:
+  mode: summary-plus-inline
+  thresholds:
+    severity_floor:
+      inline: medium
+    confidence_floor:
+      inline: 0.7
+  comment_cap:
+    per_pr: 5
+    per_file: 1
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+  pull_request:
+    number: 44
+    head:
+      sha: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+
+octokit_responses:
+  pulls_get:
+    number: 44
+    head:
+      sha: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+      ref: feature/risky-migration
+    base:
+      sha: ffffffffffffffffffffffffffffffffffffffff
+      ref: main
+  pulls_list_files:
+    - filename: migrations/20260501_drop_column.sql
+      status: added
+      additions: 2
+      deletions: 0
+      patch: |
+        @@ -0,0 +1,2 @@
+        +ALTER TABLE users DROP COLUMN legacy_token;
+        +-- no rollback statement provided
+
+provider_script:
+  - kind: output
+    output:
+      findings:
+        - path: migrations/20260501_drop_column.sql
+          line: 1
+          severity: high
+          category: migration
+          message: "Destructive migration without a rollback: dropping legacy_token from users is irreversible without a backup"
+          rationale: "The migration removes a column without a guarded rollback; production data loss risk if the deployment fails after this statement."
+          confidence: 0.85
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 1
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 1
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: ["migration"]
+    expected_categories: ["migration"]
+    rejection_reasons: []
+
+metrics:
+  - comment_usefulness
+  - publication_cap_behavior
