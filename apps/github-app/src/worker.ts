@@ -5,6 +5,7 @@ import {
   envSecretSource,
 } from '@prisma-bot/github';
 import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/provider-anthropic';
+import { CopilotProvider, type CopilotProviderOptions } from '@prisma-bot/provider-copilot';
 import { FakeProvider } from '@prisma-bot/provider-fake';
 import {
   type JobPayload,
@@ -22,15 +23,23 @@ import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
  * provider, the installation-auth, and the orchestrator, then runs the
  * consumer until SIGTERM.
  *
- * Provider selection (MVP):
- *   - If `ANTHROPIC_API_KEY` is set → `AnthropicProvider` with
- *     `maxTokensPerCall = MAX_TOKENS_PER_PR / 2` (a soft cost-ceiling proxy
- *     per `docs/operational-runbooks.md` § Numeric tunables).
- *   - Otherwise → `FakeProvider` with an empty script — the dev stack
- *     boots without secrets, but every actual job will exhaust the script
- *     and fail terminal. This is the correct dev affordance: a worker
- *     that boots and logs `worker.started` but cannot service real work
- *     until the operator configures the API key.
+ * Provider selection (deterministic, in precedence order):
+ *   1. If `ANTHROPIC_API_KEY` is set → `AnthropicProvider` (OQ-1 reference
+ *      adapter; preserves existing behavior).
+ *   2. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (GitHub Models
+ *      inference endpoint; per `.spectra/plans/copilot-vendor/spec.yaml`).
+ *      Honors optional `COPILOT_MODEL` and `COPILOT_BASE_URL` overrides.
+ *   3. Otherwise → `FakeProvider` with an empty script — the dev stack
+ *      boots without secrets, but every actual job will exhaust the script
+ *      and fail terminal. This is the correct dev affordance: a worker
+ *      that boots and logs `worker.started` but cannot service real work
+ *      until the operator configures one of the API keys.
+ *
+ * Both real adapters use `maxTokensPerCall = MAX_TOKENS_PER_PR / 2` (a soft
+ * cost-ceiling proxy per `docs/operational-runbooks.md` § Numeric tunables).
+ * If both `ANTHROPIC_API_KEY` and `COPILOT_API_KEY` are set, Anthropic wins;
+ * the operator must explicitly unset it to switch vendors. The chosen vendor
+ * is observable via the `worker.provider.selected` log event.
  *
  * Tunables come from env per `docs/operational-runbooks.md`. The
  * `BullMqJobConsumer` is constructed with `consumerTunablesFromEnv()`
@@ -65,23 +74,41 @@ const tryGetSecret = async (
 };
 
 /**
- * Build the `Provider` instance per the MVP selection rule. When the
- * Anthropic key is missing the worker still boots with a no-script
+ * Build the `Provider` instance per the documented selection rule. When no
+ * vendor key is present the worker still boots with a no-script
  * `FakeProvider`; this is documented above.
  */
 const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
-  const apiKey = await tryGetSecret(secretSource, 'ANTHROPIC_API_KEY');
-  if (apiKey !== undefined) {
+  const anthropicKey = await tryGetSecret(secretSource, 'ANTHROPIC_API_KEY');
+  if (anthropicKey !== undefined) {
     const opts: AnthropicProviderOptions = {
-      apiKey,
+      apiKey: anthropicKey,
       maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
     };
     log('worker.provider.selected', { provider: 'anthropic' });
     return new AnthropicProvider(opts);
   }
+  const copilotKey = await tryGetSecret(secretSource, 'COPILOT_API_KEY');
+  if (copilotKey !== undefined) {
+    const opts: CopilotProviderOptions = {
+      apiKey: copilotKey,
+      maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
+    };
+    const model = await tryGetSecret(secretSource, 'COPILOT_MODEL');
+    if (model !== undefined) {
+      opts.model = model;
+    }
+    const baseUrl = await tryGetSecret(secretSource, 'COPILOT_BASE_URL');
+    if (baseUrl !== undefined) {
+      opts.baseUrl = baseUrl;
+    }
+    log('worker.provider.selected', { provider: 'copilot' });
+    return new CopilotProvider(opts);
+  }
   log('worker.provider.selected', {
     provider: 'fake',
-    reason: 'ANTHROPIC_API_KEY not set; using FakeProvider with empty script',
+    reason:
+      'no vendor API key set (ANTHROPIC_API_KEY, COPILOT_API_KEY); using FakeProvider with empty script',
   });
   return new FakeProvider({ script: [] });
 };

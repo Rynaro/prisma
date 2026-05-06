@@ -19,6 +19,7 @@
     "@prisma-bot/core": "workspace:*",
     "@prisma-bot/github": "workspace:*",
     "@prisma-bot/provider-anthropic": "workspace:*",
+    "@prisma-bot/provider-copilot": "workspace:*",
     "@prisma-bot/provider-fake": "workspace:*",
     "@prisma-bot/shared": "workspace:*",
     "bullmq": "5.34.10",

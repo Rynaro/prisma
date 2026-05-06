@@ -52,6 +52,7 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `GITHUB_APP_PRIVATE_KEY` | The GitHub App private key (PEM contents or path), used by `packages/github/installation-auth` to mint installation tokens. Read via `SecretSource`. Never echoed to logs. | `secret` |
 | `GITHUB_APP_WEBHOOK_SECRET` | The HMAC secret used by `apps/github-app/webhook-ingress` to verify `X-Hub-Signature-256` on inbound webhooks. Read via `SecretSource`. Never echoed to logs. | `secret` |
 | `ANTHROPIC_API_KEY` | The Anthropic Claude provider API key consumed by the adapter at `packages/providers/anthropic` (per OQ-1). The variable name is provider-specific because the adapter is provider-specific; downstream code only sees a `SecretSource.getSecret(...)` call. Read via `SecretSource`. Never echoed to logs. | `secret` |
+| `COPILOT_API_KEY` | The GitHub Copilot provider API key (a GitHub PAT with `models:read` scope, or a runtime-resolved App installation token) consumed by the adapter at `packages/providers/copilot` (per ADR-004). Selected only when `ANTHROPIC_API_KEY` is unset; see `apps/github-app/src/worker.ts` for precedence. Read via `SecretSource`. Never echoed to logs. | `secret` |
 
 ### Config
 
@@ -65,6 +66,8 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector URL (per `observability.md` § Resolution of OQ-3 (recap) and § Sampling). When unset, telemetry export is disabled but the App still functions. | `config` |
 | `LOG_LEVEL` | Default log verbosity for `packages/shared/audit-log`; one of `debug`, `info`, `warn`, `error`. | `config` |
 | `INSTALLATION_REPLAY_WINDOW_SECONDS` | The replay-protection window for `X-GitHub-Delivery` per installation (per `system-design.md` § Queue and async model § Replay protection). Duplicate deliveries within the window short-circuit to `discarded_idempotent`. | `config` |
+| `COPILOT_MODEL` | Optional override for the Copilot adapter's default model (defaults to `gpt-4o`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
+| `COPILOT_BASE_URL` | Optional override for the Copilot adapter's inference endpoint (defaults to `https://models.github.ai/inference`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 
 ### Tunables
 
@@ -76,7 +79,7 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `RETRY_TRANSIENT_BACKOFF_BASE_MS` | Initial backoff for transient retries (jittered). | `tunable` |
 | `RETRY_TRANSIENT_BACKOFF_MAX_MS` | Cap on backoff growth for transient retries. | `tunable` |
 | `RETRY_RATELIMIT_MAX_ATTEMPTS` | Maximum attempts for the **Rate-limited** retry class (`ProviderError.rate_limit`); honors `Retry-After` when provided. | `tunable` |
-| `MAX_TOKENS_PER_PR` | Per-PR token-cost ceiling proxy enforced by `packages/providers/anthropic`. | `tunable` |
+| `MAX_TOKENS_PER_PR` | Per-PR token-cost ceiling proxy enforced by the active provider adapter (`packages/providers/anthropic` or `packages/providers/copilot`). | `tunable` |
 | `MAX_TOKENS_PER_WINDOW_PER_INSTALLATION` | Per-installation token-cost ceiling proxy over a sliding window. | `tunable` |
 | `MAX_TOKENS_WINDOW_SECONDS` | Length of the sliding window for `MAX_TOKENS_PER_WINDOW_PER_INSTALLATION`. | `tunable` |
 | `OTEL_TRACES_SAMPLER_ARG` | Head-sample argument for the parent-based sampler (per `observability.md` § Sampling); a number in `[0,1]`. | `tunable` |
@@ -101,7 +104,7 @@ The App exposes three HTTP `GET` health surfaces. All return `200` on success; f
 ### Readiness
 
 - **Path.** `/healthz/ready`.
-- **Behavior.** Returns `200` only if the process has completed bootstrap: configuration loaded, `SecretSource` reachable for the keys this process will need (`GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_WEBHOOK_SECRET`, `ANTHROPIC_API_KEY`), and the `JobQueue` client is connected to Redis (`REDIS_URL`). Returns `503` until bootstrap completes.
+- **Behavior.** Returns `200` only if the process has completed bootstrap: configuration loaded, `SecretSource` reachable for the keys this process will need (`GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_WEBHOOK_SECRET`, and exactly one of `ANTHROPIC_API_KEY` / `COPILOT_API_KEY`), and the `JobQueue` client is connected to Redis (`REDIS_URL`). Returns `503` until bootstrap completes.
 
 ### Dependency check
 
@@ -116,7 +119,10 @@ The block below is the `.env.example` shipped with the App. Placeholder values o
 # secrets (read via SecretSource; env is the MVP implementation)
 GITHUB_APP_PRIVATE_KEY=
 GITHUB_APP_WEBHOOK_SECRET=
+# Provider selection by precedence: ANTHROPIC_API_KEY first, then COPILOT_API_KEY.
+# Set exactly one for production-equivalent behavior.
 ANTHROPIC_API_KEY=
+COPILOT_API_KEY=
 
 # config
 PORT=3000
@@ -127,6 +133,9 @@ OTEL_SERVICE_NAME=prisma-review-bot
 OTEL_EXPORTER_OTLP_ENDPOINT=
 LOG_LEVEL=info
 INSTALLATION_REPLAY_WINDOW_SECONDS=300
+# Optional Copilot overrides; consumed only when COPILOT_API_KEY is set.
+COPILOT_MODEL=
+COPILOT_BASE_URL=
 
 # tunables (starting values; see operational-runbooks.md § Numeric tunables)
 QUEUE_CONCURRENCY=4

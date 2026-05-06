@@ -36,12 +36,13 @@ ADR anchors:
 
 | package | purpose | system-design.md anchor |
 | --- | --- | --- |
-| `apps/github-app` | Fastify ingress and BullMQ worker entry points; owns process bootstrap, health surfaces, and queue wiring. | [`docs/system-design.md#appsgithub-appwebhook-ingress`](docs/system-design.md#appsgithub-appwebhook-ingress) |
+| `apps/github-app` | Fastify ingress and BullMQ worker entry points; owns process bootstrap, provider selection, health surfaces, and queue wiring. | [`docs/system-design.md#appsgithub-appwebhook-ingress`](docs/system-design.md#appsgithub-appwebhook-ingress) |
 | `packages/shared` | Canonical schemas (`ProviderReviewInput`, `ProviderReviewOutput`, `NormalizedFinding`, `RankedFindings`, `PublicationResult`, `RepoConfig`, `JobPayload`), audit-log surface, and the emission-time redactor. | [`docs/system-design.md#packagessharedaudit-log`](docs/system-design.md#packagessharedaudit-log) |
 | `packages/config` | Repo-local `.github/review-bot.yml` resolver and parser; owns `loadRepoConfig` and the `RepoConfigSchema` resolution rules. | [`docs/system-design.md#packagesconfigconfig-loader`](docs/system-design.md#packagesconfigconfig-loader) |
 | `packages/core` | Deterministic pipeline modules: snapshotter, prefilter, validator, and ranker. | [`docs/system-design.md#packagescoresnapshotter`](docs/system-design.md#packagescoresnapshotter) |
 | `packages/github` | GitHub-side adapters: installation-auth, Checks API, review comments, Installations API. | [`docs/system-design.md#packagesgithubinstallation-auth`](docs/system-design.md#packagesgithubinstallation-auth) |
-| `packages/providers/anthropic` | Anthropic Claude reference adapter (per OQ-1); the only production-ready provider implementation. | [`docs/system-design.md#packagesprovidersanthropic`](docs/system-design.md#packagesprovidersanthropic) |
+| `packages/providers/anthropic` | Anthropic Claude reference adapter (per OQ-1); production-ready. | [`docs/system-design.md#packagesprovidersanthropic`](docs/system-design.md#packagesprovidersanthropic) |
+| `packages/providers/copilot` | GitHub Copilot adapter (per ADR-004) targeting the GitHub Models inference endpoint over an OpenAI-compatible chat-completions surface. | [`docs/architecture-decision-records/adr-004-copilot-provider.md`](docs/architecture-decision-records/adr-004-copilot-provider.md) |
 | `packages/providers/fake` | Deterministic in-process `FakeProvider` used by Phase 6 evaluation and unit tests. | [`docs/system-design.md#packagesproviders-provider-abstraction-surface`](docs/system-design.md#packagesproviders-provider-abstraction-surface) |
 | `evals/runner` | Phase 6 deterministic evaluation harness (`@prisma-bot/eval-runner`); owns the scenario loader and the PASS/FAIL gate. | [`evals/README.md`](evals/README.md) |
 
@@ -142,6 +143,7 @@ The full set of variables consumed by the App. Names, classifications, and descr
 | `GITHUB_APP_PRIVATE_KEY` | secret | The GitHub App private key (PEM contents or path), used by `packages/github/installation-auth` to mint installation tokens. Read via `SecretSource`. Never echoed to logs. |
 | `GITHUB_APP_WEBHOOK_SECRET` | secret | The HMAC secret used by `apps/github-app/webhook-ingress` to verify `X-Hub-Signature-256` on inbound webhooks. Read via `SecretSource`. Never echoed to logs. |
 | `ANTHROPIC_API_KEY` | secret | The Anthropic Claude provider API key consumed by `packages/providers/anthropic` (per OQ-1). Read via `SecretSource`. Never echoed to logs. |
+| `COPILOT_API_KEY` | secret | The GitHub Copilot provider API key (PAT with `models:read` scope, or App installation token) consumed by `packages/providers/copilot` (per ADR-004). Selected only when `ANTHROPIC_API_KEY` is unset. Read via `SecretSource`. Never echoed to logs. |
 
 **Config**
 
@@ -157,6 +159,8 @@ The full set of variables consumed by the App. Names, classifications, and descr
 | `INSTALLATION_REPLAY_WINDOW_SECONDS` | config | Replay-protection window for `X-GitHub-Delivery` per installation. Duplicate deliveries within the window short-circuit to `discarded_idempotent`. |
 | `NODE_ENV` | config | Standard Node.js environment marker (`development`, `production`, `test`). |
 | `APP_HOST_PORT` | config | Docker-compose host-port override consumed by `docker-compose.yml`; not read by application code. Default `3030`. |
+| `COPILOT_MODEL` | config | Optional Copilot adapter model override. Default `gpt-4o`. Consumed only when `COPILOT_API_KEY` is set. |
+| `COPILOT_BASE_URL` | config | Optional Copilot adapter inference-endpoint override. Default `https://models.github.ai/inference`. Consumed only when `COPILOT_API_KEY` is set. |
 
 **Tunables**
 
@@ -190,7 +194,7 @@ Runs the Phase 6 deterministic evaluation harness across 9 scenarios. The harnes
 ## Known limitations
 
 - Single-tenant MVP; multitenant boundaries are namespaced by `installation_id` (per `docs/system-design.md` § Multitenancy posture) but are not validated under load. Concurrency, fairness, and isolation across many installations are out of scope until the App moves to hosted multi-tenant operation.
-- Anthropic Claude is the only provider implemented (per OQ-1); the `Provider` abstraction is in place but only `AnthropicProvider` (production) and `FakeProvider` (tests, evals) exist.
+- Two production adapters ship: Anthropic Claude (per OQ-1) and GitHub Copilot via the GitHub Models inference endpoint (per ADR-004). Worker selection is by env-var precedence (`ANTHROPIC_API_KEY` → `COPILOT_API_KEY` → `FakeProvider` boot stub); both adapters satisfy the same `Provider` interface, so downstream pipeline stages do not branch.
 - No live-API integration tests; all GitHub and Anthropic calls in tests use hand-rolled fakes (`OctokitLike`, `FakeProvider`). Phase 6 evaluation is deterministic and offline.
 - Cost-ceiling enforcement uses a `character/4` token proxy (per OQ-4); precise tokenization is post-MVP.
 - Inline-comment dedupe across runs is correct in unit tests but unproven against real GitHub API quirks (per `docs/publication-policy.md` § Dedupe behavior).
