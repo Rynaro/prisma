@@ -1,4 +1,4 @@
-.PHONY: help install typecheck lint lint-fix format test test-watch eval eval-scenario up down logs ps shell clean replay-webhook smoke
+.PHONY: help install typecheck lint lint-fix format test test-watch eval eval-scenario up down logs ps shell clean replay-webhook smoke check-vendor-isolation
 
 HOST_UID := $(shell id -u)
 HOST_GID := $(shell id -g)
@@ -14,8 +14,9 @@ help:
 	@echo ""
 	@echo "  make install      Install workspace dependencies (creates pnpm-lock.yaml)"
 	@echo "  make typecheck    Run TypeScript typecheck across all workspaces"
-	@echo "  make lint         Lint with Biome"
+	@echo "  make lint         Lint with Biome (also runs check-vendor-isolation)"
 	@echo "  make lint-fix     Auto-fix lint issues"
+	@echo "  make check-vendor-isolation  Enforce ADR-002 vendor-SDK isolation"
 	@echo "  make format       Format code with Biome"
 	@echo "  make test         Run Vitest test suite"
 	@echo "  make test-watch   Run Vitest in watch mode (Ctrl-C to exit)"
@@ -39,11 +40,18 @@ install:
 typecheck:
 	$(TOOLS) pnpm typecheck
 
-lint:
+lint: check-vendor-isolation
 	$(TOOLS) pnpm lint
 
 lint-fix:
 	$(TOOLS) pnpm lint:fix
+
+# ADR-002 mechanical enforcement — vendor SDKs and the network primitive
+# (fetch) are confined to each adapter's client.ts. Runs on the host shell
+# (plain bash + grep) so it doesn't pay container startup cost; the
+# rule set lives in scripts/check-vendor-isolation.sh.
+check-vendor-isolation:
+	@bash scripts/check-vendor-isolation.sh
 
 format:
 	$(TOOLS) pnpm format

@@ -72,4 +72,4 @@ Rejected: tool-call envelopes diverge (`{ type: 'function', function: { … } }`
 
 - A future change that introduces a third real adapter is the trigger to evaluate prompt-extraction (OQ-Copilot-3 reversal).
 - A future Azure OpenAI integration may be modeled as a `COPILOT_BASE_URL` deployment variant or as a new ADR if it materially diverges from the OpenAI-compatible contract.
-- Lint enforcement of "no vendor SDK / network primitive outside the adapter" remains a `[GAP]` (per ATLAS scout report `.atlas/copilot-vendor/scout-report.md` §8); should be addressed in a separate hardening ADR.
+- Mechanical enforcement of "no vendor SDK / network primitive outside the adapter" is wired via `scripts/check-vendor-isolation.sh` and chained into `make lint` (see Makefile target `check-vendor-isolation`). Three rules are asserted today: `@anthropic-ai/sdk` confined to `packages/providers/anthropic/src/client.ts`; `@octokit/*` confined to `packages/github/src/installation-auth/`; `fetch(` calls under `packages/providers/` confined to `*/src/client.ts`. Adding a fourth adapter is one additional `check_rule` invocation in that script.
