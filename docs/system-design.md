@@ -50,7 +50,7 @@ The App is a single Fastify webhook ingress plus one or more BullMQ workers back
 
 - **Responsibility.** Implement `Provider` against the Anthropic Claude wire (per OQ-1).
 - **Owns-which-schemas.** An internal Anthropic-specific request/response shape, private to this package.
-- **Depends-on.** `SecretSource` for the provider API key, the Anthropic SDK (verify against current vendor docs in Phase 4).
+- **Depends-on.** `SecretSource` for the provider API key, the Anthropic SDK. ADR-002's "no vendor SDK outside the adapter" rule is enforced by `scripts/check-vendor-isolation.sh`.
 - **Public surface.** A factory function returning a `Provider`.
 - **Invariants.** No Anthropic SDK type, response shape, or error class crosses the package boundary. `ProviderReviewOutput` is Zod-validated at the adapter boundary; on Zod failure the adapter throws `ProviderError` with variant `schema_validation`.
 
