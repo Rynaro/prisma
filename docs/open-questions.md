@@ -60,6 +60,24 @@ Entry shape: `ID`, `Question`, `Raised in`, `Blocking?`, `Owner`, `Target phase`
 
 ## Resolution log
 
+### OQ-Copilot-1/2/3 — GitHub Copilot adapter surface, calling discipline, prompt strategy
+
+- **IDs.** OQ-Copilot-1, OQ-Copilot-2, OQ-Copilot-3.
+- **Questions.**
+  1. Which "GitHub Copilot" surface does the adapter target — Copilot Chat for individuals, Azure OpenAI via Copilot Enterprise, or the GitHub Models inference endpoint?
+  2. Should the adapter use native function-calling (OpenAI tool-call) or JSON-mode + post-validation?
+  3. Should `buildPrompt` be extracted across adapters or remain per-adapter?
+- **Raised in.** `.atlas/copilot-vendor/scout-report.md` § 9; `.spectra/plans/copilot-vendor/spec.md` § CLARIFY.
+- **Blocking?** Yes — at least for the second-vendor introduction itself; the adapter cannot ship without each answer pinned.
+- **Owner.** TBD.
+- **Target phase.** Phase 7 (post-MVP vendor expansion).
+- **Resolution date.** 2026-05-06.
+- **Resolution.**
+  1. **Surface — GitHub Models API.** Adapter targets `https://models.github.ai/inference/chat/completions`; auth is `Bearer <token>` where the token is a GitHub PAT (`models:read`) or a runtime-resolved App installation token. Recorded in ADR-004.
+  2. **Calling discipline — native function-calling.** Adapter declares one tool `submit_review_findings` and parses the model's tool-call `arguments` (a JSON-encoded string per OpenAI-compatible spec) before validating against `ProviderReviewOutputSchema`. Capabilities advertise `function_calling: true`.
+  3. **Prompt strategy — per-adapter.** Each adapter owns its own `prompt.ts`. The user-message renderer is byte-identical between adapters; the tool envelope diverges to match each vendor's wire shape. Threshold for revisiting extraction is N=3 adapters.
+- **Rationale.** (a) GitHub-hosted inference is the most natural Copilot surface for an App-delivered product; (b) tool-calling matches the existing Anthropic adapter's discipline and keeps the Provider contract uniform; (c) abstraction at N=2 is premature given the small per-adapter delta. See `.spectra/plans/copilot-vendor/spec.md` § Decisions.
+
 ### OQ-1 — Choice of first reference LLM provider adapter
 
 - **ID.** OQ-1.

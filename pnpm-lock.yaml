@@ -38,6 +38,9 @@ importers:
       '@prisma-bot/provider-anthropic':
         specifier: workspace:*
         version: link:../../packages/providers/anthropic
+      '@prisma-bot/provider-copilot':
+        specifier: workspace:*
+        version: link:../../packages/providers/copilot
       '@prisma-bot/provider-fake':
         specifier: workspace:*
         version: link:../../packages/providers/fake
@@ -152,6 +155,15 @@ importers:
       '@anthropic-ai/sdk':
         specifier: ^0.32.1
         version: 0.32.1
+      '@prisma-bot/shared':
+        specifier: workspace:*
+        version: link:../../shared
+      zod:
+        specifier: 3.24.1
+        version: 3.24.1
+
+  packages/providers/copilot:
+    dependencies:
       '@prisma-bot/shared':
         specifier: workspace:*
         version: link:../../shared
