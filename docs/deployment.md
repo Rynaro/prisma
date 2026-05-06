@@ -12,7 +12,7 @@ Each role is delivered as a container image. The MVP is single-tenant — one Gi
 
 ## Bootstrapping
 
-GitHub App creation is performed out-of-band: the operator visits GitHub's App registration UI and creates the App (this document does not reproduce GitHub's flow — verify against current GitHub docs in Phase 4). Once registered, the operator imports the artifacts into the secret store reachable by the App's `SecretSource`:
+GitHub App creation is performed out-of-band: the operator visits GitHub's App registration UI and creates the App. See [`install-github-app.md`](install-github-app.md) for the prisma-specific operator steps (permissions, events, webhook URL pattern). Once registered, the operator imports the artifacts into the secret store reachable by the App's `SecretSource`:
 
 - The App private key (`.pem`) — stored under `GITHUB_APP_PRIVATE_KEY`.
 - The webhook secret — generated and stored under `GITHUB_APP_WEBHOOK_SECRET`.
