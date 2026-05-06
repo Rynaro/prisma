@@ -1,7 +1,13 @@
 .PHONY: help install typecheck lint lint-fix format test test-watch eval eval-scenario up down logs ps shell clean replay-webhook smoke check-vendor-isolation
 
-HOST_UID := $(shell id -u)
-HOST_GID := $(shell id -g)
+# Use ?= so the calling environment (e.g. a CI workflow `env:` block, or a
+# contributor with an unusual UID) can override these without forking the
+# Makefile. The Dockerfile makes /app/node_modules and /pnpm/store mode 0777
+# so any UID the container runs as can write into them — `id -u` is the
+# right default and matches the bind-mounted workspace owner on both local
+# (developer's UID) and CI (runner UID).
+HOST_UID ?= $(shell id -u)
+HOST_GID ?= $(shell id -g)
 export HOST_UID
 export HOST_GID
 
