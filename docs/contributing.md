@@ -17,6 +17,7 @@ prisma is a `pnpm` workspace. `apps/` contains runtime entry points; `packages/`
 | `packages/github` | GitHub-side adapters: installation-auth, Checks API, review comments, Installations API. | [`docs/system-design.md#packagesgithubinstallation-auth`](system-design.md#packagesgithubinstallation-auth) |
 | `packages/providers/anthropic` | Anthropic Claude reference adapter (per OQ-1). | [`docs/system-design.md#packagesprovidersanthropic`](system-design.md#packagesprovidersanthropic) |
 | `packages/providers/copilot` | GitHub Copilot adapter (per ADR-004) targeting the GitHub Models inference endpoint. | [ADR-004](architecture-decision-records/adr-004-copilot-provider.md) |
+| `packages/providers/openai` | OpenAI adapter (per ADR-005) targeting the OpenAI `/chat/completions` endpoint; honors a deterministic `seed`. | [ADR-005](architecture-decision-records/adr-005-openai-provider.md) |
 | `packages/providers/fake` | Deterministic in-process `FakeProvider` used by the eval harness and unit tests. | [`docs/system-design.md#packagesproviders-provider-abstraction-surface`](system-design.md#packagesproviders-provider-abstraction-surface) |
 | `evals/runner` | Phase 6 deterministic evaluation harness (`@prisma-bot/eval-runner`); owns the scenario loader and the PASS/FAIL gate. | [`evals/README.md`](../evals/README.md) |
 
@@ -26,7 +27,7 @@ For a quick orientation:
 
 - **Pipeline stages** live in `packages/core/` (`snapshotter`, `prefilter`, `validator-ranker`) and the worker app at `apps/github-app/src/pipeline/` composes them.
 - **Zod schemas** live in `packages/shared/` (canonical `ProviderReviewInput`, `ProviderReviewOutput`, `NormalizedFinding`, `RankedFindings`, `PublicationResult`).
-- **Providers** live in `packages/providers/{anthropic,copilot,fake}/`.
+- **Providers** live in `packages/providers/{anthropic,openai,copilot,fake}/`.
 - **Configuration** loader and schema live in `packages/config/`.
 - **GitHub adapters** live in `packages/github/` (installation-auth, Checks API, review-comments).
 - **ADRs** live in `docs/architecture-decision-records/`.
@@ -52,7 +53,7 @@ make eval        # Phase 6 harness — 9 scenarios; PASS gate is 9/9
 | Command | What it does |
 | --- | --- |
 | `make install` | Materializes `pnpm-managed` workspace dependencies. No host-side runtime is touched. |
-| `make typecheck` | Runs the TypeScript typechecker across every workspace (`apps/github-app`, `packages/shared`, `packages/config`, `packages/core`, `packages/github`, `packages/providers/anthropic`, `packages/providers/copilot`, `packages/providers/fake`, `evals/runner`). |
+| `make typecheck` | Runs the TypeScript typechecker across every workspace (`apps/github-app`, `packages/shared`, `packages/config`, `packages/core`, `packages/github`, `packages/providers/anthropic`, `packages/providers/openai`, `packages/providers/copilot`, `packages/providers/fake`, `evals/runner`). |
 | `make lint` | Runs Biome lint plus `check-vendor-isolation` (ADR-002 mechanical enforcement; see [Vendor isolation](#vendor-isolation-adr-002) below). Lint failures exit non-zero so the command is CI-safe. |
 | `make lint-fix` | Auto-fix lint issues. |
 | `make format` | Run Biome formatter. |
@@ -122,8 +123,8 @@ Plus three test files under `tests/`.
 2. **Implement `Provider`.** Validate the vendor's wire response against `ProviderReviewOutputSchema` from `@prisma-bot/shared` at the adapter boundary. On Zod failure, throw `ProviderError` with variant `schema_validation`. (Per ADR-002 § Decision and § Interface contract; see also `packages/providers/copilot/src/index.ts` for the worked example.)
 3. **Declare capabilities honestly.** `ProviderCapabilities` is a typed bag (`structured_output`, `function_calling`, `deterministic_seed`, `max_context_tokens`, etc.). Set each flag to what the vendor actually supports. (ADR-004's example: `structured_output: true, function_calling: true, deterministic_seed: false, max_context_tokens: 128000`.)
 4. **Map errors.** Every vendor error maps to one of the five `ProviderError` variants; the adapter must scrub secrets from error messages (the `mapCopilotError` precedent reproduces the secret-scrubbing rule from `packages/providers/anthropic/src/error-mapping.ts:23` verbatim).
-5. **Wire the worker selector.** Add a precedence arm to `apps/github-app/src/worker.ts` `buildProvider()`. The current order is `ANTHROPIC_API_KEY` → `COPILOT_API_KEY` → `FakeProvider({ script: [] })`. The chosen vendor must be observable via the `worker.provider.selected` log event.
-6. **Wire vendor isolation.** Add the new vendor SDK / network primitive to `scripts/check-vendor-isolation.sh` (one rule = one `check_rule` invocation). The current rules are: `@anthropic-ai/sdk` confined to `packages/providers/anthropic/src/client.ts`; `@octokit/*` confined to `packages/github/src/installation-auth/`; `fetch(` calls under `packages/providers/` confined to `*/src/client.ts`. (Per ADR-004 § Consequences (later).)
+5. **Wire the worker selector.** Add a precedence arm to `apps/github-app/src/worker.ts` `buildProvider()`. The current order is `ANTHROPIC_API_KEY` → `COPILOT_API_KEY` → `OPENAI_API_KEY` → `FakeProvider({ script: [] })`. The chosen vendor must be observable via the `worker.provider.selected` log event.
+6. **Wire vendor isolation.** Add the new vendor SDK / network primitive to `scripts/check-vendor-isolation.sh` (one rule = one `check_rule` invocation). The current rules are: `@anthropic-ai/sdk` confined to `packages/providers/anthropic/src/client.ts`; `@octokit/*` confined to `packages/github/src/installation-auth/`; `fetch(` calls under `packages/providers/` confined to `*/src/client.ts`. Note: a **fetch-based** adapter (e.g. Copilot, OpenAI — ADR-005) needs **no new rule**, since the generic Rule 3 already confines `fetch(` to `*/src/client.ts`; only a new vendor SDK import requires an additional `check_rule`. (Per ADR-004 § Consequences (later).)
 7. **Document.** Add an ADR (`adr-005-<vendor>-provider.md`); update `.env.example`, `docs/deployment.md` (env-var table + readiness probe + `.env.example` snippet), and `docs/operational-runbooks.md` (rotation + incident-response copy).
 8. **Test.** Unit tests for client, prompt, error-mapping, and provider behavior. The eval harness uses `FakeProvider`, so you do not need to add eval scenarios to land the adapter; the 9/9 PASS gate is preserved. (Per ADR-004 § Rationale § Additive change.)
 

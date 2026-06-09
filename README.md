@@ -60,6 +60,7 @@ ADR anchors:
 - **ADR-002 — Provider Abstraction.** Locks the `Provider` interface so vendor adapters can be swapped without touching pipeline code.
 - **ADR-003 — Validation, Ranking, and Publication Cap.** Locks the pipeline string `prefilter → provider → validator → ranker → publication cap` and the trust-preserving cap stage.
 - **ADR-004 — GitHub Copilot Provider Adapter.** First additive vendor under ADR-002; ships alongside the Anthropic Claude reference adapter.
+- **ADR-005 — OpenAI Provider Adapter.** Third production vendor; the first to honor a deterministic `seed` (declares `deterministic_seed: true`) and to thread `request_shaping`.
 
 Operating principle 5 — "Trust preservation beats maximum coverage" — drives every default in the publication-cap stage. New installs ship with `comment_cap.per_pr = 5`, `comment_cap.per_file = 1`, `severity_floor.inline = medium`, `confidence_floor.inline = 0.7`, and the default `mode` for newly installed repos is `dry-run`. These caps are deliberately conservative so that a fresh installation never floods a pull request with low-confidence advisory noise: the maintainer sees the App's first findings in the Checks summary while keeping inline comments off until they opt into `summary-only` or `summary-plus-inline`. Caps and floors are tunable per-repo via `.github/review-bot.yml`; the OQ-2 defaults are the floor of conservatism, not a ceiling. The full mode behavior matrix and dedupe rules live in [`docs/publication-policy.md`](docs/publication-policy.md).
 
@@ -102,6 +103,7 @@ All environment variables are enumerated in [`docs/deployment.md` § Environment
 - [ADR-002 — Provider Abstraction](docs/architecture-decision-records/adr-002-provider-abstraction.md).
 - [ADR-003 — Validation, Ranking, and Publication Cap](docs/architecture-decision-records/adr-003-validation-ranking.md).
 - [ADR-004 — GitHub Copilot Provider Adapter](docs/architecture-decision-records/adr-004-copilot-provider.md).
+- [ADR-005 — OpenAI Provider Adapter](docs/architecture-decision-records/adr-005-openai-provider.md).
 
 ## License
 

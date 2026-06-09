@@ -53,6 +53,7 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `GITHUB_APP_WEBHOOK_SECRET` | The HMAC secret used by `apps/github-app/webhook-ingress` to verify `X-Hub-Signature-256` on inbound webhooks. Read via `SecretSource`. Never echoed to logs. | `secret` |
 | `ANTHROPIC_API_KEY` | The Anthropic Claude provider API key consumed by the adapter at `packages/providers/anthropic` (per OQ-1). The variable name is provider-specific because the adapter is provider-specific; downstream code only sees a `SecretSource.getSecret(...)` call. Read via `SecretSource`. Never echoed to logs. | `secret` |
 | `COPILOT_API_KEY` | The GitHub Copilot provider API key (a GitHub PAT with `models:read` scope, or a runtime-resolved App installation token) consumed by the adapter at `packages/providers/copilot` (per ADR-004). Selected only when `ANTHROPIC_API_KEY` is unset; see `apps/github-app/src/worker.ts` for precedence. Read via `SecretSource`. Never echoed to logs. | `secret` |
+| `OPENAI_API_KEY` | The OpenAI provider API key consumed by the adapter at `packages/providers/openai` (per ADR-005). Selected only when `ANTHROPIC_API_KEY` and `COPILOT_API_KEY` are unset (precedence is `ANTHROPIC_API_KEY` → `COPILOT_API_KEY` → `OPENAI_API_KEY`); see `apps/github-app/src/worker.ts`. Read via `SecretSource`. Never echoed to logs. | `secret` |
 
 ### Config
 
@@ -66,6 +67,8 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector URL (per `observability.md` § Resolution of OQ-3 (recap) and § Sampling). When unset, telemetry export is disabled but the App still functions. | `config` |
 | `LOG_LEVEL` | Default log verbosity for `packages/shared/audit-log`; one of `debug`, `info`, `warn`, `error`. | `config` |
 | `INSTALLATION_REPLAY_WINDOW_SECONDS` | The replay-protection window for `X-GitHub-Delivery` per installation (per `system-design.md` § Queue and async model § Replay protection). Duplicate deliveries within the window short-circuit to `discarded_idempotent`. | `config` |
+| `OPENAI_MODEL` | Optional override for the OpenAI adapter's default model (defaults to `gpt-4o`). Consumed only when `OPENAI_API_KEY` is set. May also be set per-request via `request_shaping.model`. | `config` |
+| `OPENAI_BASE_URL` | Optional override for the OpenAI adapter's inference endpoint (defaults to `https://api.openai.com/v1`). Consumed only when `OPENAI_API_KEY` is set; useful for Azure OpenAI or a proxy gateway. | `config` |
 | `COPILOT_MODEL` | Optional override for the Copilot adapter's default model (defaults to `gpt-4o`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 | `COPILOT_BASE_URL` | Optional override for the Copilot adapter's inference endpoint (defaults to `https://models.github.ai/inference`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 
@@ -104,7 +107,7 @@ The App exposes three HTTP `GET` health surfaces. All return `200` on success; f
 ### Readiness
 
 - **Path.** `/healthz/ready`.
-- **Behavior.** Returns `200` only if the process has completed bootstrap: configuration loaded, `SecretSource` reachable for the keys this process will need (`GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_WEBHOOK_SECRET`, and exactly one of `ANTHROPIC_API_KEY` / `COPILOT_API_KEY`), and the `JobQueue` client is connected to Redis (`REDIS_URL`). Returns `503` until bootstrap completes.
+- **Behavior.** Returns `200` only if the process has completed bootstrap: configuration loaded, `SecretSource` reachable for the keys this process will need (`GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_WEBHOOK_SECRET`, and exactly one of `ANTHROPIC_API_KEY` / `COPILOT_API_KEY` / `OPENAI_API_KEY`), and the `JobQueue` client is connected to Redis (`REDIS_URL`). Returns `503` until bootstrap completes.
 
 ### Dependency check
 
@@ -119,10 +122,11 @@ The block below is the `.env.example` shipped with the App. Placeholder values o
 # secrets (read via SecretSource; env is the MVP implementation)
 GITHUB_APP_PRIVATE_KEY=
 GITHUB_APP_WEBHOOK_SECRET=
-# Provider selection by precedence: ANTHROPIC_API_KEY first, then COPILOT_API_KEY.
+# Provider selection by precedence: ANTHROPIC_API_KEY, then COPILOT_API_KEY, then OPENAI_API_KEY.
 # Set exactly one for production-equivalent behavior.
 ANTHROPIC_API_KEY=
 COPILOT_API_KEY=
+OPENAI_API_KEY=
 
 # config
 PORT=3000
@@ -136,6 +140,9 @@ INSTALLATION_REPLAY_WINDOW_SECONDS=300
 # Optional Copilot overrides; consumed only when COPILOT_API_KEY is set.
 COPILOT_MODEL=
 COPILOT_BASE_URL=
+# Optional OpenAI overrides; consumed only when OPENAI_API_KEY is set.
+OPENAI_MODEL=
+OPENAI_BASE_URL=
 
 # tunables (starting values; see operational-runbooks.md § Numeric tunables)
 QUEUE_CONCURRENCY=4

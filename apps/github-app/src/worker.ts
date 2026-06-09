@@ -7,6 +7,7 @@ import {
 import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/provider-anthropic';
 import { CopilotProvider, type CopilotProviderOptions } from '@prisma-bot/provider-copilot';
 import { FakeProvider } from '@prisma-bot/provider-fake';
+import { OpenAIProvider, type OpenAIProviderOptions } from '@prisma-bot/provider-openai';
 import {
   type JobPayload,
   type Provider,
@@ -29,7 +30,10 @@ import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
  *   2. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (GitHub Models
  *      inference endpoint; per `.spectra/plans/copilot-vendor/spec.yaml`).
  *      Honors optional `COPILOT_MODEL` and `COPILOT_BASE_URL` overrides.
- *   3. Otherwise → `FakeProvider` with an empty script — the dev stack
+ *   3. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (OpenAI inference
+ *      endpoint; supports deterministic seed). Honors optional `OPENAI_MODEL`
+ *      and `OPENAI_BASE_URL` overrides.
+ *   4. Otherwise → `FakeProvider` with an empty script — the dev stack
  *      boots without secrets, but every actual job will exhaust the script
  *      and fail terminal. This is the correct dev affordance: a worker
  *      that boots and logs `worker.started` but cannot service real work
@@ -105,10 +109,27 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     log('worker.provider.selected', { provider: 'copilot' });
     return new CopilotProvider(opts);
   }
+  const openaiKey = await tryGetSecret(secretSource, 'OPENAI_API_KEY');
+  if (openaiKey !== undefined) {
+    const opts: OpenAIProviderOptions = {
+      apiKey: openaiKey,
+      maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
+    };
+    const model = await tryGetSecret(secretSource, 'OPENAI_MODEL');
+    if (model !== undefined) {
+      opts.model = model;
+    }
+    const baseUrl = await tryGetSecret(secretSource, 'OPENAI_BASE_URL');
+    if (baseUrl !== undefined) {
+      opts.baseUrl = baseUrl;
+    }
+    log('worker.provider.selected', { provider: 'openai' });
+    return new OpenAIProvider(opts);
+  }
   log('worker.provider.selected', {
     provider: 'fake',
     reason:
-      'no vendor API key set (ANTHROPIC_API_KEY, COPILOT_API_KEY); using FakeProvider with empty script',
+      'no vendor API key set (ANTHROPIC_API_KEY, COPILOT_API_KEY, OPENAI_API_KEY); using FakeProvider with empty script',
   });
   return new FakeProvider({ script: [] });
 };
