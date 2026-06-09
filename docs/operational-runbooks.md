@@ -98,7 +98,7 @@ A procedure for rotating `ANTHROPIC_API_KEY` (or, depending on the selected adap
 - **Diagnosis.** Not applicable.
 - **Mitigation.** Procedure (steps):
   1. Mint a new provider API key in the provider's dashboard (verify against current vendor docs in Phase 4).
-  2. Stage the new key in `SecretSource` under `ANTHROPIC_API_KEY` for the Anthropic adapter, `OPENAI_API_KEY` for the OpenAI adapter at `packages/providers/openai` (per ADR-005), or `COPILOT_API_KEY` for the Copilot adapter at `packages/providers/copilot` (per ADR-004). Do not set more than one: provider selection is by precedence (`ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `COPILOT_API_KEY`), so leaving a higher-precedence key set silently pins the worker to that vendor.
+  2. Stage the new key in `SecretSource` under `ANTHROPIC_API_KEY` for the Anthropic adapter, `OPENAI_API_KEY` for the OpenAI adapter at `packages/providers/openai` (per ADR-005), or `COPILOT_API_KEY` for the Copilot adapter at `packages/providers/copilot` (per ADR-004). Do not set more than one: provider selection is by precedence (`ANTHROPIC_API_KEY` → `COPILOT_API_KEY` → `OPENAI_API_KEY`), so leaving a higher-precedence key set silently pins the worker to that vendor.
   3. Roll the App processes (rolling restart) so each worker picks up the new key on startup.
   4. Verify with a sentinel call: a `provider.called` event followed by a successful response (no `provider.error` event) for the next inbound PR.
   5. Revoke the old key in the provider's dashboard.

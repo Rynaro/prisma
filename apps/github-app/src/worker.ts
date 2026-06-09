@@ -27,12 +27,12 @@ import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
  * Provider selection (deterministic, in precedence order):
  *   1. If `ANTHROPIC_API_KEY` is set → `AnthropicProvider` (OQ-1 reference
  *      adapter; preserves existing behavior).
- *   2. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (OpenAI inference
- *      endpoint; supports deterministic seed). Honors optional `OPENAI_MODEL`
- *      and `OPENAI_BASE_URL` overrides.
- *   3. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (GitHub Models
+ *   2. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (GitHub Models
  *      inference endpoint; per `.spectra/plans/copilot-vendor/spec.yaml`).
  *      Honors optional `COPILOT_MODEL` and `COPILOT_BASE_URL` overrides.
+ *   3. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (OpenAI inference
+ *      endpoint; supports deterministic seed). Honors optional `OPENAI_MODEL`
+ *      and `OPENAI_BASE_URL` overrides.
  *   4. Otherwise → `FakeProvider` with an empty script — the dev stack
  *      boots without secrets, but every actual job will exhaust the script
  *      and fail terminal. This is the correct dev affordance: a worker
@@ -92,23 +92,6 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     log('worker.provider.selected', { provider: 'anthropic' });
     return new AnthropicProvider(opts);
   }
-  const openaiKey = await tryGetSecret(secretSource, 'OPENAI_API_KEY');
-  if (openaiKey !== undefined) {
-    const opts: OpenAIProviderOptions = {
-      apiKey: openaiKey,
-      maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
-    };
-    const model = await tryGetSecret(secretSource, 'OPENAI_MODEL');
-    if (model !== undefined) {
-      opts.model = model;
-    }
-    const baseUrl = await tryGetSecret(secretSource, 'OPENAI_BASE_URL');
-    if (baseUrl !== undefined) {
-      opts.baseUrl = baseUrl;
-    }
-    log('worker.provider.selected', { provider: 'openai' });
-    return new OpenAIProvider(opts);
-  }
   const copilotKey = await tryGetSecret(secretSource, 'COPILOT_API_KEY');
   if (copilotKey !== undefined) {
     const opts: CopilotProviderOptions = {
@@ -126,10 +109,27 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     log('worker.provider.selected', { provider: 'copilot' });
     return new CopilotProvider(opts);
   }
+  const openaiKey = await tryGetSecret(secretSource, 'OPENAI_API_KEY');
+  if (openaiKey !== undefined) {
+    const opts: OpenAIProviderOptions = {
+      apiKey: openaiKey,
+      maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
+    };
+    const model = await tryGetSecret(secretSource, 'OPENAI_MODEL');
+    if (model !== undefined) {
+      opts.model = model;
+    }
+    const baseUrl = await tryGetSecret(secretSource, 'OPENAI_BASE_URL');
+    if (baseUrl !== undefined) {
+      opts.baseUrl = baseUrl;
+    }
+    log('worker.provider.selected', { provider: 'openai' });
+    return new OpenAIProvider(opts);
+  }
   log('worker.provider.selected', {
     provider: 'fake',
     reason:
-      'no vendor API key set (ANTHROPIC_API_KEY, OPENAI_API_KEY, COPILOT_API_KEY); using FakeProvider with empty script',
+      'no vendor API key set (ANTHROPIC_API_KEY, COPILOT_API_KEY, OPENAI_API_KEY); using FakeProvider with empty script',
   });
   return new FakeProvider({ script: [] });
 };

@@ -70,7 +70,7 @@ The minimum set of secrets:
 
 - `GITHUB_APP_PRIVATE_KEY` — the PEM contents (or a path to the PEM file) from Step 2. Used by `packages/github/installation-auth` to mint installation tokens.
 - `GITHUB_APP_WEBHOOK_SECRET` — the webhook secret you generated in Step 1. Used by `apps/github-app/webhook-ingress` to verify `X-Hub-Signature-256` on inbound deliveries.
-- Exactly one of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, **or** `COPILOT_API_KEY` — see [Choosing a provider](#choosing-a-provider).
+- Exactly one of `ANTHROPIC_API_KEY`, `COPILOT_API_KEY`, **or** `OPENAI_API_KEY` — see [Choosing a provider](#choosing-a-provider).
 
 The minimum set of (non-secret) config:
 
@@ -84,18 +84,18 @@ For the **complete** environment-variable reference (every variable, classificat
 prisma ships with three production-ready provider adapters and one boot-only stub. Worker selection is by deterministic env-var precedence (see `apps/github-app/src/worker.ts` `buildProvider()` and ADR-004 / ADR-005 § Decision):
 
 1. If `ANTHROPIC_API_KEY` is set → `AnthropicProvider` (the OQ-1 reference adapter at `packages/providers/anthropic`).
-2. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (per ADR-005; targets the OpenAI `/chat/completions` endpoint at `https://api.openai.com/v1/chat/completions`. The only adapter that honors a deterministic `seed` and a per-request model override via `request_shaping`).
-3. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (per ADR-004; targets the GitHub Models inference endpoint at `https://models.github.ai/inference/chat/completions` over an OpenAI-compatible chat-completions surface).
+2. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (per ADR-004; targets the GitHub Models inference endpoint at `https://models.github.ai/inference/chat/completions` over an OpenAI-compatible chat-completions surface).
+3. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (per ADR-005; targets the OpenAI `/chat/completions` endpoint at `https://api.openai.com/v1/chat/completions`. The only adapter that honors a deterministic `seed` and a per-request model override via `request_shaping`).
 4. Else → `FakeProvider({ script: [] })` (the worker boots and logs `worker.started` but every real job fails terminal — this is the dev-stub posture, not a production posture).
 
-**Set exactly one** of the keys for production-equivalent behavior. If more than one is set, the highest-precedence wins (Anthropic, then OpenAI, then Copilot); the operator must explicitly unset it to switch vendors. The chosen vendor is observable via the `worker.provider.selected` log event.
+**Set exactly one** of the keys for production-equivalent behavior. If more than one is set, the highest-precedence wins (Anthropic, then Copilot, then OpenAI); the operator must explicitly unset it to switch vendors. The chosen vendor is observable via the `worker.provider.selected` log event.
 
 Optional OpenAI overrides (consumed only when `OPENAI_API_KEY` is set):
 
 - `OPENAI_MODEL` — defaults to `gpt-4o`.
 - `OPENAI_BASE_URL` — defaults to `https://api.openai.com/v1`. Useful for re-targeting at Azure OpenAI or a proxy gateway without code changes (per ADR-005 § Decision).
 
-Optional Copilot overrides (consumed only when `COPILOT_API_KEY` is set):
+(Listed by precedence above, Copilot is tried before OpenAI.) Optional Copilot overrides (consumed only when `COPILOT_API_KEY` is set):
 
 - `COPILOT_MODEL` — defaults to `gpt-4o`.
 - `COPILOT_BASE_URL` — defaults to `https://models.github.ai/inference`. Useful for re-targeting at Azure OpenAI or an alternate inference endpoint without code changes (per ADR-004 § Trade-offs).

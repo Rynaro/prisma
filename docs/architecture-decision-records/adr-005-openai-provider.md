@@ -16,11 +16,11 @@ With OpenAI, the provider count reaches **N=3**, which is the threshold ADR-004 
 
 The OpenAI adapter targets the **OpenAI Chat Completions endpoint** (`https://api.openai.com/v1/chat/completions`) over the standard OpenAI-compatible chat-completions surface. Authentication is `Authorization: Bearer <token>`, where the token is an OpenAI API key supplied via `OPENAI_API_KEY`. The adapter package lives at `packages/providers/openai` and exports `OpenAIProvider`, which implements the `Provider` interface defined in `packages/shared/src/schemas/provider-interface.ts`.
 
-Worker selection in `apps/github-app/src/worker.ts` follows a deterministic precedence (OpenAI inserted between Anthropic and Copilot):
+Worker selection in `apps/github-app/src/worker.ts` follows a deterministic precedence (OpenAI appended after the existing Anthropic and Copilot arms):
 
 1. `ANTHROPIC_API_KEY` set → `AnthropicProvider`.
-2. else `OPENAI_API_KEY` set → `OpenAIProvider`.
-3. else `COPILOT_API_KEY` set → `CopilotProvider`.
+2. else `COPILOT_API_KEY` set → `CopilotProvider`.
+3. else `OPENAI_API_KEY` set → `OpenAIProvider`.
 4. else → `FakeProvider({ script: [] })` (boot-only stub).
 
 Operators override the model via `OPENAI_MODEL` and the endpoint via `OPENAI_BASE_URL` (e.g. for Azure OpenAI or a proxy gateway).
@@ -68,7 +68,7 @@ Deferred (the OQ-Copilot-3 reversal trigger): tool-call envelopes still differ b
 
 - New package `packages/providers/openai` with the four-file source layout and three-file test layout that mirror `packages/providers/copilot`.
 - `apps/github-app/package.json` adds `@prisma-bot/provider-openai` as a workspace dependency.
-- `apps/github-app/src/worker.ts buildProvider()` carries a fourth selector arm, inserted between the Anthropic and Copilot arms, observable via the `worker.provider.selected` log event (`{ provider: 'openai' }`).
+- `apps/github-app/src/worker.ts buildProvider()` carries a fourth selector arm, appended after the Copilot arm (precedence `ANTHROPIC → COPILOT → OPENAI → Fake`), observable via the `worker.provider.selected` log event (`{ provider: 'openai' }`).
 - Documentation surface: `.env.example`, `README.md`, `docs/contributing.md`, `docs/deployment.md`, `docs/install-github-app.md`, `docs/quickstart.md`, `docs/operational-runbooks.md`.
 - `docs/open-questions.md` records the resolution log entry for `OQ-OpenAI-1/2/3`.
 - **No change** to `scripts/check-vendor-isolation.sh`: the adapter is fetch-based, so Rule 3 (generic) already covers it; the script still asserts three rules.
