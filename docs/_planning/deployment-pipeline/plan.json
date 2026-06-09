@@ -1,0 +1,64 @@
+{
+  "thread_id": "019eae72-01ad-7ad1-a02a-0bc727483e4b",
+  "tier": "trance",
+  "enforce": "fail-fast",
+  "steps": [
+    {
+      "step_id": "S0",
+      "from": {
+        "eidolon": "human",
+        "version": "n/a"
+      },
+      "to": {
+        "eidolon": "atlas",
+        "version": "1.11.0"
+      },
+      "performative": "REQUEST",
+      "edge_origin": "roster",
+      "objective": "Scout the prisma-bot deployment surface for the Traefik + ACME + interactive-installer pipeline.",
+      "artifact": {
+        "kind": "mission",
+        "schema_version": "1.0",
+        "path": "docs/_planning/deployment-pipeline/mission.md"
+      }
+    },
+    {
+      "step_id": "S1",
+      "from": {
+        "eidolon": "atlas",
+        "version": "1.11.0"
+      },
+      "to": {
+        "eidolon": "spectra",
+        "version": "4.8.0"
+      },
+      "performative": "INFORM",
+      "edge_origin": "roster",
+      "objective": "Hand the evidence-anchored scout report (13 findings, 6 gaps, REUSE-vs-CREATE map) to SPECTRA for the G3 spec.",
+      "artifact": {
+        "kind": "scout-report",
+        "schema_version": "1.0",
+        "path": "docs/_planning/deployment-pipeline/scout-report.md"
+      }
+    },
+    {
+      "step_id": "S2",
+      "from": {
+        "eidolon": "spectra",
+        "version": "4.8.0"
+      },
+      "to": {
+        "eidolon": "apivr",
+        "version": "3.6.0"
+      },
+      "performative": "PROPOSE",
+      "edge_origin": "roster",
+      "objective": "Propose the decision-ready deployment-pipeline spec (S1-S6 ship, 3 parallel tracks, 2 sync contracts) to the coder.",
+      "artifact": {
+        "kind": "spec",
+        "schema_version": "1.0",
+        "path": "docs/_planning/deployment-pipeline/spec.md"
+      }
+    }
+  ]
+}
