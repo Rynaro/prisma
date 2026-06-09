@@ -78,6 +78,24 @@ Entry shape: `ID`, `Question`, `Raised in`, `Blocking?`, `Owner`, `Target phase`
   3. **Prompt strategy — per-adapter.** Each adapter owns its own `prompt.ts`. The user-message renderer is byte-identical between adapters; the tool envelope diverges to match each vendor's wire shape. Threshold for revisiting extraction is N=3 adapters.
 - **Rationale.** (a) GitHub-hosted inference is the most natural Copilot surface for an App-delivered product; (b) tool-calling matches the existing Anthropic adapter's discipline and keeps the Provider contract uniform; (c) abstraction at N=2 is premature given the small per-adapter delta. See `.spectra/plans/copilot-vendor/spec.md` § Decisions.
 
+### OQ-OpenAI-1/2/3 — OpenAI adapter surface, calling discipline, prompt strategy
+
+- **IDs.** OQ-OpenAI-1, OQ-OpenAI-2, OQ-OpenAI-3.
+- **Questions.**
+  1. Which OpenAI surface does the adapter target, and how is determinism handled?
+  2. Should the adapter use function-calling or `response_format` (structured outputs)?
+  3. Now that N=3 adapters exist, should `buildPrompt` be extracted across adapters?
+- **Raised in.** `.junction/threads/019ead48-67e3-7131-8552-6ccdf9a887ab/S0/out/scout-report.md`; `…/S1/out/spec.md` § Decisions.
+- **Blocking?** Yes — for the third-vendor introduction itself; each answer must be pinned before the adapter ships.
+- **Owner.** TBD.
+- **Target phase.** Phase 7 (post-MVP vendor expansion).
+- **Resolution date.** 2026-06-09.
+- **Resolution.**
+  1. **Surface — OpenAI Chat Completions.** Adapter targets `https://api.openai.com/v1/chat/completions`; auth is `Bearer <OPENAI_API_KEY>`. Unlike Anthropic/Copilot, OpenAI honors an integer `seed`, so the adapter declares `deterministic_seed: true` and threads `request_shaping.deterministic_seed` (the INT seed) and `request_shaping.model` into the request. Recorded in ADR-005.
+  2. **Calling discipline — native function-calling.** Adapter declares one tool `submit_review_findings` and parses the tool-call `arguments` (a JSON-encoded string) before validating against `ProviderReviewOutputSchema`. `response_format` (structured outputs) is rejected for this delta — no repo precedent (D2).
+  3. **Prompt strategy — per-adapter (re-evaluation now due).** Each adapter still owns its `prompt.ts`. N=3 is the threshold OQ-Copilot-3 named for re-evaluating a shared `buildPrompt`; that re-evaluation is now live and flagged in ADR-005 § Consequences (later). Kept per-adapter for this delta to preserve parity.
+- **Rationale.** (a) the canonical OpenAI endpoint with a native `seed` is the only honest basis for a `deterministic_seed: true` capability; (b) function-calling matches the Anthropic/Copilot discipline and keeps the Provider contract uniform; (c) prompt extraction is now a live N=3 re-evaluation rather than a deferred one. See `…/S1/out/spec.md` § Decisions (D1–D4).
+
 ### OQ-1 — Choice of first reference LLM provider adapter
 
 - **ID.** OQ-1.

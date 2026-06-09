@@ -44,6 +44,9 @@ importers:
       '@prisma-bot/provider-fake':
         specifier: workspace:*
         version: link:../../packages/providers/fake
+      '@prisma-bot/provider-openai':
+        specifier: workspace:*
+        version: link:../../packages/providers/openai
       '@prisma-bot/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -176,6 +179,15 @@ importers:
       '@prisma-bot/shared':
         specifier: workspace:*
         version: link:../../shared
+
+  packages/providers/openai:
+    dependencies:
+      '@prisma-bot/shared':
+        specifier: workspace:*
+        version: link:../../shared
+      zod:
+        specifier: 3.24.1
+        version: 3.24.1
 
   packages/shared:
     dependencies:

@@ -28,7 +28,7 @@ Each runbook is structured `Symptom`, `Detection`, `Diagnosis`, `Mitigation`, `R
 
 - **Symptom.** Many PRs end with `failed_terminal`; reviewers see the "review unavailable" Checks summary on PRs.
 - **Detection.** Rising `prisma_provider_call_seconds{outcome="error.transport"}` or `outcome="error.rate_limit"`; spike in `provider.error` events with `variant=auth` (key revoked), `variant=rate_limit`, or `variant=transport` (outage). A sympathetic decline in `prisma_findings_published_total{surface="inline"}` and `prisma_findings_published_total{surface="summary"}` confirms PRs are reaching the failure path rather than the publish path.
-- **Diagnosis.** Check the active provider's status page. Confirm `ANTHROPIC_API_KEY` (or `COPILOT_API_KEY`, when the Copilot adapter is selected) is valid — it may have been revoked or expired. Check whether `prisma_provider_retry_total{retry_class="rate_limited"}` is dominating, which suggests cost pressure rather than outage.
+- **Diagnosis.** Check the active provider's status page. Confirm the selected provider's key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `COPILOT_API_KEY`) is valid — it may have been revoked or expired. Check whether `prisma_provider_retry_total{retry_class="rate_limited"}` is dominating, which suggests cost pressure rather than outage.
 - **Mitigation.**
   - For `variant=auth`: rotate the key via `### Rotating provider API key`.
   - For `variant=rate_limit`: raise `RETRY_RATELIMIT_MAX_ATTEMPTS` cautiously; consider tightening `MAX_TOKENS_PER_PR` and `MAX_TOKENS_PER_WINDOW_PER_INSTALLATION` (over `MAX_TOKENS_WINDOW_SECONDS`) to reduce the App's call volume against the provider.
@@ -91,14 +91,14 @@ A zero-downtime procedure for rotating `GITHUB_APP_WEBHOOK_SECRET`.
 
 ### Rotating provider API key
 
-A procedure for rotating `ANTHROPIC_API_KEY` (or, when the Copilot adapter is in use, `COPILOT_API_KEY`).
+A procedure for rotating `ANTHROPIC_API_KEY` (or, depending on the selected adapter, `OPENAI_API_KEY` or `COPILOT_API_KEY`).
 
 - **Symptom.** Operator-initiated; not a fault response.
 - **Detection.** Not applicable. After step 5, expect `prisma_findings_published_total` to resume at the prior rate; a sentinel `provider.called` event followed by a successful return is the affirmative health signal.
 - **Diagnosis.** Not applicable.
 - **Mitigation.** Procedure (steps):
   1. Mint a new provider API key in the provider's dashboard (verify against current vendor docs in Phase 4).
-  2. Stage the new key in `SecretSource` under `ANTHROPIC_API_KEY` for the Anthropic adapter, or under `COPILOT_API_KEY` for the Copilot adapter at `packages/providers/copilot` (per ADR-004). Do not set both: provider selection is by precedence (`ANTHROPIC_API_KEY` first), so leaving the deselected key set silently pins the worker to the older vendor.
+  2. Stage the new key in `SecretSource` under `ANTHROPIC_API_KEY` for the Anthropic adapter, `OPENAI_API_KEY` for the OpenAI adapter at `packages/providers/openai` (per ADR-005), or `COPILOT_API_KEY` for the Copilot adapter at `packages/providers/copilot` (per ADR-004). Do not set more than one: provider selection is by precedence (`ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `COPILOT_API_KEY`), so leaving a higher-precedence key set silently pins the worker to that vendor.
   3. Roll the App processes (rolling restart) so each worker picks up the new key on startup.
   4. Verify with a sentinel call: a `provider.called` event followed by a successful response (no `provider.error` event) for the next inbound PR.
   5. Revoke the old key in the provider's dashboard.
