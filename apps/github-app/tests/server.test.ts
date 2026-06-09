@@ -83,10 +83,12 @@ describe('Fastify server (Phase 4 healthz / smoke contract)', () => {
     const res = await app.inject({ method: 'GET', url: '/healthz/deps' });
     expect(res.statusCode).toBe(200);
     const body = res.json();
+    // When no depsProbe is injected (dev/test affordance) the route returns
+    // an unchecked snapshot. The contract only requires redis and github
+    // fields; provider is not a dependency surface exposed at /healthz/deps.
     expect(body.dependencies).toMatchObject({
       redis: expect.any(String),
       github: expect.any(String),
-      provider: expect.any(String),
     });
   });
 

@@ -10,6 +10,46 @@ import { verifySignature } from './webhook/signature.js';
 const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? 'prisma-review-bot';
 const DEFAULT_BODY_LIMIT_BYTES = 10 * 1024 * 1024; // 10 MB
 
+/**
+ * Result returned by the readiness probe. When `ready` is false the reason
+ * string is included in the 503 payload for operator diagnostics.
+ */
+export interface ReadinessProbeResult {
+  ready: boolean;
+  reason?: string;
+}
+
+/**
+ * Per-dependency status for the deps probe. Each field carries either 'ok',
+ * 'degraded', or 'error'.
+ */
+export type DepStatus = 'ok' | 'degraded' | 'error';
+
+export interface DepsProbeResult {
+  /** Overall: 'ok' when all required deps pass; 'degraded' when OTLP fails; 'error' on hard failure. */
+  status: 'ok' | 'degraded' | 'error';
+  dependencies: {
+    redis: DepStatus;
+    github: DepStatus;
+    /** Present only when OTEL_EXPORTER_OTLP_ENDPOINT is set. */
+    otlp?: DepStatus;
+  };
+}
+
+/**
+ * Injectable readiness probe. Called by GET /healthz/ready on every request.
+ * Must be latency-bounded by the caller (e.g. Promise.race timeout).
+ * Returns `{ ready: true }` when bootstrap is complete; `{ ready: false, reason }` otherwise.
+ */
+export type ReadinessProbe = () => Promise<ReadinessProbeResult>;
+
+/**
+ * Injectable deps probe. Called by GET /healthz/deps on every request.
+ * Must be latency-bounded by the caller. Returns a DepsProbeResult;
+ * the route maps status:'error' → 503 and status:'ok'|'degraded' → 200.
+ */
+export type DepsProbe = () => Promise<DepsProbeResult>;
+
 export interface BuildServerOptions {
   // Resolved per-request via the SecretSource boundary (system-design.md
   // § Secret storage abstraction). The function may return a string or
@@ -20,6 +60,18 @@ export interface BuildServerOptions {
   logger?: FastifyBaseLogger;
   // Default 10 MB; the route fails closed on oversize with 413.
   bodyLimit?: number;
+  /**
+   * Optional readiness probe injected at construction time. When absent the
+   * route returns 200 unconditionally (backward-compatible dev affordance).
+   * Production wiring (main.ts) injects a real probe.
+   */
+  readinessProbe?: ReadinessProbe;
+  /**
+   * Optional deps probe injected at construction time. When absent the route
+   * returns an 'unchecked' snapshot (backward-compatible dev affordance).
+   * Production wiring (main.ts) injects a real probe.
+   */
+  depsProbe?: DepsProbe;
 }
 
 interface ParsedJsonBody {
@@ -135,16 +187,60 @@ export const buildServer = (opts: BuildServerOptions) => {
 
   app.get('/healthz/live', async () => ({ status: 'ok' }));
 
-  app.get('/healthz/ready', async () => ({ status: 'ok' }));
+  app.get('/healthz/ready', async (_request, reply) => {
+    if (opts.readinessProbe === undefined) {
+      // No probe injected: dev/test affordance — report ready.
+      return reply.code(200).send({ status: 'ok' });
+    }
+    let result: ReadinessProbeResult;
+    try {
+      result = await Promise.race([
+        opts.readinessProbe(),
+        new Promise<ReadinessProbeResult>((_, reject) =>
+          setTimeout(() => reject(new Error('readiness probe timed out')), 2000),
+        ),
+      ]);
+    } catch (err) {
+      return reply.code(503).send({
+        status: 'not_ready',
+        reason: err instanceof Error ? err.message : 'probe_error',
+      });
+    }
+    if (!result.ready) {
+      return reply.code(503).send({ status: 'not_ready', reason: result.reason ?? 'not_ready' });
+    }
+    return reply.code(200).send({ status: 'ok' });
+  });
 
-  app.get('/healthz/deps', async () => ({
-    status: 'ok',
-    dependencies: {
-      redis: 'unchecked',
-      github: 'unchecked',
-      provider: 'unchecked',
-    },
-  }));
+  app.get('/healthz/deps', async (_request, reply) => {
+    if (opts.depsProbe === undefined) {
+      // No probe injected: dev/test affordance — report unchecked.
+      return reply.code(200).send({
+        status: 'ok',
+        dependencies: {
+          redis: 'unchecked',
+          github: 'unchecked',
+        },
+      });
+    }
+    let result: DepsProbeResult;
+    try {
+      result = await Promise.race([
+        opts.depsProbe(),
+        new Promise<DepsProbeResult>((_, reject) =>
+          setTimeout(() => reject(new Error('deps probe timed out')), 2000),
+        ),
+      ]);
+    } catch (err) {
+      return reply.code(503).send({
+        status: 'error',
+        dependencies: { redis: 'error', github: 'error' },
+        reason: err instanceof Error ? err.message : 'probe_error',
+      });
+    }
+    const httpStatus = result.status === 'error' ? 503 : 200;
+    return reply.code(httpStatus).send(result);
+  });
 
   // The webhook ingress: 2xx-on-accept budget ≤ 1s per
   // docs/api-contracts.md § Webhook ingress contract. All I/O on this
