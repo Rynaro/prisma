@@ -1,0 +1,47 @@
+################################################################
+# Traefik v3 static configuration
+# deploy/install.sh substitutes "ACME_EMAIL_PLACEHOLDER" with
+# the operator-supplied email address during installation.
+################################################################
+
+log:
+  level: INFO
+
+api:
+  dashboard: false
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+
+  websecure:
+    address: ":443"
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      # deploy/install.sh replaces this placeholder with the real email.
+      email: "ACME_EMAIL_PLACEHOLDER"
+      storage: /acme.json
+      httpChallenge:
+        # Use the "web" entrypoint (port 80) for the HTTP-01 ACME challenge.
+        entryPoint: web
+
+      # dnsChallenge variant — uncomment and configure when port 80 is
+      # unavailable or wildcard certificates are required:
+      #
+      # dnsChallenge:
+      #   provider: cloudflare       # set CLOUDFLARE_DNS_API_TOKEN in env
+      #   delayBeforeCheck: 10
+      #   resolvers:
+      #     - "1.1.1.1:53"
+      #     - "8.8.8.8:53"
+
+providers:
+  docker:
+    exposedByDefault: false

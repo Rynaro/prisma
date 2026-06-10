@@ -1,0 +1,19 @@
+{
+  "envelope_version": "1.0",
+  "message_id": "019eae72-01b0-74ee-9b42-5a93a3e3d358",
+  "thread_id": "019eae72-01ad-7ad1-a02a-0bc727483e4b",
+  "parent_id": null,
+  "from": {"eidolon": "human", "version": "n/a"},
+  "to": {"eidolon": "atlas", "version": "1.11.0"},
+  "performative": "REQUEST",
+  "objective": "Scout the prisma-bot deployment surface to answer the DECISION_TARGET: what must be built vs reused for an interactive, Traefik-fronted, auto-certificate single-host deployment pipeline.",
+  "artifact": {
+    "kind": "mission",
+    "schema_version": "1.0",
+    "path": "mission.md",
+    "sha256": "db1c14f0cb30416e0df7b27085689bd8b52a84c834a1789d784868697ea2d59f",
+    "size_bytes": 2814
+  },
+  "integrity": {"method": "sha256", "value": "db1c14f0cb30416e0df7b27085689bd8b52a84c834a1789d784868697ea2d59f"},
+  "trace": {"ts": "2026-06-09T22:12:47Z", "host": "claude-code", "model": "claude-fable-5", "tier": "trance"}
+}

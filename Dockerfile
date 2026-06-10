@@ -33,7 +33,28 @@ RUN mkdir -p /app/node_modules \
 # bind-mounted from the host at runtime; node_modules lives in a named volume.
 # The container runs as a non-root user matched to the host UID/GID (passed in
 # via docker-compose `user:`) so files written into the bind mount stay owned
-# by the developer on the host. Production stages arrive in Phase 5.
+# by the developer on the host.
 FROM base AS dev
 USER node
 CMD ["sleep", "infinity"]
+
+# ---------- prod ----------
+# Immutable production image. tsx is retained (it lives in devDependencies but
+# is required at runtime — DECISION-1 forbids a compile/bundle step). A full
+# pnpm install is performed so tsx is present; NODE_ENV is set to production
+# after install so pnpm does not skip devDependencies during the install step.
+# The CMD intentionally has no hardcoded role: compose overrides `command:`
+# per service (pnpm --filter @prisma-bot/github-app run start:app|start:worker).
+FROM base AS prod
+# Copy workspace manifests and lockfile first for better layer caching.
+COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc* ./
+COPY --chown=node:node apps/github-app/package.json ./apps/github-app/
+COPY --chown=node:node packages/ ./packages/
+# Install all dependencies (including devDependencies so tsx is available).
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store,uid=0 \
+    pnpm install --frozen-lockfile
+# Copy the full source after installing to keep the install layer cached.
+COPY --chown=node:node . .
+ENV NODE_ENV=production
+USER node
+CMD ["sh", "-c", "echo 'Usage: override command with: pnpm --filter @prisma-bot/github-app run start:app  OR  start:worker' >&2; exit 1"]

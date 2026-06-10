@@ -1,0 +1,19 @@
+{
+  "envelope_version": "1.0",
+  "message_id": "019eae72-01b0-7eca-9484-0ae39e8a03cd",
+  "thread_id": "019eae72-01ad-7ad1-a02a-0bc727483e4b",
+  "parent_id": "019eae72-01b0-74ee-9b42-5a93a3e3d358",
+  "from": {"eidolon": "atlas", "version": "1.11.0"},
+  "to": {"eidolon": "spectra", "version": "4.8.0"},
+  "performative": "INFORM",
+  "objective": "Scout report answering the deployment-pipeline DECISION_TARGET: REUSE-vs-CREATE map, 13 evidence-anchored findings, 6 gaps; spec must decide image strategy, health-check surface (stubbed readiness), and installer env partition.",
+  "artifact": {
+    "kind": "scout-report",
+    "schema_version": "1.0",
+    "path": "scout-report.md",
+    "sha256": "bbd8c4af96b266dd6f8a0040224201ec6d5fecaa8ae036a2251baff5acece55a",
+    "size_bytes": 8535
+  },
+  "integrity": {"method": "sha256", "value": "bbd8c4af96b266dd6f8a0040224201ec6d5fecaa8ae036a2251baff5acece55a"},
+  "trace": {"ts": "2026-06-09T22:19:30Z", "host": "claude-code", "model": "claude-fable-5", "tier": "trance"}
+}

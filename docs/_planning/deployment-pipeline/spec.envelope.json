@@ -1,0 +1,19 @@
+{
+  "envelope_version": "1.0",
+  "message_id": "019eae72-01b0-7c0e-8239-133fdbbced12",
+  "thread_id": "019eae72-01ad-7ad1-a02a-0bc727483e4b",
+  "parent_id": "019eae72-01b0-7eca-9484-0ae39e8a03cd",
+  "from": {"eidolon": "spectra", "version": "4.8.0"},
+  "to": {"eidolon": "apivr", "version": "3.6.0"},
+  "performative": "PROPOSE",
+  "objective": "Decision-ready spec for the prisma-bot deployment pipeline: 6 ship stories (S1-S6) on 3 parallel tracks (T-image, T-compose, T-installer), two sync contracts (image tag, /healthz/live); S7 stretch pending human ratification.",
+  "artifact": {
+    "kind": "spec",
+    "schema_version": "1.0",
+    "path": "spec.md",
+    "sha256": "cb42196c533f7048a28624788620c213cbdaa9268c556be21adf93b0f2a0f0a4",
+    "size_bytes": 35963
+  },
+  "integrity": {"method": "sha256", "value": "cb42196c533f7048a28624788620c213cbdaa9268c556be21adf93b0f2a0f0a4"},
+  "trace": {"ts": "2026-06-09T22:35:00Z", "host": "claude-code", "model": "claude-fable-5", "tier": "trance"}
+}
