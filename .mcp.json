@@ -1,0 +1,65 @@
+{
+  "mcpServers": {
+    "crystalium": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--name",
+        "crystalium-prisma",
+        "--label",
+        "eidolons.project=prisma",
+        "-v",
+        "/Users/henrique/.crystalium/prisma:/root/.crystalium/prisma",
+        "-e",
+        "CRYSTALIUM_DATA_DIR=/root/.crystalium/prisma",
+        "-e",
+        "CRYSTALIUM_CALLER_TIER=T1",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "ghcr.io/rynaro/crystalium@sha256:778167053c55cea71c1f6d7a12f8a11d904c00715aaa72ac47aec90b3d3fdf2f",
+        "python",
+        "-m",
+        "crystalium",
+        "serve"
+      ]
+    },
+    "atlas-aci": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--read-only",
+        "--name",
+        "atlas-aci-prisma",
+        "--label",
+        "eidolons.project=prisma",
+        "-v",
+        "/Users/henrique/workspace/oss/prisma:/repo:ro",
+        "-v",
+        "/Users/henrique/workspace/oss/prisma/.atlas/memex:/memex",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "ghcr.io/rynaro/atlas-aci@sha256:86f82c454d21378ba99ce7ef92494c34ad533e82bc76e6ea7affa4a8056326b3",
+        "serve",
+        "--repo",
+        "/repo",
+        "--memex-root",
+        "/memex"
+      ]
+    },
+    "junction": {
+      "command": "/Users/henrique/.eidolons/cache/junction@0.3.0/junction",
+      "args": [
+        "mcp",
+        "serve"
+      ]
+    }
+  }
+}
