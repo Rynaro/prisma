@@ -27,6 +27,13 @@ export const JobPayloadSchema = z
     received_at: z.string().datetime({ offset: true }),
     // Phase 3 additive extension — does not modify Phase 2 contracts.
     traceparent: z.string().min(1).optional(),
+    // Repository identity carried from the webhook payload so the worker can
+    // resolve owner/repo without an extra API call. Optional for backwards
+    // compatibility: jobs enqueued by an older app version will not have these
+    // fields; the worker falls back to env-var overrides and then throws a
+    // descriptive error if neither source is available.
+    owner: z.string().min(1).optional(),
+    repo: z.string().min(1).optional(),
   })
   .strict();
 export type JobPayload = z.infer<typeof JobPayloadSchema>;

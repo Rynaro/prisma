@@ -18,6 +18,8 @@ const sign = (body: Buffer | string, secret = TEST_SECRET): string => {
 interface PullRequestBodyArgs {
   installation_id?: number;
   repository_id?: number;
+  repository_owner?: string;
+  repository_name?: string;
   pull_request_number?: number;
   head_sha?: string;
   action?: string;
@@ -26,7 +28,11 @@ interface PullRequestBodyArgs {
 const makePullRequestBody = (args: PullRequestBodyArgs = {}): Record<string, unknown> => ({
   action: args.action ?? 'opened',
   installation: { id: args.installation_id ?? 1234 },
-  repository: { id: args.repository_id ?? 5678 },
+  repository: {
+    id: args.repository_id ?? 5678,
+    name: args.repository_name ?? 'hello-world',
+    owner: { login: args.repository_owner ?? 'octocat' },
+  },
   pull_request: {
     number: args.pull_request_number ?? 42,
     head: { sha: args.head_sha ?? 'a'.repeat(40) },
@@ -174,6 +180,8 @@ describe('POST /webhooks/github (Phase 5.2)', () => {
         pull_request_number: 42,
         head_sha: 'a'.repeat(40),
         event_type: 'pull_request.opened',
+        owner: 'octocat',
+        repo: 'hello-world',
       }),
     );
     expect(typeof enqueuedPayload.received_at).toBe('string');
@@ -398,5 +406,50 @@ describe('POST /webhooks/github (Phase 5.2)', () => {
     expect(enqueueJob).toHaveBeenCalledTimes(1);
     const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
     expect(payload.traceparent).toBe(traceparent);
+  });
+
+  it('carries owner and repo from webhook payload into the enqueued JobPayload', async () => {
+    const body = makePullRequestBody({ repository_owner: 'my-org', repository_name: 'my-service' });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'pull_request',
+        'x-github-delivery': 'd-owner-repo',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(enqueueJob).toHaveBeenCalledTimes(1);
+    const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+    expect(payload.owner).toBe('my-org');
+    expect(payload.repo).toBe('my-service');
+  });
+
+  it('returns 400 when the webhook payload is missing repository.owner.login and does not enqueue', async () => {
+    // A payload that has repository.id but is missing the owner object.
+    const incompleteBody = {
+      action: 'opened',
+      installation: { id: 1234 },
+      repository: { id: 5678, name: 'hello-world' }, // missing owner
+      pull_request: { number: 42, head: { sha: 'a'.repeat(40) } },
+    };
+    const raw = Buffer.from(JSON.stringify(incompleteBody), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'pull_request',
+        'x-github-delivery': 'd-missing-owner',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(enqueueJob).not.toHaveBeenCalled();
   });
 });

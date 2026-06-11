@@ -18,6 +18,7 @@ import {
 import IORedis from 'ioredis';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
+import { resolveRepoIdentity } from './repo-identity.js';
 
 /**
  * `worker.ts` — production wiring for the BullMQ consumer. Builds the
@@ -164,33 +165,52 @@ const buildInstallationAuth = async (secretSource: SecretSource): Promise<Instal
 };
 
 /**
- * Build the `RepoLookup` callback. Ideally this resolves
- * `(installation_id, repository_id) → { owner, repo, app_id, app_login }`
- * via an Octokit lookup against `installations/{id}/repositories`. For
- * MVP we read defaults from env vars; production wiring is a follow-up.
+ * Build the `RepoLookup` callback. Resolution order (highest precedence first):
+ *
+ *   1. **Env-var override** — if `GITHUB_DEFAULT_OWNER` and
+ *      `GITHUB_DEFAULT_REPO` are both set they take precedence over every
+ *      other source.  This is the existing single-tenant escape hatch; it
+ *      continues to work unchanged so that operators who rely on it are
+ *      unaffected by this change.
+ *   2. **Webhook payload fields** — `owner` and `repo` are carried from the
+ *      GitHub `pull_request` webhook payload (`repository.owner.login` and
+ *      `repository.name`) into the `JobPayload` by the server.  This is the
+ *      primary production path and requires no extra GitHub API call.
+ *   3. **Error** — if neither source yields a value the lookup throws a
+ *      descriptive `Error` so the job fails fast with a clear log message
+ *      instead of silently routing to `unknown-owner/unknown-repo`.  Old
+ *      payloads (enqueued before this change) will hit this path; that is the
+ *      correct behaviour for in-flight jobs that cannot be resolved.
  */
 const buildRepoLookup = (secretSource: SecretSource): RepoLookup => {
   return async (params): Promise<RepoIdentity> => {
-    const ownerEnv = await tryGetSecret(secretSource, 'GITHUB_DEFAULT_OWNER');
-    const repoEnv = await tryGetSecret(secretSource, 'GITHUB_DEFAULT_REPO');
-    const appIdRaw = await tryGetSecret(secretSource, 'GITHUB_APP_ID');
-    const appLoginEnv = await tryGetSecret(secretSource, 'GITHUB_APP_SLUG');
-    const owner = ownerEnv ?? 'unknown-owner';
-    const repo = repoEnv ?? 'unknown-repo';
-    const app_id = appIdRaw !== undefined ? Number.parseInt(appIdRaw, 10) : 0;
-    const app_login = appLoginEnv ?? 'prisma-bot';
+    const resolution = resolveRepoIdentity({
+      payloadOwner: params.owner,
+      payloadRepo: params.repo,
+      envOwner: await tryGetSecret(secretSource, 'GITHUB_DEFAULT_OWNER'),
+      envRepo: await tryGetSecret(secretSource, 'GITHUB_DEFAULT_REPO'),
+      appIdRaw: await tryGetSecret(secretSource, 'GITHUB_APP_ID'),
+      appLogin: await tryGetSecret(secretSource, 'GITHUB_APP_SLUG'),
+    });
+
+    if (!resolution.ok) {
+      log('worker.repo_lookup.error', {
+        installation_id: params.installation_id,
+        repository_id: params.repository_id,
+        missing: resolution.missing,
+        message: resolution.message,
+      });
+      throw new Error(resolution.message);
+    }
+
     log('worker.repo_lookup', {
       installation_id: params.installation_id,
       repository_id: params.repository_id,
-      owner,
-      repo,
+      owner: resolution.identity.owner,
+      repo: resolution.identity.repo,
+      source: resolution.source,
     });
-    return {
-      owner,
-      repo,
-      app_id: Number.isFinite(app_id) && app_id > 0 ? app_id : 0,
-      app_login,
-    };
+    return resolution.identity;
   };
 };
 
