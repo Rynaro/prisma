@@ -111,6 +111,39 @@ describe('@prisma-bot/shared schemas', () => {
         );
       }
     });
+
+    it('accepts a payload with owner and repo fields (new webhook-sourced fields)', () => {
+      const result = JobPayloadSchema.safeParse({
+        ...validJobPayload,
+        owner: 'octocat',
+        repo: 'hello-world',
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.owner).toBe('octocat');
+        expect(result.data.repo).toBe('hello-world');
+      }
+    });
+
+    it('accepts an old-shape payload without owner/repo (backwards compatibility)', () => {
+      // Payloads enqueued before the webhook-identity change must still parse
+      // successfully; the worker handles the missing fields at lookup time.
+      const result = JobPayloadSchema.safeParse(validJobPayload);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.owner).toBeUndefined();
+        expect(result.data.repo).toBeUndefined();
+      }
+    });
+
+    it('rejects a payload where owner is an empty string', () => {
+      const result = JobPayloadSchema.safeParse({
+        ...validJobPayload,
+        owner: '',
+        repo: 'hello-world',
+      });
+      expect(result.success).toBe(false);
+    });
   });
 
   describe('RejectionLogEntry', () => {

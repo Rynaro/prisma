@@ -81,7 +81,7 @@ interface ParsedJsonBody {
 
 interface PullRequestEnvelope {
   installation: { id: number };
-  repository: { id: number };
+  repository: { id: number; name: string; owner: { login: string } };
   pull_request: { number: number; head: { sha: string } };
   action?: string;
 }
@@ -92,10 +92,18 @@ const isPullRequestEnvelope = (value: unknown): value is PullRequestEnvelope => 
   }
   const v = value as Record<string, unknown>;
   const installation = v.installation as { id?: unknown } | undefined;
-  const repository = v.repository as { id?: unknown } | undefined;
+  const repository = v.repository as
+    | {
+        id?: unknown;
+        name?: unknown;
+        owner?: { login?: unknown };
+      }
+    | undefined;
   const pullRequest = v.pull_request as { number?: unknown; head?: { sha?: unknown } } | undefined;
   if (!installation || typeof installation.id !== 'number') return false;
   if (!repository || typeof repository.id !== 'number') return false;
+  if (typeof repository.name !== 'string') return false;
+  if (!repository.owner || typeof repository.owner.login !== 'string') return false;
   if (!pullRequest || typeof pullRequest.number !== 'number') return false;
   if (!pullRequest.head || typeof pullRequest.head.sha !== 'string') return false;
   return true;
@@ -364,6 +372,8 @@ export const buildServer = (opts: BuildServerOptions) => {
 
     const installationId = parsedBody.installation.id;
     const repositoryId = parsedBody.repository.id;
+    const repositoryOwner = parsedBody.repository.owner.login;
+    const repositoryName = parsedBody.repository.name;
     const pullRequestNumber = parsedBody.pull_request.number;
     const headSha = parsedBody.pull_request.head.sha;
 
@@ -407,6 +417,8 @@ export const buildServer = (opts: BuildServerOptions) => {
     // Build the JobPayload per docs/api-contracts.md § Async job contract;
     // include `traceparent` if the header is present (Phase 3 additive
     // extension — system-design.md § Cross-cutting concerns).
+    // `owner` and `repo` are sourced directly from the webhook payload so the
+    // worker can resolve repo identity without an extra GitHub API call.
     const jobPayload: JobPayload = {
       idempotency_key: idempotencyKey,
       installation_id: installationId,
@@ -415,6 +427,8 @@ export const buildServer = (opts: BuildServerOptions) => {
       head_sha: headSha,
       event_type: eventTypeFor(action ?? ''),
       received_at: new Date().toISOString(),
+      owner: repositoryOwner,
+      repo: repositoryName,
       ...(traceparent !== undefined ? { traceparent } : {}),
     };
 

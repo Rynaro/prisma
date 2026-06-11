@@ -24,6 +24,9 @@ pr_payload:
   repository:
     id: 2000
     full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
   pull_request:
     number: 42
     head:

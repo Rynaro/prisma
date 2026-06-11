@@ -68,6 +68,10 @@ export interface RepoIdentity {
 export type RepoLookup = (params: {
   installation_id: number;
   repository_id: number;
+  /** Optional: repo owner login carried from the webhook payload. */
+  owner?: string;
+  /** Optional: repo name carried from the webhook payload. */
+  repo?: string;
 }) => Promise<RepoIdentity>;
 
 export type LogEvent =
@@ -261,6 +265,8 @@ export const runPipeline = async (
   const identity = await deps.repoLookup({
     installation_id: payload.installation_id,
     repository_id: payload.repository_id,
+    ...(payload.owner !== undefined ? { owner: payload.owner } : {}),
+    ...(payload.repo !== undefined ? { repo: payload.repo } : {}),
   });
 
   const octokit = deps.octokit ?? (await deps.installationAuth.getOctokit(payload.installation_id));

@@ -48,6 +48,8 @@ const sign = (body: Buffer | string, secret = TEST_SECRET): string => {
 interface PullRequestBodyArgs {
   installation_id?: number;
   repository_id?: number;
+  repository_owner?: string;
+  repository_name?: string;
   pull_request_number?: number;
   head_sha?: string;
   action?: string;
@@ -56,7 +58,11 @@ interface PullRequestBodyArgs {
 const makePullRequestBody = (args: PullRequestBodyArgs = {}): Record<string, unknown> => ({
   action: args.action ?? 'opened',
   installation: { id: args.installation_id ?? 1234 },
-  repository: { id: args.repository_id ?? 5678 },
+  repository: {
+    id: args.repository_id ?? 5678,
+    name: args.repository_name ?? 'hello-world',
+    owner: { login: args.repository_owner ?? 'octocat' },
+  },
   pull_request: {
     number: args.pull_request_number ?? 42,
     head: { sha: args.head_sha ?? 'a'.repeat(40) },
