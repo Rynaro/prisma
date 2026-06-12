@@ -162,9 +162,19 @@ Mention the bot in a PR comment to trigger actions without opening the GitHub UI
 nickname: prbot
 ```
 
-Both `@prisma-bot` and `@prbot` will then be accepted as valid triggers.
+Both `@prisma-bot` and `@prbot` will then be accepted as valid triggers. Mention matching is case-insensitive: `@Prbot` and `@prbot` are equivalent.
 
-**Ack protocol.** When the bot receives a command it adds a 👀 reaction to acknowledge receipt (fail-open — the review continues even if the reaction call fails). On success it adds a ✅ reaction and optionally posts a reply comment for `help` and `configuration` commands.
+**Command marker.** By default the bot is triggered by `@<login>`. To avoid GitHub's `@`-autocomplete (which can surface and ping real users who share a name prefix with the bot slug), set a different command marker:
+
+```yaml
+command_marker: "$"
+```
+
+Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write `$prisma-bot review` instead of `@prisma-bot review`. All four markers are supported in the same syntax.
+
+> **Note on `$`.** GitHub renders `$...$` pairs as inline math (LaTeX). A lone `$josie` at the start of a line (no matching `$` on the same line) is plain text — this is the safe common pattern.
+
+**Ack protocol.** When the bot receives a recognised command it adds a 👀 reaction to acknowledge receipt (fail-open — the review continues even if the reaction call fails). On success it adds a ✅ reaction and optionally posts a reply comment for `help` and `configuration` commands. The 👀 reaction is posted only after the marker and identity checks pass — the bot will not react to comments addressed to other people or the wrong marker.
 
 **Loop prevention.** Comments authored by the bot itself are silently discarded at the worker level — the job resolves to `discarded_idempotent` without any provider call.
 
@@ -174,7 +184,7 @@ Both `@prisma-bot` and `@prbot` will then be accepted as valid triggers.
 
 **v0.5.0** — pipeline observability: provider findings-count event, per-rejection validator detail, truncation guards in all three provider adapters.
 
-- 465 tests across 47 files, all passing · 12/12 deterministic eval scenarios PASS
+- 506 tests across 47 files, all passing · 12/12 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`

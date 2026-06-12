@@ -76,6 +76,12 @@ const CommentJobPayloadSchema = z
     commenter_association: z.string().min(1),
     mention_candidate: z.string().min(1),
     command_raw: z.string(),
+    /**
+     * The command marker that was used in the comment (one of `@`, `$`, `!`,
+     * `/`). Optional for backward compatibility — old queued payloads without
+     * this field are treated as if they used the default `@` marker.
+     */
+    command_marker: z.enum(['@', '$', '!', '/']).default('@'),
   })
   .strict();
 

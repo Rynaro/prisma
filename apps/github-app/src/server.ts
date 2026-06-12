@@ -721,6 +721,7 @@ export const buildServer = (opts: BuildServerOptions) => {
         commenter_association: authorAssociation,
         mention_candidate: mentionResult.candidate,
         command_raw: mentionResult.rest,
+        command_marker: mentionResult.marker,
         ...(traceparent !== undefined ? { traceparent } : {}),
       };
 

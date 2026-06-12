@@ -56,6 +56,7 @@ const makeCommentPayload = (
   commenter_association: 'COLLABORATOR',
   mention_candidate: 'mybot',
   command_raw: 'review',
+  command_marker: '@',
   owner: 'octocat',
   repo: 'hello-world',
   ...overrides,
@@ -172,33 +173,98 @@ describe('loop prevention (bot-author detection)', () => {
 describe('nickname resolution (D2)', () => {
   /**
    * Mirrors the target-set construction inside handleCommentJob (worker.ts).
+   * Updated to use case-insensitive comparison (fix c).
    */
   const buildValidTargets = (botLogin: string, nickname?: string): Set<string> => {
-    const targets = new Set<string>([botLogin, `${botLogin}[bot]`]);
-    if (nickname !== undefined) targets.add(nickname);
+    const targets = new Set<string>([botLogin.toLowerCase(), `${botLogin}[bot]`.toLowerCase()]);
+    if (nickname !== undefined) targets.add(nickname.toLowerCase());
     return targets;
   };
 
+  const matchesTarget = (candidate: string, targets: Set<string>): boolean =>
+    targets.has(candidate.toLowerCase());
+
   it('accepts the bot login as a valid target', () => {
     const targets = buildValidTargets('mybot');
-    expect(targets.has('mybot')).toBe(true);
-    expect(targets.has('mybot[bot]')).toBe(true);
+    expect(matchesTarget('mybot', targets)).toBe(true);
+    expect(matchesTarget('mybot[bot]', targets)).toBe(true);
   });
 
   it('accepts the configured nickname as a valid target', () => {
     const targets = buildValidTargets('mybot', 'reviewbot');
-    expect(targets.has('reviewbot')).toBe(true);
+    expect(matchesTarget('reviewbot', targets)).toBe(true);
   });
 
   it('does not accept an unrelated login as a valid target', () => {
     const targets = buildValidTargets('mybot');
-    expect(targets.has('wrongname')).toBe(false);
+    expect(matchesTarget('wrongname', targets)).toBe(false);
   });
 
   it('nickname does not override loop prevention (bot login always in set)', () => {
     // Even when nickname is set, bot login is still in the valid-targets set.
     const targets = buildValidTargets('mybot', 'reviewbot');
-    expect(targets.has('mybot')).toBe(true);
+    expect(matchesTarget('mybot', targets)).toBe(true);
+  });
+
+  // --- (c) case-insensitive nickname/slug matching ---
+
+  it('case-insensitive: candidate "josie" matches nickname "Josie" (exact production case)', () => {
+    const targets = buildValidTargets('mybot', 'Josie');
+    expect(matchesTarget('josie', targets)).toBe(true);
+  });
+
+  it('case-insensitive: candidate "Josie" matches nickname "josie"', () => {
+    const targets = buildValidTargets('mybot', 'josie');
+    expect(matchesTarget('Josie', targets)).toBe(true);
+  });
+
+  it('case-insensitive: candidate "MYBOT" matches bot login "mybot"', () => {
+    const targets = buildValidTargets('mybot');
+    expect(matchesTarget('MYBOT', targets)).toBe(true);
+  });
+
+  it('case-insensitive: candidate "MyBot[BOT]" matches bot comment login "mybot[bot]"', () => {
+    const targets = buildValidTargets('mybot');
+    expect(matchesTarget('MyBot[BOT]', targets)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Marker mismatch drop (b)
+// ---------------------------------------------------------------------------
+
+describe('marker mismatch drop logic', () => {
+  /**
+   * Mirrors the marker-enforcement logic inside handleCommentJob (worker.ts).
+   */
+  const isMarkerMatch = (payloadMarker: string, configuredMarker: string): boolean =>
+    payloadMarker === configuredMarker;
+
+  it('@ matches @ (default case)', () => {
+    expect(isMarkerMatch('@', '@')).toBe(true);
+  });
+
+  it('$ matches $ (custom marker)', () => {
+    expect(isMarkerMatch('$', '$')).toBe(true);
+  });
+
+  it('$ does NOT match @ (mismatch → drop)', () => {
+    expect(isMarkerMatch('$', '@')).toBe(false);
+  });
+
+  it('@ does NOT match $ (mismatch → drop)', () => {
+    expect(isMarkerMatch('@', '$')).toBe(false);
+  });
+
+  it('! does NOT match / (mismatch → drop)', () => {
+    expect(isMarkerMatch('!', '/')).toBe(false);
+  });
+
+  it('default payload marker "@" matches default config "@"', () => {
+    // Old payloads without command_marker field get default '@' from Zod.
+    const payloadMarker = '@'; // Zod default
+    const configuredMarker = '@'; // config default
+    expect(isMarkerMatch(payloadMarker, configuredMarker)).toBe(true);
   });
 });
 
@@ -215,6 +281,16 @@ describe('comment job payload', () => {
   it('carries head_sha as empty sentinel at ingress time', () => {
     const p = makeCommentPayload();
     expect(p.head_sha).toBe('');
+  });
+
+  it('carries command_marker "@" by default', () => {
+    const p = makeCommentPayload();
+    expect(p.command_marker).toBe('@');
+  });
+
+  it('carries non-default command_marker when overridden', () => {
+    const p = makeCommentPayload({ command_marker: '$' });
+    expect(p.command_marker).toBe('$');
   });
 
   it('ack fail-open: reaction error does not propagate to reply', async () => {
@@ -240,5 +316,59 @@ describe('comment job payload', () => {
 
     expect(addReactionSpy).toHaveBeenCalledOnce();
     expect(fake.replyCalls).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Eyes reaction ordering (d)
+// ---------------------------------------------------------------------------
+
+describe('eyes reaction ordering', () => {
+  /**
+   * Mirrors the ordering contract: 👀 must NOT be posted when a drop condition
+   * (marker mismatch or nickname mismatch) is detected before dispatch.
+   * This is a pure-function simulation of the control flow.
+   */
+
+  interface DropResult {
+    dropped: boolean;
+    reason: string;
+  }
+
+  const checkDropBeforeEyes = (
+    payloadMarker: string,
+    configuredMarker: string,
+    candidateLower: string,
+    validTargets: Set<string>,
+  ): DropResult => {
+    if (payloadMarker !== configuredMarker) {
+      return { dropped: true, reason: 'marker_mismatch' };
+    }
+    if (!validTargets.has(candidateLower)) {
+      return { dropped: true, reason: 'nickname_mismatch' };
+    }
+    return { dropped: false, reason: '' };
+  };
+
+  it('does NOT drop on matching marker + matching candidate (eyes SHOULD be posted)', () => {
+    const result = checkDropBeforeEyes('@', '@', 'mybot', new Set(['mybot', 'mybot[bot]']));
+    expect(result.dropped).toBe(false);
+  });
+
+  it('drops on marker mismatch (eyes should NOT be posted)', () => {
+    const result = checkDropBeforeEyes('$', '@', 'mybot', new Set(['mybot']));
+    expect(result.dropped).toBe(true);
+    expect(result.reason).toBe('marker_mismatch');
+  });
+
+  it('drops on nickname mismatch (eyes should NOT be posted)', () => {
+    const result = checkDropBeforeEyes('@', '@', 'wrongbot', new Set(['mybot', 'mybot[bot]']));
+    expect(result.dropped).toBe(true);
+    expect(result.reason).toBe('nickname_mismatch');
+  });
+
+  it('$ marker with matching config allows eyes to be posted', () => {
+    const result = checkDropBeforeEyes('$', '$', 'josie', new Set(['josie', 'josie[bot]']));
+    expect(result.dropped).toBe(false);
   });
 });

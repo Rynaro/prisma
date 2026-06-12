@@ -177,6 +177,40 @@ describe('@prisma-bot/shared schemas', () => {
       }
     });
 
+    // --- (g) backward compat: old payload without command_marker still parses ---
+
+    it('old issue_comment.command payload without command_marker still parses (default "@")', () => {
+      // Payloads enqueued before the command_marker field was added must still
+      // parse successfully; the Zod default fills in '@'.
+      const oldPayload = {
+        idempotency_key: 'idem-old-1',
+        installation_id: 1234,
+        repository_id: 9876,
+        pull_request_number: 42,
+        head_sha: '',
+        event_type: 'issue_comment.command' as const,
+        received_at: '2026-04-30T17:03:21Z',
+        comment_id: 9001,
+        commenter_login: 'alice',
+        commenter_association: 'COLLABORATOR',
+        mention_candidate: 'mybot',
+        command_raw: 'review',
+        owner: 'octocat',
+        repo: 'hello-world',
+        // command_marker intentionally absent
+      };
+      const result = JobPayloadSchema.safeParse(oldPayload);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.event_type).toBe('issue_comment.command');
+        // Narrow the discriminated union to access comment-specific fields.
+        if (result.data.event_type === 'issue_comment.command') {
+          // Default '@' is filled in by Zod.
+          expect(result.data.command_marker).toBe('@');
+        }
+      }
+    });
+
     it('rejects a comment variant missing command_raw with a path-specific issue', () => {
       const commentPayload = {
         idempotency_key: 'idem-comment-2',
@@ -405,6 +439,69 @@ describe('@prisma-bot/shared schemas', () => {
       expect(result.success).toBe(false);
     });
   });
+
+  // --- command_marker config tests (f) ---
+
+  describe('RepoConfigSchema command_marker key', () => {
+    it('defaults to "@" when absent', () => {
+      const result = RepoConfigSchema.safeParse({});
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.command_marker).toBe('@');
+      }
+    });
+
+    it('accepts "@"', () => {
+      const result = RepoConfigSchema.safeParse({ command_marker: '@' });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.command_marker).toBe('@');
+      }
+    });
+
+    it('accepts "$"', () => {
+      const result = RepoConfigSchema.safeParse({ command_marker: '$' });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.command_marker).toBe('$');
+      }
+    });
+
+    it('accepts "!"', () => {
+      const result = RepoConfigSchema.safeParse({ command_marker: '!' });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.command_marker).toBe('!');
+      }
+    });
+
+    it('accepts "/"', () => {
+      const result = RepoConfigSchema.safeParse({ command_marker: '/' });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.command_marker).toBe('/');
+      }
+    });
+
+    it('rejects "#" (not in the allowed set)', () => {
+      const result = RepoConfigSchema.safeParse({ command_marker: '#' });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects "%" (not in the allowed set)', () => {
+      const result = RepoConfigSchema.safeParse({ command_marker: '%' });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a multi-character value', () => {
+      const result = RepoConfigSchema.safeParse({ command_marker: '@!' });
+      expect(result.success).toBe(false);
+    });
+
+    it('DEFAULT_REPO_CONFIG has command_marker "@"', () => {
+      expect(DEFAULT_REPO_CONFIG.command_marker).toBe('@');
+    });
+  });
 });
 
 // --- T4: Command parser ---
@@ -412,16 +509,17 @@ describe('@prisma-bot/shared schemas', () => {
 describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)', () => {
   describe('parseMentionCandidate', () => {
     it.each([
-      ['@reviewbot full review please', 'reviewbot', 'full review please'],
-      ['@reviewbot   REVIEW', 'reviewbot', 'REVIEW'],
-      ['@bot help', 'bot', 'help'],
-      ['@bot', 'bot', ''],
-      ['  @mybot config', 'mybot', 'config'],
-    ])('parses "%s" → candidate=%s, rest=%s', (body, candidate, rest) => {
+      ['@reviewbot full review please', 'reviewbot', 'full review please', '@'],
+      ['@reviewbot   REVIEW', 'reviewbot', 'REVIEW', '@'],
+      ['@bot help', 'bot', 'help', '@'],
+      ['@bot', 'bot', '', '@'],
+      ['  @mybot config', 'mybot', 'config', '@'],
+    ])('parses "%s" → candidate=%s, rest=%s, marker=%s', (body, candidate, rest, marker) => {
       const result = parseMentionCandidate(body);
       expect(result).not.toBeNull();
       expect(result?.candidate).toBe(candidate);
       expect(result?.rest).toBe(rest);
+      expect(result?.marker).toBe(marker);
     });
 
     it.each([
@@ -430,13 +528,60 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
       ['// @bot review'], // mid-comment (not at start)
       ['```\n@bot review\n```'], // code fence (first char is backtick, not @)
       [''],
-    ])('returns null for "%s" (no mention at start)', (body) => {
+      ['#bot review'], // # is not an allowed marker
+      ['%bot review'], // % is not an allowed marker
+    ])('returns null for "%s" (no recognised marker at start)', (body) => {
       expect(parseMentionCandidate(body)).toBeNull();
     });
 
     it('only inspects the first line (mid-body mention ignored)', () => {
       const body = 'LGTM\n@bot review';
       expect(parseMentionCandidate(body)).toBeNull();
+    });
+
+    // --- configurable command marker tests (a) ---
+
+    it('parses $ marker: "$josie review" → marker=$, candidate=josie', () => {
+      const result = parseMentionCandidate('$josie review');
+      expect(result).not.toBeNull();
+      expect(result?.marker).toBe('$');
+      expect(result?.candidate).toBe('josie');
+      expect(result?.rest).toBe('review');
+    });
+
+    it('parses ! marker: "!bot help" → marker=!, candidate=bot', () => {
+      const result = parseMentionCandidate('!bot help');
+      expect(result).not.toBeNull();
+      expect(result?.marker).toBe('!');
+      expect(result?.candidate).toBe('bot');
+      expect(result?.rest).toBe('help');
+    });
+
+    it('parses / marker: "/bot configuration" → marker=/, candidate=bot', () => {
+      const result = parseMentionCandidate('/bot configuration');
+      expect(result).not.toBeNull();
+      expect(result?.marker).toBe('/');
+      expect(result?.candidate).toBe('bot');
+      expect(result?.rest).toBe('configuration');
+    });
+
+    it('parses @ marker: "@bot full review" → marker=@, candidate=bot', () => {
+      const result = parseMentionCandidate('@bot full review');
+      expect(result).not.toBeNull();
+      expect(result?.marker).toBe('@');
+      expect(result?.candidate).toBe('bot');
+      expect(result?.rest).toBe('full review');
+    });
+
+    it('rejects # as a marker (not in the allowed set)', () => {
+      expect(parseMentionCandidate('#bot review')).toBeNull();
+    });
+
+    it('leading whitespace is tolerated with non-@ markers', () => {
+      const result = parseMentionCandidate('  $josie review');
+      expect(result).not.toBeNull();
+      expect(result?.marker).toBe('$');
+      expect(result?.candidate).toBe('josie');
     });
   });
 

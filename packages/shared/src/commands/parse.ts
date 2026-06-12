@@ -16,39 +16,67 @@
 // ---------------------------------------------------------------------------
 
 /**
+ * The allowed set of command-marker characters. One of these must appear before
+ * the candidate login in a command comment. Default is `'@'`.
+ */
+export type CommandMarker = '@' | '$' | '!' | '/';
+
+/**
+ * The four allowed command-marker characters as a frozen set, used for both
+ * runtime validation and regex construction.
+ */
+export const ALLOWED_COMMAND_MARKERS: ReadonlySet<CommandMarker> = new Set<CommandMarker>([
+  '@',
+  '$',
+  '!',
+  '/',
+]);
+
+/**
  * Result of a successful mention candidate parse.
  */
 export interface MentionCandidateResult {
-  /** The login-shaped token following `@`. */
+  /** The login-shaped token following the marker. */
   candidate: string;
   /** The remainder of the first line after the mention token (trimmed). */
   rest: string;
+  /**
+   * The command marker that was matched (`@`, `$`, `!`, or `/`).
+   * Present when one of the four recognised markers was used.
+   * Defaults to `'@'` for callers that do not inspect the marker.
+   */
+  marker: CommandMarker;
 }
 
 /**
- * Cheap ingress pre-filter. Matches a `@<login>` at the start of the comment
+ * Cheap ingress pre-filter. Matches any of the four allowed command markers
+ * (`@`, `$`, `!`, `/`) followed by a `<login>` at the start of the comment
  * body (leading whitespace allowed), case-insensitive, first line only.
  *
- * Returns `null` fast for non-mentions — no I/O, no config fetch.
+ * Returns `null` fast for non-commands — no I/O, no config fetch.
  * Does NOT validate whether the candidate is the bot's login or a configured
  * nickname; that authoritative check is done in the worker.
  */
 export const parseMentionCandidate = (body: string): MentionCandidateResult | null => {
   // Only inspect the first line of the comment.
   const firstLine = body.split('\n')[0] ?? '';
-  // Pattern: optional leading whitespace, @<login>, optional trailing content.
-  // Login-shaped: starts with alphanumeric, may contain hyphens, max 39 chars.
-  const re = /^\s*@(?<candidate>[A-Za-z0-9][A-Za-z0-9-]{0,38})\b\s*(?<rest>.*)/i;
+  // Pattern: optional leading whitespace, one of the 4 allowed markers,
+  // <login> (starts with alphanumeric, may contain hyphens, max 39 chars),
+  // optional trailing content.
+  const re = /^\s*(?<marker>[@$!/])(?<candidate>[A-Za-z0-9][A-Za-z0-9-]{0,38})\b\s*(?<rest>.*)/i;
   const m = re.exec(firstLine);
   if (m === null || m.groups === undefined) {
     return null;
   }
   const candidate = m.groups.candidate;
   const rest = (m.groups.rest ?? '').trim();
-  if (candidate === undefined || candidate.length === 0) {
+  const rawMarker = m.groups.marker;
+  if (candidate === undefined || candidate.length === 0 || rawMarker === undefined) {
     return null;
   }
-  return { candidate, rest };
+  // Narrow the marker to the CommandMarker union type.
+  const marker = rawMarker as CommandMarker;
+  return { candidate, rest, marker };
 };
 
 // ---------------------------------------------------------------------------

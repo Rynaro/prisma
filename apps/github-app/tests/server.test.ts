@@ -731,3 +731,223 @@ describe('POST /webhooks/github — check_run event (T1)', () => {
     expect(payload.event_type).toBe('pull_request.opened');
   });
 });
+
+// ---------------------------------------------------------------------------
+// botLogin loop prevention (e) + command_marker in JobPayload
+// ---------------------------------------------------------------------------
+
+describe('POST /webhooks/github — botLogin wiring (e)', () => {
+  let enqueueJob: ReturnType<typeof vi.fn>;
+  let replayCache: InMemoryReplayCache;
+
+  beforeEach(() => {
+    enqueueJob = vi.fn(async (payload: JobPayload) => ({
+      enqueued: true,
+      idempotency_key: payload.idempotency_key,
+    }));
+    replayCache = new InMemoryReplayCache({ windowSeconds: 60 });
+  });
+
+  it('drops a bot-authored comment when botLogin is provided and login matches "<botLogin>[bot]"', async () => {
+    // Build a server with botLogin configured.
+    const opts: BuildServerOptions = {
+      webhookSecret: () => TEST_SECRET,
+      replayCache,
+      enqueueJob: enqueueJob as unknown as EnqueueJob,
+      botLogin: 'my-review-bot',
+    };
+    const app = buildServer(opts);
+    try {
+      const body = makeIssueCommentBody({
+        comment_body: '@my-review-bot review',
+        comment_user_login: 'my-review-bot[bot]',
+        comment_user_type: 'User', // type is NOT 'Bot' to isolate the login-based check
+        sender_type: 'User',
+      });
+      const raw = Buffer.from(JSON.stringify(body), 'utf8');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(raw),
+          'x-github-event': 'issue_comment',
+          'x-github-delivery': 'ic-botlogin-drop',
+        },
+        payload: raw,
+      });
+      expect(res.statusCode).toBe(202);
+      expect(res.json()).toEqual(expect.objectContaining({ accepted: false, ignored: true }));
+      expect(enqueueJob).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does NOT drop a human comment even when botLogin is provided', async () => {
+    const opts: BuildServerOptions = {
+      webhookSecret: () => TEST_SECRET,
+      replayCache,
+      enqueueJob: enqueueJob as unknown as EnqueueJob,
+      botLogin: 'my-review-bot',
+    };
+    const app = buildServer(opts);
+    try {
+      const body = makeIssueCommentBody({
+        comment_body: '@my-review-bot review',
+        comment_user_login: 'alice',
+        comment_user_type: 'User',
+        sender_type: 'User',
+      });
+      const raw = Buffer.from(JSON.stringify(body), 'utf8');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(raw),
+          'x-github-event': 'issue_comment',
+          'x-github-delivery': 'ic-botlogin-human',
+        },
+        payload: raw,
+      });
+      expect(res.statusCode).toBe(202);
+      expect(res.json()).toEqual(expect.objectContaining({ accepted: true }));
+      expect(enqueueJob).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('enqueued comment job carries command_marker "@" for @-prefix comment', async () => {
+    const app = buildTestServer({ enqueueJob: enqueueJob as unknown as EnqueueJob, replayCache });
+    try {
+      const body = makeIssueCommentBody({ comment_body: '@test-bot review' });
+      const raw = Buffer.from(JSON.stringify(body), 'utf8');
+      await app.inject({
+        method: 'POST',
+        url: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(raw),
+          'x-github-event': 'issue_comment',
+          'x-github-delivery': 'ic-marker-at',
+        },
+        payload: raw,
+      });
+      expect(enqueueJob).toHaveBeenCalledTimes(1);
+      const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+      expect(payload.event_type).toBe('issue_comment.command');
+      if (payload.event_type === 'issue_comment.command') {
+        expect(payload.command_marker).toBe('@');
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('enqueued comment job carries command_marker "$" for $-prefix comment', async () => {
+    const app = buildTestServer({ enqueueJob: enqueueJob as unknown as EnqueueJob, replayCache });
+    try {
+      const body = makeIssueCommentBody({ comment_body: '$test-bot review' });
+      const raw = Buffer.from(JSON.stringify(body), 'utf8');
+      await app.inject({
+        method: 'POST',
+        url: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(raw),
+          'x-github-event': 'issue_comment',
+          'x-github-delivery': 'ic-marker-dollar',
+        },
+        payload: raw,
+      });
+      expect(enqueueJob).toHaveBeenCalledTimes(1);
+      const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+      expect(payload.event_type).toBe('issue_comment.command');
+      if (payload.event_type === 'issue_comment.command') {
+        expect(payload.command_marker).toBe('$');
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('enqueued comment job carries command_marker "!" for !-prefix comment', async () => {
+    const app = buildTestServer({ enqueueJob: enqueueJob as unknown as EnqueueJob, replayCache });
+    try {
+      const body = makeIssueCommentBody({ comment_body: '!test-bot review' });
+      const raw = Buffer.from(JSON.stringify(body), 'utf8');
+      await app.inject({
+        method: 'POST',
+        url: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(raw),
+          'x-github-event': 'issue_comment',
+          'x-github-delivery': 'ic-marker-bang',
+        },
+        payload: raw,
+      });
+      expect(enqueueJob).toHaveBeenCalledTimes(1);
+      const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+      expect(payload.event_type).toBe('issue_comment.command');
+      if (payload.event_type === 'issue_comment.command') {
+        expect(payload.command_marker).toBe('!');
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('enqueued comment job carries command_marker "/" for /-prefix comment', async () => {
+    const app = buildTestServer({ enqueueJob: enqueueJob as unknown as EnqueueJob, replayCache });
+    try {
+      const body = makeIssueCommentBody({ comment_body: '/test-bot review' });
+      const raw = Buffer.from(JSON.stringify(body), 'utf8');
+      await app.inject({
+        method: 'POST',
+        url: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(raw),
+          'x-github-event': 'issue_comment',
+          'x-github-delivery': 'ic-marker-slash',
+        },
+        payload: raw,
+      });
+      expect(enqueueJob).toHaveBeenCalledTimes(1);
+      const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+      expect(payload.event_type).toBe('issue_comment.command');
+      if (payload.event_type === 'issue_comment.command') {
+        expect(payload.command_marker).toBe('/');
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('comment with no recognised marker is still ignored (# is not a valid marker)', async () => {
+    const app = buildTestServer({ enqueueJob: enqueueJob as unknown as EnqueueJob, replayCache });
+    try {
+      const body = makeIssueCommentBody({ comment_body: '#test-bot review' });
+      const raw = Buffer.from(JSON.stringify(body), 'utf8');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(raw),
+          'x-github-event': 'issue_comment',
+          'x-github-delivery': 'ic-marker-hash',
+        },
+        payload: raw,
+      });
+      expect(res.statusCode).toBe(202);
+      expect(res.json()).toEqual(expect.objectContaining({ accepted: false, ignored: true }));
+      expect(enqueueJob).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});
