@@ -230,6 +230,31 @@ export class CopilotProvider implements Provider {
       throw new ProviderErrorThrowable(mapCopilotError(err));
     }
 
+    // Detect response truncation: finish_reason==='length' means the model hit
+    // max_tokens (4096) and the output may be a partial/invalid findings array.
+    // Treat as schema_validation so the orchestrator publishes malformed_provider_output
+    // and does not silently accept a truncated result.
+    if (
+      typeof response === 'object' &&
+      response !== null &&
+      Array.isArray((response as Record<string, unknown>).choices) &&
+      ((response as Record<string, unknown>).choices as unknown[])[0] !== undefined
+    ) {
+      const firstChoice = (
+        (response as Record<string, unknown>).choices as Record<string, unknown>[]
+      )[0];
+      if (
+        typeof firstChoice === 'object' &&
+        firstChoice !== null &&
+        (firstChoice as Record<string, unknown>).finish_reason === 'length'
+      ) {
+        throw new ProviderErrorThrowable({
+          kind: 'schema_validation',
+          message: `copilot response truncated: finish_reason is 'length' (max_tokens: 4096)`,
+        });
+      }
+    }
+
     const toolArgs = extractToolCallArguments(response, prompt.tool.function.name);
     const parsed = ProviderReviewOutputSchema.safeParse(toolArgs);
     if (!parsed.success) {

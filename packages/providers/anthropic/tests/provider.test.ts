@@ -138,4 +138,36 @@ describe('AnthropicProvider', () => {
     }
     expect(create).not.toHaveBeenCalled();
   });
+
+  // T10: stop_reason==='max_tokens' → schema_validation (truncation guard)
+  it('throws schema_validation when stop_reason is "max_tokens" (response truncated)', async () => {
+    // Simulate a response where the model hit max_tokens: tool_use input
+    // may be a partially-written object that would pass schema but silently drop findings.
+    const create = vi.fn().mockResolvedValue({
+      stop_reason: 'max_tokens',
+      content: [
+        {
+          type: 'tool_use',
+          name: 'submit_review_findings',
+          input: { findings: [] },
+        },
+      ],
+    });
+    const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+    await expect(provider.review(validInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'schema_validation',
+    });
+  });
+
+  // T11: stop_reason==='tool_use' (normal) → does NOT throw truncation error
+  it('does not throw truncation error when stop_reason is "tool_use"', async () => {
+    const create = vi.fn().mockResolvedValue({
+      stop_reason: 'tool_use',
+      ...toolUseResponse({ findings: [] }),
+    });
+    const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+    const out = await provider.review(validInput);
+    expect(out.findings).toHaveLength(0);
+  });
 });

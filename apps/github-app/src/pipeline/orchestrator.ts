@@ -85,6 +85,7 @@ export type LogEvent =
   | 'prefilter.accepted'
   | 'prefilter.skipped'
   | 'provider.called'
+  | 'provider.output'
   | 'provider.error'
   | 'validator.rejected'
   | 'ranker.dropped'
@@ -447,6 +448,7 @@ export const runPipeline = async (
   let providerOutput: ProviderReviewOutput;
   try {
     providerOutput = await deps.provider.review(providerInput);
+    logger.emit('provider.output', { ...trace, findings_count: providerOutput.findings.length });
   } catch (err) {
     if (err instanceof ProviderErrorThrowable) {
       const kind = err.value.kind;
@@ -550,6 +552,14 @@ export const runPipeline = async (
     logger.emit('validator.rejected', {
       ...trace,
       count: validatorResult.rejections.length,
+      rejections: validatorResult.rejections.map((r) => ({
+        finding_id: r.finding_id,
+        stage: r.stage,
+        reason_code: r.reason_code,
+        reason_message: r.reason_message,
+        provider_output_excerpt: r.provider_output_excerpt,
+        timestamp: r.timestamp,
+      })),
     });
   }
 

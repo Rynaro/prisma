@@ -159,4 +159,46 @@ describe('CopilotProvider', () => {
     }
     expect(chatCompletions).not.toHaveBeenCalled();
   });
+
+  // T10: finish_reason==='length' → schema_validation (truncation guard)
+  it('throws schema_validation when finish_reason is "length" (response truncated at max_tokens)', async () => {
+    // Simulate a response where the model hit max_tokens: tool_call arguments
+    // may be a partially-written JSON array that would parse but silently drop findings.
+    const chatCompletions = vi.fn().mockResolvedValue({
+      id: 'chatcmpl-truncated',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'submit_review_findings',
+                  arguments: JSON.stringify({ findings: [] }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'length',
+        },
+      ],
+    });
+    const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
+    await expect(provider.review(validInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'schema_validation',
+    });
+  });
+
+  // T11: finish_reason==='tool_calls' (normal) → does NOT throw truncation error
+  it('does not throw truncation error when finish_reason is "tool_calls"', async () => {
+    const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
+    const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
+    const out = await provider.review(validInput);
+    expect(out.findings).toHaveLength(0);
+  });
 });

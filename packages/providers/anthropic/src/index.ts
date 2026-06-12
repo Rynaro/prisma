@@ -173,6 +173,21 @@ export class AnthropicProvider implements Provider {
       throw new ProviderErrorThrowable(mapAnthropicError(err));
     }
 
+    // Detect response truncation: stop_reason==='max_tokens' means the model hit
+    // max_tokens (4096) and the output may be a partial/invalid findings array.
+    // Treat as schema_validation so the orchestrator publishes malformed_provider_output
+    // and does not silently accept a truncated result.
+    if (
+      typeof response === 'object' &&
+      response !== null &&
+      (response as Record<string, unknown>).stop_reason === 'max_tokens'
+    ) {
+      throw new ProviderErrorThrowable({
+        kind: 'schema_validation',
+        message: `anthropic response truncated: stop_reason is 'max_tokens' (max_tokens: 4096)`,
+      });
+    }
+
     const toolInput = extractToolUseInput(response, prompt.tool.name);
     const parsed = ProviderReviewOutputSchema.safeParse(toolInput);
     if (!parsed.success) {
