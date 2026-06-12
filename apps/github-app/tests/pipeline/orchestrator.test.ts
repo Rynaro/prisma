@@ -260,6 +260,31 @@ describe('runPipeline', () => {
     expect(spy.reviewCommentsCreate).toHaveLength(0);
   });
 
+  it('provider truncation (finish_reason=length, schema_validation) -> malformed_provider_output summary; succeeded state', async () => {
+    // The OpenAI adapter throws schema_validation when finish_reason==='length'.
+    // The orchestrator must publish malformed_provider_output summary-only and
+    // return succeeded so the job is not retried.
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: {
+            kind: 'schema_validation',
+            message: "openai response truncated: finish_reason is 'length' (max_tokens: 4096)",
+          },
+        },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy }));
+    expect(result.state).toBe('succeeded');
+    expect(spy.checksCreate).toHaveLength(1);
+    expect(spy.reviewCommentsCreate).toHaveLength(0);
+    expect(result.rejections.some((r) => r.reason_code === 'provider_output_zod_failed')).toBe(
+      true,
+    );
+  });
+
   it('provider returns malformed output -> "review unavailable" summary; succeeded state', async () => {
     const provider = new FakeProvider({
       script: [
@@ -460,5 +485,80 @@ describe('runPipeline', () => {
     expect(events).toContain('provider.called');
     expect(events).toContain('publisher.published');
     expect(events).toContain('job.terminal');
+  });
+
+  it('emits provider.output with correct findings_count after successful provider call', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: validOutputForExampleFile() }],
+    });
+    const logger = buildLogger();
+    const spy = buildOctokitSpy();
+    await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, logger }));
+    const outputEvent = logger.events.find((e) => e.event === 'provider.output');
+    expect(outputEvent).toBeDefined();
+    expect(outputEvent?.fields.findings_count).toBe(1);
+  });
+
+  it('provider.output emitted with findings_count=0 when provider returns empty findings', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+    const logger = buildLogger();
+    const spy = buildOctokitSpy();
+    await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, logger }));
+    const outputEvent = logger.events.find((e) => e.event === 'provider.output');
+    expect(outputEvent).toBeDefined();
+    expect(outputEvent?.fields.findings_count).toBe(0);
+  });
+
+  it('provider.output is NOT emitted when provider throws', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'error', error: { kind: 'transport', message: 'network error' } }],
+    });
+    const logger = buildLogger();
+    const spy = buildOctokitSpy();
+    await expect(
+      runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, logger })),
+    ).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    const outputEvent = logger.events.find((e) => e.event === 'provider.output');
+    expect(outputEvent).toBeUndefined();
+  });
+
+  it('validator.rejected emits count and per-rejection detail with required RejectionLogEntry fields', async () => {
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'output',
+          output: {
+            findings: [
+              makeFindingFixture({
+                path: 'src/example.ts',
+                line: 9999, // outside the touched hunk [10..14]
+              }),
+            ],
+          },
+        },
+      ],
+    });
+    const logger = buildLogger();
+    const spy = buildOctokitSpy();
+    await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, logger }));
+    const rejectedEvent = logger.events.find((e) => e.event === 'validator.rejected');
+    expect(rejectedEvent).toBeDefined();
+    expect(rejectedEvent?.fields.count).toBe(1);
+    const rejections = rejectedEvent?.fields.rejections as Array<Record<string, unknown>>;
+    expect(Array.isArray(rejections)).toBe(true);
+    expect(rejections).toHaveLength(1);
+    const entry = rejections[0];
+    expect(entry).toBeDefined();
+    // All RejectionLogEntry fields must be present
+    expect(typeof entry?.reason_code).toBe('string');
+    expect(typeof entry?.reason_message).toBe('string');
+    expect(typeof entry?.stage).toBe('string');
+    expect('finding_id' in (entry ?? {})).toBe(true);
+    expect('provider_output_excerpt' in (entry ?? {})).toBe(true);
+    expect(typeof entry?.timestamp).toBe('string');
+    // reason_code matches the validator's out-of-diff rejection
+    expect(entry?.reason_code).toBe('line_not_in_diff');
   });
 });
