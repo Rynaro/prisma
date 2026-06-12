@@ -4,3 +4,4 @@ export * from './installation-auth/index.js';
 export * from './check-runs/index.js';
 export * from './review-comments/index.js';
 export * from './publisher/index.js';
+export * from './content-fetcher/index.js';

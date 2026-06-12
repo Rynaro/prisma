@@ -1,4 +1,4 @@
-import type { OctokitLike } from '@prisma-bot/github';
+import type { OctokitLike, ReposGetContentData } from '@prisma-bot/github';
 import type { ChangedFileEntry, PullsGetData, ScenarioOctokitResponses } from './schema.js';
 
 /**
@@ -28,6 +28,7 @@ export interface FakeOctokitOptions {
 export interface FakeOctokitCallCounts {
   pulls_get: number;
   pulls_list_files: number;
+  repos_get_content: number;
   checks_create: number;
   checks_update: number;
   checks_list_for_ref: number;
@@ -56,6 +57,7 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
   const calls: FakeOctokitCallCounts = {
     pulls_get: 0,
     pulls_list_files: 0,
+    repos_get_content: 0,
     checks_create: 0,
     checks_update: 0,
     checks_list_for_ref: 0,
@@ -75,6 +77,7 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
   const allFiles: ChangedFileEntry[] = options.filesPayload;
   const priorReviewComments = options.responses.prior_review_comments ?? [];
   const priorCheckRuns = options.responses.prior_check_runs ?? [];
+  const reposGetContentMap = options.responses.repos_get_content ?? {};
 
   const octokit: OctokitLike = {
     rest: {
@@ -116,6 +119,32 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
             return base;
           });
           return { data: slice };
+        },
+      },
+      repos: {
+        getContent: async (params): Promise<{ data: ReposGetContentData }> => {
+          calls.repos_get_content += 1;
+          const entry = reposGetContentMap[params.path];
+          if (entry === undefined) {
+            // Path not in fixture → 404 (missing).
+            const err = Object.assign(new Error('Not Found'), { status: 404 });
+            throw err;
+          }
+          if ('error' in entry && entry.error === 'not_found') {
+            const err = Object.assign(new Error('Not Found'), { status: 404 });
+            throw err;
+          }
+          if ('content_base64' in entry) {
+            return {
+              data: {
+                type: 'file',
+                encoding: 'base64',
+                content: entry.content_base64,
+              },
+            };
+          }
+          const err = Object.assign(new Error('Not Found'), { status: 404 });
+          throw err;
         },
       },
       checks: {

@@ -76,6 +76,9 @@ const buildOctokitSpy = (): OctokitSpy => {
         }),
         listFiles: async () => ({ data: [] }),
       },
+      repos: {
+        getContent: async () => ({ data: {} }),
+      },
       checks: {
         create: async (params) => {
           checksCreate.push(params);

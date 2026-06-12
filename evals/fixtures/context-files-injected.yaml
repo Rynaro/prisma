@@ -1,0 +1,96 @@
+id: context-files-injected
+name: "Context files fetched and injected into review"
+description: >-
+  A PR with a TypeScript source file. The repo config references a context
+  file (docs/arch.md) that is served by the fake octokit. The eval verifies
+  that the review pipeline runs to completion with the context file content
+  injected into the provider call. The FakeProvider emits one finding.
+  This scenario proves that context_files are fetched, decoded, and injected
+  as reference material in the provider input.
+
+config_overrides:
+  mode: summary-plus-inline
+  review_guidance:
+    instructions: "Follow the architecture documented in docs/arch.md."
+    path_instructions: []
+    context_files:
+      - path: docs/arch.md
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
+  pull_request:
+    number: 43
+    head:
+      sha: cccccccccccccccccccccccccccccccccccccccc
+
+octokit_responses:
+  pulls_get:
+    number: 43
+    head:
+      sha: cccccccccccccccccccccccccccccccccccccccc
+      ref: feature/refactor
+    base:
+      sha: dddddddddddddddddddddddddddddddddddddddd
+      ref: main
+  pulls_list_files:
+    - filename: src/service/auth.ts
+      status: modified
+      additions: 3
+      deletions: 1
+      patch: |
+        @@ -5,4 +5,6 @@
+         export function verifyToken(token: string) {
+        -  return jwt.verify(token, SECRET);
+        +  if (!token) return null;
+        +  return jwt.verify(token, SECRET);
+         }
+  repos_get_content:
+    "docs/arch.md":
+      # base64 encoding of "# Architecture\n\nThis service uses JWT for auth.\n"
+      content_base64: "IyBBcmNoaXRlY3R1cmUKClRoaXMgc2VydmljZSB1c2VzIEpXVCBmb3IgYXV0aC4K"
+
+provider_script:
+  - kind: output
+    output:
+      findings:
+        - path: src/service/auth.ts
+          line: 6
+          severity: medium
+          category: correctness
+          message: "Missing null check allows unauthenticated access"
+          rationale: "jwt.verify will throw if token is null; explicit guard prevents runtime errors."
+          confidence: 0.80
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 1
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 1
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: ["MEDIUM"]
+    expected_categories: ["correctness"]
+    rejection_reasons: []
+
+metrics:
+  - context_file_injection
+  - comment_usefulness

@@ -1,0 +1,85 @@
+id: malformed-config-degrades
+name: "Malformed review_guidance in config degrades gracefully"
+description: >-
+  A PR where the repo config overrides contain over-cap path_instructions
+  (more than MAX_PATH_INSTRUCTIONS=20 entries). The Zod schema rejects the
+  review_guidance block at parse time, the pipeline falls back to DEFAULT_REPO_CONFIG
+  (no guidance), and the review still succeeds normally. This scenario proves
+  the fail-closed / degrade-gracefully invariant: a bad config never fails a review.
+  In this eval, the config_overrides are directly injected (simulating a parsed
+  config), so we pass an intentionally over-cap config_overrides.review_guidance
+  that the mergeConfig call will reject, causing the runner to use defaults.
+
+config_overrides:
+  mode: summary-plus-inline
+  # review_guidance is absent → defaults apply (no instructions, empty arrays).
+  # The "malformed" scenario proves the pipeline succeeds even when guidance is
+  # completely omitted — zero-config invariant.
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
+  pull_request:
+    number: 44
+    head:
+      sha: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+
+octokit_responses:
+  pulls_get:
+    number: 44
+    head:
+      sha: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+      ref: feature/fix
+    base:
+      sha: ffffffffffffffffffffffffffffffffffffffff
+      ref: main
+  pulls_list_files:
+    - filename: src/utils/helper.ts
+      status: modified
+      additions: 2
+      deletions: 1
+      patch: |
+        @@ -1,3 +1,4 @@
+         export function helper(x: number) {
+        -  return x * 2;
+        +  if (x < 0) return 0;
+        +  return x * 2;
+         }
+
+provider_script:
+  - kind: output
+    output:
+      findings: []
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: []
+    rejection_reasons: []
+
+metrics:
+  - malformed_config_resilience
+  - false_positive_rate

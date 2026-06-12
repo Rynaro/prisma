@@ -121,6 +121,9 @@ importers:
       '@prisma-bot/config':
         specifier: workspace:*
         version: link:../config
+      '@prisma-bot/github':
+        specifier: workspace:*
+        version: link:../github
       '@prisma-bot/shared':
         specifier: workspace:*
         version: link:../shared

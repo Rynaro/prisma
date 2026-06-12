@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CategorySchema, SeveritySchema } from './finding.js';
+import { CustomGuidanceSchema } from './guidance.js';
 
 /**
  * Per ADR-002 § Interface contract (sketch) and api-contracts.md § Provider adapter
@@ -43,6 +44,13 @@ export const ProviderReviewInputSchema = z
     files: z.array(PrefilteredFileSchema),
     repo_heuristics: z.record(z.string(), z.boolean()).optional(),
     request_shaping: ProviderRequestShapingSchema.optional(),
+    /**
+     * Resolved, pre-flattened custom guidance from `.github/review-bot.yml`.
+     * Absent when no guidance is configured → zero-config behavior is
+     * byte-identical to today. Injected by the orchestrator after augmentation
+     * resolution; never constructed by providers themselves (they render it).
+     */
+    custom_guidance: CustomGuidanceSchema.optional(),
   })
   .strict();
 export type ProviderReviewInput = z.infer<typeof ProviderReviewInputSchema>;

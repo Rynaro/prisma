@@ -33,9 +33,26 @@ import { Octokit } from '@octokit/rest';
 
 export interface PullsGetData {
   number: number;
-  head: { sha: string; ref: string };
-  base: { sha: string; ref: string };
+  head: { sha: string; ref: string; repo?: { full_name?: string } | null };
+  base: { sha: string; ref: string; repo?: { full_name?: string } | null };
   base_ref?: string | null;
+}
+
+/**
+ * `ReposGetContentData` — minimal shape of the GitHub REST `repos.getContent`
+ * response we consume. GitHub returns an object (single file), an array
+ * (directory), or a string (symlink destination) depending on `path`. We only
+ * consume the single-file form; callers must check `type === 'file'`.
+ */
+export interface ReposGetContentData {
+  /** 'file' for a regular file; 'dir', 'symlink', 'submodule' otherwise. */
+  type?: string;
+  /** 'base64' when GitHub encodes file content; absent for non-files. */
+  encoding?: string;
+  /** Base64-encoded file content when `type === 'file'` and `encoding === 'base64'`. */
+  content?: string;
+  /** Unencoded byte size. */
+  size?: number;
 }
 
 export interface PullsListFilesData {
@@ -116,6 +133,20 @@ export interface OctokitLike {
         page?: number;
       }): Promise<{ data: PullsListFilesData[] }>;
     };
+    repos: {
+      /**
+       * Fetch file/directory content from a repository at a given ref.
+       * Returns the single-file form (`ReposGetContentData`) or throws a
+       * 404-shaped error when the path does not exist.
+       * Mapping: octokit.rest.repos.getContent
+       */
+      getContent(params: {
+        owner: string;
+        repo: string;
+        path: string;
+        ref?: string;
+      }): Promise<{ data: ReposGetContentData }>;
+    };
     checks: {
       create(params: ChecksCreateParams): Promise<{ data: { id: number } }>;
       update(params: ChecksUpdateParams): Promise<{ data: { id: number } }>;
@@ -161,6 +192,12 @@ export const createDefaultOctokit = (token: string): OctokitLike => {
         listFiles: (params) =>
           inner.rest.pulls.listFiles(params) as unknown as Promise<{
             data: PullsListFilesData[];
+          }>,
+      },
+      repos: {
+        getContent: (params) =>
+          inner.rest.repos.getContent(params) as unknown as Promise<{
+            data: ReposGetContentData;
           }>,
       },
       checks: {

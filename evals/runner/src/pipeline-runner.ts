@@ -1,8 +1,9 @@
 import { type SnapshotterOctokitLike, fetchPrSnapshot, runPrefilter } from '@prisma-bot/core';
-import type { InstallationAuth } from '@prisma-bot/github';
+import { type InstallationAuth, buildContentFetcher } from '@prisma-bot/github';
 import { type RepoIdentity, runPipeline } from '@prisma-bot/github-app';
 import { FakeProvider, type FakeStep } from '@prisma-bot/provider-fake';
 import {
+  type CustomGuidance,
   type JobPayload,
   type ProviderError,
   type ProviderReviewOutput,
@@ -56,6 +57,8 @@ export interface RunOutcome {
   prefilter: PrefilterMirror;
   provider: {
     calls: number;
+    /** The custom_guidance from the first provider call, if any. */
+    first_call_custom_guidance?: CustomGuidance;
   };
   validator: {
     findings: number;
@@ -73,6 +76,8 @@ export interface RunOutcome {
     rejection_reasons: string[];
     expected_categories: string[];
   };
+  /** Notes from config-fetch / augmentation surfaced by the orchestrator. */
+  config_notes?: string[];
   publication?: PublicationResult;
   thrown?: RunOutcomeError;
 }
@@ -235,6 +240,16 @@ export const runPipelineForFixture = async (
   let publication: PublicationResult | undefined;
   let publicationState: 'succeeded' | 'failed_terminal' = 'succeeded';
   let thrown: RunOutcomeError | undefined;
+  let pipelineConfigNotes: string[] | undefined;
+
+  // Build a ContentFetcher from the fake octokit so context-file scenarios
+  // exercise the full augmentation path through the real orchestrator.
+  const contentFetcher = buildContentFetcher(
+    octokitHandle.octokit,
+    REPO_IDENTITY.owner,
+    REPO_IDENTITY.repo,
+  );
+
   try {
     const result = await runPipeline(payload, {
       installationAuth: STUB_INSTALLATION_AUTH,
@@ -243,9 +258,11 @@ export const runPipelineForFixture = async (
       repoLookup: async () => REPO_IDENTITY,
       octokit: octokitHandle.octokit,
       logger: { emit: () => {} },
+      contentFetcher,
     });
     publicationState = result.state;
     publication = result.publication;
+    pipelineConfigNotes = result.config_notes;
     for (const r of result.rejections) {
       if (r.stage === 'validator') validatorRejections.push(r);
     }
@@ -281,9 +298,18 @@ export const runPipelineForFixture = async (
     ? collectPublisherRejectionReasons(publication)
     : [];
 
+  // Capture the custom_guidance from the first provider call for assertion.
+  const firstCall = provider.calls[0];
+  const firstCallCustomGuidance = firstCall?.custom_guidance;
+
   const outcome: RunOutcome = {
     prefilter: prefilterMirror,
-    provider: { calls: provider.calls.length },
+    provider: {
+      calls: provider.calls.length,
+      ...(firstCallCustomGuidance !== undefined
+        ? { first_call_custom_guidance: firstCallCustomGuidance }
+        : {}),
+    },
     validator: {
       findings: validatorOutputSize,
       rejection_reasons: Array.from(validatorRejectionReasonSet),
@@ -298,6 +324,9 @@ export const runPipelineForFixture = async (
       rejection_reasons: publisherRejectionReasons,
       expected_categories: expectedCategories,
     },
+    ...(pipelineConfigNotes !== undefined && pipelineConfigNotes.length > 0
+      ? { config_notes: pipelineConfigNotes }
+      : {}),
   };
   if (publication !== undefined) outcome.publication = publication;
   if (thrown !== undefined) outcome.thrown = thrown;

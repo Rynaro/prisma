@@ -54,6 +54,9 @@ const buildFake = (): FakeOctokit => {
         return { data: { check_runs: listForRefData } };
       },
     },
+    repos: {
+      getContent: async () => ({ data: {} }),
+    },
     pulls_reviews: {
       createReviewComment: async () => ({
         data: { id: 1, body: '', path: '', line: null, user: null },

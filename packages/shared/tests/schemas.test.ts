@@ -2,10 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_REPO_CONFIG,
   JobPayloadSchema,
+  MAX_CONTEXT_FILES,
+  MAX_INSTRUCTION_BLOCK_BYTES,
+  MAX_PATH_INSTRUCTIONS,
   NormalizedFindingSchema,
+  ProviderReviewInputSchema,
   ProviderReviewOutputSchema,
   RejectionLogEntrySchema,
   RepoConfigSchema,
+  ReviewGuidanceSchema,
 } from '../src/index.js';
 
 const validProviderFinding = {
@@ -170,6 +175,103 @@ describe('@prisma-bot/shared schemas', () => {
       expect(DEFAULT_REPO_CONFIG.thresholds.severity_floor.inline).toBe('medium');
       expect(DEFAULT_REPO_CONFIG.thresholds.confidence_floor.inline).toBe(0.7);
       expect(DEFAULT_REPO_CONFIG.provider).toBe('anthropic');
+    });
+
+    it('has empty review_guidance defaults (zero-config invariant)', () => {
+      expect(DEFAULT_REPO_CONFIG.review_guidance).toBeDefined();
+      expect(DEFAULT_REPO_CONFIG.review_guidance.path_instructions).toEqual([]);
+      expect(DEFAULT_REPO_CONFIG.review_guidance.context_files).toEqual([]);
+      expect(DEFAULT_REPO_CONFIG.review_guidance.instructions).toBeUndefined();
+    });
+  });
+
+  describe('ReviewGuidance schema', () => {
+    it('accepts an empty object and applies defaults', () => {
+      const result = ReviewGuidanceSchema.safeParse({});
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.path_instructions).toEqual([]);
+        expect(result.data.context_files).toEqual([]);
+        expect(result.data.instructions).toBeUndefined();
+      }
+    });
+
+    it('accepts valid instructions, path_instructions, and context_files', () => {
+      const result = ReviewGuidanceSchema.safeParse({
+        instructions: 'Focus on security.',
+        path_instructions: [{ path: 'src/**', instructions: 'Enforce strict types.' }],
+        context_files: [{ path: 'docs/arch.md' }],
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects instructions exceeding MAX_INSTRUCTION_BLOCK_BYTES', () => {
+      const tooLong = 'x'.repeat(MAX_INSTRUCTION_BLOCK_BYTES + 1);
+      const result = ReviewGuidanceSchema.safeParse({ instructions: tooLong });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects path_instructions exceeding MAX_PATH_INSTRUCTIONS count', () => {
+      const entries = Array.from({ length: MAX_PATH_INSTRUCTIONS + 1 }, (_, i) => ({
+        path: `src/file${i}.ts`,
+        instructions: 'Do something.',
+      }));
+      const result = ReviewGuidanceSchema.safeParse({ path_instructions: entries });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects context_files exceeding MAX_CONTEXT_FILES count', () => {
+      const entries = Array.from({ length: MAX_CONTEXT_FILES + 1 }, (_, i) => ({
+        path: `docs/file${i}.md`,
+      }));
+      const result = ReviewGuidanceSchema.safeParse({ context_files: entries });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects extra keys on path_instruction entries (.strict())', () => {
+      const result = ReviewGuidanceSchema.safeParse({
+        path_instructions: [{ path: 'src/**', instructions: 'ok', extra: 'nope' }],
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('ProviderReviewInput with custom_guidance', () => {
+    const baseInput = {
+      files: [],
+    };
+
+    it('accepts input without custom_guidance (zero-config backward compat)', () => {
+      const result = ProviderReviewInputSchema.safeParse(baseInput);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.custom_guidance).toBeUndefined();
+      }
+    });
+
+    it('accepts input with custom_guidance round-trips correctly', () => {
+      const result = ProviderReviewInputSchema.safeParse({
+        ...baseInput,
+        custom_guidance: {
+          instructions: 'Focus on correctness.',
+          matched_path_instructions: [{ path: 'src/**', instructions: 'Check types.' }],
+          context_files: [{ path: 'docs/arch.md', content: '# Architecture' }],
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.custom_guidance?.instructions).toBe('Focus on correctness.');
+        expect(result.data.custom_guidance?.matched_path_instructions).toHaveLength(1);
+        expect(result.data.custom_guidance?.context_files).toHaveLength(1);
+      }
+    });
+
+    it('rejects unknown keys in custom_guidance (.strict())', () => {
+      const result = ProviderReviewInputSchema.safeParse({
+        ...baseInput,
+        custom_guidance: { unknown_key: 'nope' },
+      });
+      expect(result.success).toBe(false);
     });
   });
 });
