@@ -1,4 +1,5 @@
 import type { ProviderReviewInput } from '@prisma-bot/shared';
+import { IMMUTABLE_SYSTEM_PROMPT } from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
 import { buildPrompt } from '../src/prompt.js';
 
@@ -58,5 +59,34 @@ describe('buildPrompt (openai)', () => {
     const prompt2 = buildPrompt({ ...inputBase, repo_heuristics: { uses_typescript: true } });
     const userMsg2 = prompt2.messages.find((m) => m.role === 'user');
     expect(userMsg2?.content).toContain('uses_typescript: true');
+  });
+
+  it('system message is the shared IMMUTABLE_SYSTEM_PROMPT with hierarchy clause', () => {
+    const prompt = buildPrompt(inputBase);
+    const sys = prompt.messages.find((m) => m.role === 'system');
+    expect(sys?.content).toBe(IMMUTABLE_SYSTEM_PROMPT);
+    expect(sys?.content).toContain('untrusted repository guidance');
+  });
+
+  it('GIVEN no custom_guidance WHEN built THEN user message has no guidance block', () => {
+    const prompt = buildPrompt(inputBase);
+    const userMsg = prompt.messages.find((m) => m.role === 'user');
+    expect(userMsg?.content).not.toContain('BEGIN_REPO_GUIDANCE');
+  });
+
+  it('GIVEN custom_guidance WHEN built THEN fenced block appears below file listing', () => {
+    const input: ProviderReviewInput = {
+      ...inputBase,
+      custom_guidance: {
+        instructions: 'Focus on security.',
+        matched_path_instructions: [],
+        context_files: [],
+      },
+    };
+    const prompt = buildPrompt(input);
+    const userMsg = prompt.messages.find((m) => m.role === 'user');
+    expect(userMsg?.content).toContain('<<<BEGIN_REPO_GUIDANCE');
+    expect(userMsg?.content).toContain('END_REPO_GUIDANCE>>>');
+    expect(userMsg?.content).toContain('Focus on security.');
   });
 });

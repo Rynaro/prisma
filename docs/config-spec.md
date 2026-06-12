@@ -190,6 +190,32 @@ Configuration is resolved in this order; each layer overrides the previous on a 
     layering: true
   ```
 
+### review_guidance
+
+- **Type.** Object.
+- **Required.** Optional.
+- **Default.** Empty (no custom guidance).
+- **Validation rule (plain English).** All sub-fields are optional. The object contains up to three sub-keys:
+  - `instructions`: a free-text string (1–2,048 bytes) applied globally to every PR review.
+  - `path_instructions`: an array of up to 20 objects, each with `path` (minimatch glob) and `instructions` (1–2,048 bytes). Only path-scoped instructions matching changed files are sent to the model.
+  - `context_files`: an array of up to 5 objects, each with `path` (repo-relative file path). Files are fetched and injected as reference material (max 64 KiB each, truncated on UTF-8 boundary).
+- **Example.**
+
+  ```yaml
+  review_guidance:
+    instructions: "Always check for proper error handling and logging."
+    path_instructions:
+      - path: "src/api/**"
+        instructions: "Enforce strict TypeScript types; no implicit any."
+      - path: "tests/**"
+        instructions: "Each test must assert one clear behavior."
+    context_files:
+      - path: "docs/architecture.md"
+      - path: "docs/BUSINESS_RULES.md"
+  ```
+
+- **Full reference:** [docs/custom-review-prompts.md](./custom-review-prompts.md) — how custom guidance works, token budgets, degradation rules, and security considerations.
+
 ## Precedence matrix
 
 The following table declares how filtering keys interact. Rows are the filtering key in question; the cell describes its resolution rule against the named other key. "Applies first" means evaluated before; "applies last" means evaluated after.

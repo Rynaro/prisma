@@ -14,6 +14,7 @@ A production-ready GitHub App that reviews pull requests with swappable AI provi
 - **Try locally in 5 minutes** → [Local evaluation quickstart](#quickstart)
 - **Deploy to production** → [Interactive installer](#deploy-to-production)
 - **Integrate via GitHub App** → [App installation guide](./docs/install-github-app.md)
+- **Customize the review** → [Custom review prompts guide](./docs/custom-review-prompts.md)
 - **Understand the architecture** → [System design](./docs/system-design.md)
 
 ## Quickstart
@@ -31,7 +32,7 @@ make eval
 cat evals/last-report.md
 ```
 
-**Expected result:** `9 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
+**Expected result:** `12 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
 
 Smoke test (end-to-end stack — app, worker, Redis, signed webhook, teardown; ~45 seconds):
 
@@ -64,7 +65,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.1.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.2.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 ## What is prisma?
 
@@ -96,11 +97,36 @@ A GitHub App with a deterministic review pipeline. A single Fastify ingress acce
 
 Full mode matrix and dedupe rules: [docs/publication-policy.md](./docs/publication-policy.md).
 
+## Customize the review
+
+Shape how the bot reviews your code by adding custom guidance to `.github/review-bot.yml`:
+
+```yaml
+review_guidance:
+  instructions: |
+    Check for proper error handling. Each async operation must have a
+    clear failure mode. Prefer specific error types over generic Error.
+
+  path_instructions:
+    - path: "src/payments/**"
+      instructions: |
+        Payment processing requires audit logging and idempotency keys.
+        Flag any currency conversions without rounding checks.
+
+  context_files:
+    - path: "docs/architecture.md"
+    - path: "docs/SECURITY_RULES.md"
+```
+
+Guidance is injected as **untrusted data** beneath an immutable system prompt — your rules can focus the review but never override the output schema or finding categories. Missing context files degrade gracefully. Token budget enforced; the diff is never evicted.
+
+Full guide: [docs/custom-review-prompts.md](./docs/custom-review-prompts.md).
+
 ## Status
 
-**v0.1.0** — first production release.
+**v0.2.0** — user-customizable review prompts.
 
-- 294 tests across 41 files, all passing · 9/9 deterministic eval scenarios PASS
+- 364 tests across 45 files, all passing · 12/12 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
@@ -125,6 +151,7 @@ Organized by what you want to do (Diátaxis).
 
 - [Quickstart](./docs/quickstart.md) — 5-minute evaluator tutorial with troubleshooting
 - [GitHub App installation](./docs/install-github-app.md) — install on your org
+- [Customize the review](./docs/custom-review-prompts.md) — add custom guidance and context files
 - [Deployment](./docs/deployment.md) — env vars, topology, secrets, networking, health surfaces
 - [Contributing](./docs/contributing.md) — workspace, tests, ADRs, adding a provider
 

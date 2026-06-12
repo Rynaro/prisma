@@ -1,11 +1,14 @@
 import {
+  type AugmentationCaps,
   type SnapshotterOctokitLike,
   fetchPrSnapshot,
+  resolveAugmentation,
   runPrefilter,
   runRanker,
   runValidator,
 } from '@prisma-bot/core';
 import {
+  type ContentFetcher,
   type InstallationAuth,
   type OctokitLike,
   type PublishContext,
@@ -15,8 +18,11 @@ import {
   publish as defaultPublish,
 } from '@prisma-bot/github';
 import {
+  type CustomGuidance,
   type Hunk,
   type JobPayload,
+  MAX_AUGMENTATION_TOKENS,
+  MAX_CONTEXT_FILE_BYTES,
   type NormalizedFinding,
   type PrSnapshot,
   type PrefilteredFile,
@@ -137,6 +143,19 @@ export interface OrchestratorDeps {
   logger?: PipelineLogger;
   /** Hooks for snapshotter / publisher; tests inject simpler implementations. */
   hooks?: OrchestratorHooks;
+  /**
+   * Fetcher for repository files (config + context files). Optional: when
+   * absent, augmentation falls back to instructions/path_instructions only
+   * (no context-file fetch). Tests and evals that don't exercise context files
+   * can omit this.
+   */
+  contentFetcher?: ContentFetcher;
+  /**
+   * Notes surfaced by the worker's config-fetch step (e.g. config parse
+   * errors). Passed through to the OrchestratorResult so the publisher can
+   * include them in the summary. Optional.
+   */
+  configNotes?: string[];
 }
 
 export interface OrchestratorResult {
@@ -144,6 +163,8 @@ export interface OrchestratorResult {
   publication?: PublicationResult;
   reason?: string;
   rejections: RejectionLogEntry[];
+  /** Notes from config-fetch / augmentation (config errors, skipped files, etc.). */
+  config_notes?: string[];
 }
 
 const buildSyntheticEmptyOutput = (): {
@@ -161,7 +182,11 @@ const traceFields = (payload: JobPayload): Record<string, unknown> => {
   return fields;
 };
 
-const buildProviderInput = (files: PrefilteredFile[], cfg: RepoConfig): ProviderReviewInput => {
+const buildProviderInput = (
+  files: PrefilteredFile[],
+  cfg: RepoConfig,
+  guidance?: CustomGuidance,
+): ProviderReviewInput => {
   const heuristics: Record<string, boolean> = {
     security: cfg.repo_heuristics.security,
     tests: cfg.repo_heuristics.tests,
@@ -190,6 +215,9 @@ const buildProviderInput = (files: PrefilteredFile[], cfg: RepoConfig): Provider
   };
   if (cfg.model !== undefined) {
     input.request_shaping = { model: cfg.model };
+  }
+  if (guidance !== undefined) {
+    input.custom_guidance = guidance;
   }
   return input;
 };
@@ -342,8 +370,57 @@ export const runPipeline = async (
     return { state: 'succeeded', publication, rejections: publication.rejections };
   }
 
+  // Stage: augmentation resolution.
+  // Resolve custom guidance (path-instruction matching + context-file fetch)
+  // after prefilter so we have the final changed-path list. Uses the trust-
+  // anchor ref from the snapshot (D3): same-repo → head_sha; fork → default_branch.
+  const augCaps: AugmentationCaps = {
+    maxTokens: MAX_AUGMENTATION_TOKENS,
+    maxContextFileBytes: MAX_CONTEXT_FILE_BYTES,
+  };
+  const configRef = snapshot.is_fork === true ? snapshot.default_branch : snapshot.head_sha;
+  const changedPaths = prefilter.files.map((f) => f.path);
+  const allNotes: string[] = [...(deps.configNotes ?? [])];
+  let resolvedGuidance: CustomGuidance | undefined;
+  if (deps.contentFetcher !== undefined) {
+    const augResult = await resolveAugmentation({
+      guidance: deps.config.review_guidance,
+      changedPaths,
+      fetcher: deps.contentFetcher,
+      ref: configRef,
+      caps: augCaps,
+    });
+    resolvedGuidance = augResult.guidance;
+    allNotes.push(...augResult.notes);
+  } else {
+    // No content fetcher: resolve instructions + path_instructions locally
+    // (no context-file fetch). The augmentation resolver handles a null fetcher
+    // by returning skip notes; we simulate the no-fetch path inline.
+    const augResult = await resolveAugmentation({
+      guidance: deps.config.review_guidance,
+      changedPaths,
+      fetcher: {
+        async fetchText() {
+          return { ok: false as const, reason: 'error' as const };
+        },
+      },
+      ref: configRef,
+      caps: augCaps,
+    });
+    resolvedGuidance = augResult.guidance;
+    // Don't surface "error" notes for the no-fetcher path; context files are
+    // simply not requested when no fetcher is present.
+    const contextFileNotes = augResult.notes.filter((n) => n.includes('skipped: error'));
+    if (contextFileNotes.length === 0) {
+      allNotes.push(...augResult.notes);
+    } else {
+      // Only surface non-error notes (e.g. truncation notes if any).
+      allNotes.push(...augResult.notes.filter((n) => !n.includes('skipped: error')));
+    }
+  }
+
   // Stage: provider.
-  const providerInput = buildProviderInput(prefilter.files, deps.config);
+  const providerInput = buildProviderInput(prefilter.files, deps.config, resolvedGuidance);
   logger.emit('provider.called', { ...trace, provider: deps.provider.name });
   let providerOutput: ProviderReviewOutput;
   try {
@@ -476,5 +553,6 @@ export const runPipeline = async (
     state: 'succeeded',
     publication,
     rejections: [...validatorResult.rejections, ...publication.rejections],
+    ...(allNotes.length > 0 ? { config_notes: allNotes } : {}),
   };
 };

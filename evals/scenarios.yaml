@@ -35,3 +35,15 @@ scenarios:
     name: "PR exceeds max_files"
     fixture: fixtures/oversized-pr.yaml
     tags: ["large_diff_degradation"]
+  - id: custom-instructions-threaded
+    name: "Custom instructions and path-scoped rules reach the provider"
+    fixture: fixtures/custom-instructions-threaded.yaml
+    tags: ["custom_guidance_threading", "comment_usefulness"]
+  - id: context-files-injected
+    name: "Context files fetched and injected into review"
+    fixture: fixtures/context-files-injected.yaml
+    tags: ["context_file_injection", "comment_usefulness"]
+  - id: malformed-config-degrades
+    name: "Missing review guidance degrades gracefully (zero-config invariant)"
+    fixture: fixtures/malformed-config-degrades.yaml
+    tags: ["malformed_config_resilience", "false_positive_rate"]

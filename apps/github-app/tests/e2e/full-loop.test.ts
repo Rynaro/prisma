@@ -153,6 +153,9 @@ const buildOctokitSpy = (opts: OctokitFakeOptions = {}): OctokitSpy => {
           return { data: slice };
         },
       },
+      repos: {
+        getContent: async () => ({ data: {} }),
+      },
       checks: {
         create: async (params) => {
           checksCreate.push({ head_sha: params.head_sha });

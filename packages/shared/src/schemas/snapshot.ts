@@ -62,6 +62,15 @@ export const PrSnapshotSchema = z
     head_sha: z.string().min(1),
     base_sha: z.string().min(1),
     default_branch: z.string().min(1),
+    /**
+     * True when the PR originates from a fork (head.repo.full_name ≠
+     * base.repo.full_name). Used by the orchestrator to select the config-fetch
+     * ref per D3 (spec § Trust anchor). Absent / false for same-repo PRs.
+     * Fail-closed: when GitHub does not provide repo metadata (some webhook
+     * shapes), the orchestrator defaults to base default-branch (the safer
+     * anchor per spec [GAP-A]).
+     */
+    is_fork: z.boolean().optional(),
     /** total non-binary changed lines across all included files */
     total_changed_lines: z.number().int().nonnegative(),
     files: z.array(ChangedFileSchema),

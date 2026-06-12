@@ -36,8 +36,8 @@ export interface SnapshotterOctokitLike {
       get(params: { owner: string; repo: string; pull_number: number }): Promise<{
         data: {
           number: number;
-          head: { sha: string; ref: string };
-          base: { sha: string; ref: string };
+          head: { sha: string; ref: string; repo?: { full_name?: string } | null };
+          base: { sha: string; ref: string; repo?: { full_name?: string } | null };
           base_ref?: string | null;
         };
       }>;
@@ -320,6 +320,15 @@ export const fetchPrSnapshot = async (opts: SnapshotterOptions): Promise<PrSnaps
     0,
   );
 
+  // D3 fork signal: compare head.repo.full_name vs base.repo.full_name when
+  // both are present. Absent → undefined (fail-closed in the orchestrator).
+  const headFullName = pr.head.repo?.full_name;
+  const baseFullName = pr.base.repo?.full_name;
+  const isFork =
+    headFullName !== undefined && baseFullName !== undefined
+      ? headFullName !== baseFullName
+      : undefined;
+
   const candidate: PrSnapshot = {
     installation_id: opts.installation_id,
     repository_id: opts.repository_id,
@@ -327,6 +336,7 @@ export const fetchPrSnapshot = async (opts: SnapshotterOptions): Promise<PrSnaps
     head_sha: pr.head.sha,
     base_sha: pr.base.sha,
     default_branch: pr.base.ref,
+    ...(isFork !== undefined ? { is_fork: isFork } : {}),
     total_changed_lines,
     files,
   };

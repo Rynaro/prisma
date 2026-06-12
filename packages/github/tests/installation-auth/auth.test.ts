@@ -14,6 +14,9 @@ const fakeOctokit = (): OctokitLike => ({
       }),
       listFiles: async () => ({ data: [] }),
     },
+    repos: {
+      getContent: async () => ({ data: {} }),
+    },
     checks: {
       create: async () => ({ data: { id: 1 } }),
       update: async () => ({ data: { id: 1 } }),

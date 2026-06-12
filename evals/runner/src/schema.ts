@@ -116,12 +116,29 @@ const PriorCheckRunSchema = z
   })
   .strict();
 
+/**
+ * Per-path fixture responses for `repos.getContent`.
+ * Key: repo-relative path (e.g. 'docs/arch.md').
+ * Value: `{ content_base64: string }` for a file hit,
+ *        or `{ error: 'not_found' }` for a simulated 404.
+ */
+const ReposGetContentEntrySchema = z.union([
+  z.object({ content_base64: z.string() }).strict(),
+  z.object({ error: z.literal('not_found') }).strict(),
+]);
+export type ReposGetContentEntry = z.infer<typeof ReposGetContentEntrySchema>;
+
+const ReposGetContentMapSchema = z.record(z.string().min(1), ReposGetContentEntrySchema);
+export type ReposGetContentMap = z.infer<typeof ReposGetContentMapSchema>;
+
 export const ScenarioOctokitResponsesSchema = z
   .object({
     pulls_get: PullsGetDataSchema,
     pulls_list_files: PullsListFilesInputSchema,
     prior_review_comments: z.array(PriorReviewCommentSchema).optional(),
     prior_check_runs: z.array(PriorCheckRunSchema).optional(),
+    /** Fixture responses for `repos.getContent` keyed by repo-relative path. */
+    repos_get_content: ReposGetContentMapSchema.optional(),
   })
   .strict();
 
@@ -247,6 +264,9 @@ const FROZEN_METRIC_IDS = [
   'provider_schema_failure_handling',
   'confidence_threshold_behavior',
   'publication_cap_behavior',
+  'custom_guidance_threading',
+  'context_file_injection',
+  'malformed_config_resilience',
 ] as const;
 
 export const MetricIdSchema = z.enum(FROZEN_METRIC_IDS);

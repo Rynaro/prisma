@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CategorySchema, ModeSchema, SeveritySchema } from './finding.js';
+import { ReviewGuidanceSchema } from './guidance.js';
 
 /**
  * `.github/review-bot.yml` schema per docs/config-spec.md § Key reference.
@@ -118,6 +119,13 @@ export const RepoConfigSchema = z
     severity: SeverityOverridesSchema,
     language_overrides: LanguageOverridesSchema,
     repo_heuristics: RepoHeuristicsSchema,
+    /**
+     * User-customizable review guidance (global instructions, path-scoped
+     * instructions, and context files to inject). All fields are optional;
+     * absent key → empty defaults → today's behavior preserved byte-for-byte.
+     * Per spec § D2: extends the existing .github/review-bot.yml schema.
+     */
+    review_guidance: ReviewGuidanceSchema,
   })
   .describe('Repo-local .github/review-bot.yml configuration');
 

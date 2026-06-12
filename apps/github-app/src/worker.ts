@@ -1,7 +1,10 @@
+import { ConfigParseError, REPO_LOCAL_CONFIG_PATH, loadRepoConfig } from '@prisma-bot/config';
 import {
   type AppCredentials,
   InstallationAuth,
+  type OctokitLike,
   type SecretSource,
+  buildContentFetcher,
   envSecretSource,
 } from '@prisma-bot/github';
 import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/provider-anthropic';
@@ -13,7 +16,6 @@ import {
   type Provider,
   ProviderErrorThrowable,
   type RepoConfig,
-  RepoConfigSchema,
 } from '@prisma-bot/shared';
 import IORedis from 'ioredis';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
@@ -214,7 +216,56 @@ const buildRepoLookup = (secretSource: SecretSource): RepoLookup => {
   };
 };
 
-const defaultRepoConfig = (): RepoConfig => RepoConfigSchema.parse({});
+/**
+ * Fetch and parse the per-repo config from `.github/review-bot.yml` at the
+ * given ref. Returns `{ config, notes }` where `notes` carries any parse
+ * error description (config error → default config, review succeeds).
+ *
+ * Per spec § S4 / §6.1: config is per-job (each PR's repo has its own config);
+ * the static `defaultRepoConfig()` is removed from the per-process scope.
+ */
+const fetchRepoConfig = async (
+  octokit: OctokitLike,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<{ config: RepoConfig; notes: string[] }> => {
+  const fetcher = buildContentFetcher(octokit, owner, repo);
+  const result = await fetcher.fetchText({
+    path: REPO_LOCAL_CONFIG_PATH,
+    ref,
+    maxBytes: 65536,
+  });
+
+  if (!result.ok) {
+    if (result.reason === 'missing') {
+      // No config file → pure defaults, no note needed.
+      return { config: loadRepoConfig({ yamlContents: null }), notes: [] };
+    }
+    // Other fetch error → defaults + note.
+    return {
+      config: loadRepoConfig({ yamlContents: null }),
+      notes: [`config fetch failed (${result.reason}): using defaults`],
+    };
+  }
+
+  try {
+    const config = loadRepoConfig({ yamlContents: result.text });
+    return { config, notes: [] };
+  } catch (err) {
+    if (err instanceof ConfigParseError) {
+      log('worker.config.parse_error', { code: err.code, message: err.message });
+      return {
+        config: loadRepoConfig({ yamlContents: null }),
+        notes: [`config error (${err.code}): ${err.message} — using defaults`],
+      };
+    }
+    return {
+      config: loadRepoConfig({ yamlContents: null }),
+      notes: ['config parse error: unknown error — using defaults'],
+    };
+  }
+};
 
 const start = async (): Promise<void> => {
   const secretSource = envSecretSource();
@@ -225,18 +276,57 @@ const start = async (): Promise<void> => {
   const provider = await buildProvider(secretSource);
   const installationAuth = await buildInstallationAuth(secretSource);
   const repoLookup = buildRepoLookup(secretSource);
-  const config = defaultRepoConfig();
 
   const consumer = new BullMqJobConsumer({ connection });
 
   const handler = async (payload: JobPayload): Promise<JobOutcome> => {
     log('job.started', { idempotency_key: payload.idempotency_key });
     try {
+      // Get an authenticated octokit for this job's installation.
+      const octokit = await installationAuth.getOctokit(payload.installation_id);
+      // Resolve repo identity first (needed for content fetcher).
+      const identity = await repoLookup({
+        installation_id: payload.installation_id,
+        repository_id: payload.repository_id,
+        ...(payload.owner !== undefined ? { owner: payload.owner } : {}),
+        ...(payload.repo !== undefined ? { repo: payload.repo } : {}),
+      });
+
+      // D3: use head_sha for same-repo PRs as the default ref; without the
+      // snapshot we don't yet know if it's a fork, so we use head_sha from
+      // the payload (same-repo assumption). The orchestrator re-evaluates
+      // this from the snapshot for context-file fetching (where fork matters).
+      const configRef = payload.head_sha;
+
+      const { config, notes: configNotes } = await fetchRepoConfig(
+        octokit,
+        identity.owner,
+        identity.repo,
+        configRef,
+      );
+
+      log('worker.config.loaded', {
+        idempotency_key: payload.idempotency_key,
+        owner: identity.owner,
+        repo: identity.repo,
+        ref: configRef,
+        has_guidance:
+          config.review_guidance.instructions !== undefined ||
+          config.review_guidance.path_instructions.length > 0 ||
+          config.review_guidance.context_files.length > 0,
+        config_notes: configNotes.length,
+      });
+
+      const contentFetcher = buildContentFetcher(octokit, identity.owner, identity.repo);
+
       const result = await runPipeline(payload, {
         installationAuth,
         provider,
         config,
         repoLookup,
+        octokit,
+        contentFetcher,
+        configNotes,
       });
       if (result.state === 'succeeded' && result.publication !== undefined) {
         return { state: 'succeeded', result: result.publication };

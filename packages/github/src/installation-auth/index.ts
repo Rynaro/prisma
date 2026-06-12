@@ -11,6 +11,7 @@ export type {
   OctokitLike,
   PullsGetData,
   PullsListFilesData,
+  ReposGetContentData,
   ChecksCreateParams,
   ChecksUpdateParams,
   ChecksListItemData,
