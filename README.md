@@ -65,7 +65,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.1.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.2.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 ## What is prisma?
 
@@ -124,7 +124,7 @@ Full guide: [docs/custom-review-prompts.md](./docs/custom-review-prompts.md).
 
 ## Status
 
-**v0.1.0** — first production release.
+**v0.2.0** — user-customizable review prompts.
 
 - 364 tests across 45 files, all passing · 12/12 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
