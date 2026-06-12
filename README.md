@@ -122,6 +122,38 @@ Guidance is injected as **untrusted data** beneath an immutable system prompt �
 
 Full guide: [docs/custom-review-prompts.md](./docs/custom-review-prompts.md).
 
+## Commands
+
+Mention the bot in a PR comment to trigger actions without opening the GitHub UI:
+
+```
+@prisma-bot review
+@prisma-bot full review
+@prisma-bot help
+@prisma-bot configuration
+```
+
+| Command | What it does |
+|---------|-------------|
+| `review` | Incremental re-review: only files not already covered in prior rounds of this PR are reviewed. |
+| `full review` | Full re-review: all diff files are reviewed from scratch, ignoring prior-round dedupe state. |
+| `help` | Replies with the command vocabulary in a PR comment. No provider call is made. |
+| `configuration` | Replies with the resolved repo configuration (mode, caps, thresholds). No provider call is made. |
+
+**Nickname.** If you prefer a shorter mention, set `nickname` in `.github/review-bot.yml`:
+
+```yaml
+nickname: prbot
+```
+
+Both `@prisma-bot` and `@prbot` will then be accepted as valid triggers.
+
+**Ack protocol.** When the bot receives a command it adds a 👀 reaction to acknowledge receipt (fail-open — the review continues even if the reaction call fails). On success it adds a ✅ reaction and optionally posts a reply comment for `help` and `configuration` commands.
+
+**Loop prevention.** Comments authored by the bot itself are silently discarded at the worker level — the job resolves to `discarded_idempotent` without any provider call.
+
+**Graceful degradation.** If the bot's login cannot be resolved (`GITHUB_APP_SLUG` unset), comment events are still processed — the loop-prevention check simply becomes a no-op for that delivery.
+
 ## Status
 
 **v0.2.0** — user-customizable review prompts.

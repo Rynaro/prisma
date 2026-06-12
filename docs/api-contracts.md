@@ -34,7 +34,7 @@ The webhook ingress is the single externally reachable HTTP surface of the App.
   - `X-GitHub-Event` — the GitHub event name (e.g., `pull_request`).
   - `X-GitHub-Delivery` — the delivery UUID assigned by GitHub.
   - `Content-Type: application/json`.
-- **Idempotency key derivation.** A deterministic function named `deriveIdempotencyKey` whose inputs are the `X-GitHub-Delivery` header value and the `(installation_id, repository_id, pull_request.number, head_sha)` tuple parsed from the body when the event is one of the accepted ones. Output is a deterministic string. Sketch:
+- **Idempotency key derivation.** A deterministic function named `deriveIdempotencyKey` whose inputs are the `X-GitHub-Delivery` header value and a per-event-type tuple parsed from the body. Output is a deterministic string. Sketch:
 
   ```ts
   function deriveIdempotencyKey(input: {
@@ -42,14 +42,18 @@ The webhook ingress is the single externally reachable HTTP surface of the App.
     installation_id: number;
     repository_id: number;
     pull_request_number: number;
-    head_sha: string;
+    head_sha?: string;              // present for pull_request; undefined for comment/check_run events
+    comment_id?: number;            // present for issue_comment events
+    check_run_id?: number;          // present for check_run rerequested events
   }): string;
   ```
 
-- **Accepted events (closed list for MVP).**
+- **Accepted events (closed list).**
   - `pull_request.opened`
   - `pull_request.synchronize`
   - `pull_request.reopened`
+  - `issue_comment.created` — triggers the comment-command dispatch path. Bot-authored comments are detected at the worker level (loop prevention) and resolved to `discarded_idempotent` without any provider call.
+  - `check_run.rerequested` — triggers a fresh full-review pipeline run when the user clicks the native GitHub "Re-run" button on the "AI Code Review" check run.
 
   Any other event returns `2xx` and is otherwise discarded with a structured log entry naming the event type and the delivery id.
 
@@ -86,18 +90,37 @@ The webhook ingress is the single externally reachable HTTP surface of the App.
 
 The async job is the unit of pipeline work for a single PR event.
 
-- **`JobPayload` shape.**
+- **`JobPayload` shape.** A discriminated union on `event_type`. All three variants share the common fields; the `issue_comment` and `check_run` variants carry their event-specific identifiers.
 
   ```ts
-  type JobPayload = {
+  // Shared fields present in every variant
+  type JobPayloadBase = {
     idempotency_key: string;          // output of deriveIdempotencyKey
     installation_id: number;
     repository_id: number;
     pull_request_number: number;
-    head_sha: string;
-    event_type: 'pull_request.opened' | 'pull_request.synchronize' | 'pull_request.reopened';
     received_at: string;              // ISO-8601
   };
+
+  type PullRequestJobPayload = JobPayloadBase & {
+    event_type: 'pull_request.opened' | 'pull_request.synchronize' | 'pull_request.reopened';
+    head_sha: string;
+  };
+
+  type IssueCommentJobPayload = JobPayloadBase & {
+    event_type: 'issue_comment.created';
+    comment_id: number;
+    comment_author_login: string;
+    command_raw: string;              // the raw text of the comment body
+  };
+
+  type CheckRunJobPayload = JobPayloadBase & {
+    event_type: 'check_run.rerequested';
+    check_run_id: number;
+    head_sha: string;
+  };
+
+  type JobPayload = PullRequestJobPayload | IssueCommentJobPayload | CheckRunJobPayload;
   ```
 
   No raw provider credentials, App private key material, or webhook secret material is permitted in the payload. Installation tokens are minted at job execution time, not embedded in the payload.
@@ -269,4 +292,5 @@ The per-contract invariants above are aggregated here as a numbered list:
 6. `published_inline.length <= comment_cap.per_pr`, and the per-file count is `<= comment_cap.per_file`.
 7. Every dropped `NormalizedFinding` is accompanied by exactly one `RejectionLogEntry` with a `stage` and a `reason_code`.
 8. If `ProviderReviewOutput` fails Zod validation at the adapter boundary, no `NormalizedFinding` is emitted for that PR; the job terminates with `failed_terminal` and an audit entry (`stage = 'validator'`, `reason_code = 'provider_output_zod_failed'`, or — when the failure is at the adapter boundary itself — `stage = 'validator'` with the same reason code referencing the adapter-side rejection).
-9. The accepted-events list in the webhook ingress is the closed set `{pull_request.opened, pull_request.synchronize, pull_request.reopened}`; any other event returns 2xx and is otherwise discarded.
+9. The accepted-events list in the webhook ingress is the closed set `{pull_request.opened, pull_request.synchronize, pull_request.reopened, issue_comment.created, check_run.rerequested}`; any other event returns 2xx and is otherwise discarded.
+10. A job whose `event_type` is `issue_comment.created` and whose `comment_author_login` matches the bot's own login is resolved to `discarded_idempotent` at the worker level without any provider call (loop prevention).

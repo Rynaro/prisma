@@ -38,6 +38,7 @@ The App requires exactly the following repository permissions. Granting more is 
 | `pull_requests` | Read & write | Create/update Check runs and inline review comments on PRs (per `packages/github/check-runs` and `packages/github/review-comments`). |
 | `checks` | Read & write | Create/update Check runs on the PR `head_sha` (per ADR-001 § Rationale: Checks API richness). |
 | `contents` | Read | Fetch the PR diff and `.github/review-bot.yml` from the head ref (per `packages/core/snapshotter` and `packages/config/config-loader`). |
+| `issues` | Read & write | Post PR conversation reply comments and 👀/✅ reactions for the comment-command ack protocol (`packages/github/issue-comments`). PRs are issues in the GitHub data model; no separate `pull_requests` scope is required for conversation comments. Reactions require no additional scope beyond `issues:write`. |
 | `metadata` | Read | Required by every GitHub App; auto-granted. |
 
 No organization-level permissions are required for MVP. (Multi-installation routing is namespaced by `installation_id` per [`system-design.md` § Multitenancy posture](system-design.md).)
@@ -48,7 +49,9 @@ Subscribe to the following webhook events:
 
 | Event | Why |
 | --- | --- |
-| `pull_request` | The trigger that makes the bot review a PR (`opened`, `synchronize`, and related actions arrive on this event). |
+| `pull_request` | The trigger that makes the bot review a PR (`opened`, `synchronize`, `reopened` actions). |
+| `issue_comment` | Enables PR comment-command mentions: `@bot review`, `@bot full review`, `@bot help`, `@bot configuration`. Only the `created` action is accepted; `edited` and `deleted` are ignored. Bot-authored comments are dropped at ingress (loop prevention). |
+| `check_run` | Enables the native GitHub "Re-run" button on the "AI Code Review" check run. Only the `rerequested` action is accepted; `completed`, `created`, and all others are ignored. |
 | `installation` | The bot must observe install/uninstall to track installation lifecycle. |
 | `installation_repositories` | Repository add/remove against an existing installation. |
 
