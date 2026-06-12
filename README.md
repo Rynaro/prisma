@@ -13,6 +13,7 @@ A production-ready GitHub App that reviews pull requests with swappable AI provi
 
 - **Try locally in 5 minutes** → [Local evaluation quickstart](#quickstart)
 - **Deploy to production** → [Interactive installer](#deploy-to-production)
+- **Operate a deployment** → [Ops CLI `bin/prisma`](#operate-the-deployment)
 - **Integrate via GitHub App** → [App installation guide](./docs/install-github-app.md)
 - **Customize the review** → [Custom review prompts guide](./docs/custom-review-prompts.md)
 - **Understand the architecture** → [System design](./docs/system-design.md)
@@ -66,6 +67,21 @@ bash deploy/install.sh --yes
 ```
 
 Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.3.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+
+## Operate the Deployment
+
+Once installed, `bin/prisma` is total control over the running stack — an interactive console for humans, flag-driven workflows for automation (CI, cron, LLM operators):
+
+```bash
+bin/prisma                              # interactive TUI console
+bin/prisma --update --tag v0.4.0 --yes  # headless: pull, redeploy, health-gate,
+                                        # auto-rollback to the previous release on failure
+bin/prisma --rollback --yes             # back to the previous recorded release
+bin/prisma status                       # services, image pin, liveness at a glance
+bin/prisma doctor                       # full diagnostic (env, perms, DNS, disk, health)
+```
+
+Also: `logs`, `restart`, `scale`, `config get/set`, Redis `backup`/`restore`, `up`/`down`. Full reference: [docs/operations.md](./docs/operations.md).
 
 ## What is prisma?
 
