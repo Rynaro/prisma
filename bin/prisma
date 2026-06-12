@@ -1,0 +1,1025 @@
+#!/usr/bin/env bash
+# bin/prisma — operations CLI for a deployed prisma-review-bot stack.
+#
+# One command, two faces:
+#   bin/prisma                          # interactive TUI console
+#   bin/prisma --update --tag v0.4.0 --yes   # headless workflow
+#
+# Every command also works in subcommand form (bin/prisma update --tag ...).
+# Operates on the production stack defined by deploy/docker-compose.prod.yml
+# and configured by deploy/.env (written by deploy/install.sh).
+#
+# Bash 3.2-compatible (macOS default shell). No associative arrays, no
+# mapfile, no ${var^^}/${var,,}, no &>>.
+#
+# stdout: machine-readable command output (values, tables, summaries).
+# stderr: ALL prompts, progress, warnings, and diagnostic output.
+#
+# House rules follow deploy/install.sh:
+#   set -euo pipefail; log/fail helpers to stderr; explicit variable init.
+
+set -euo pipefail
+
+PRISMA_CLI_VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMPOSE_FILE="${REPO_ROOT}/deploy/docker-compose.prod.yml"
+ENV_FILE="${REPO_ROOT}/deploy/.env"
+HISTORY_FILE="${REPO_ROOT}/deploy/.releases"
+BACKUP_DIR="${REPO_ROOT}/deploy/backups"
+HEALTH_DEADLINE_DEFAULT=120
+
+# ---------------------------------------------------------------------------
+# Output helpers (logs/prompts -> stderr; values -> stdout)
+# ---------------------------------------------------------------------------
+
+C_RESET=""
+C_BOLD=""
+C_DIM=""
+C_GREEN=""
+C_RED=""
+C_YELLOW=""
+C_CYAN=""
+if [ -t 2 ]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'
+  C_RED=$'\033[31m'
+  C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+fi
+
+log() {
+  printf '%s[prisma]%s %s\n' "${C_CYAN}" "${C_RESET}" "$*" >&2
+}
+
+ok() {
+  printf '%s[prisma]%s %s%s%s\n' "${C_CYAN}" "${C_RESET}" "${C_GREEN}" "$*" "${C_RESET}" >&2
+}
+
+warn() {
+  printf '%s[prisma]%s %sWARNING:%s %s\n' "${C_CYAN}" "${C_RESET}" "${C_YELLOW}" "${C_RESET}" "$*" >&2
+}
+
+fail() {
+  printf '%s[prisma]%s %sERROR:%s %s\n' "${C_CYAN}" "${C_RESET}" "${C_RED}" "${C_RESET}" "$*" >&2
+  exit 1
+}
+
+# confirm QUESTION — returns 0 on yes. --yes mode auto-confirms.
+# Headless without a tty and without --yes fails loudly rather than hanging.
+confirm() {
+  local question="$1"
+  local answer=""
+  if [ "${YES_MODE}" -eq 1 ]; then
+    return 0
+  fi
+  if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    fail "'${question}' needs confirmation but no TTY is attached. Re-run with --yes."
+  fi
+  printf '%s[prisma]%s %s [y/N]: ' "${C_CYAN}" "${C_RESET}" "${question}" >&2
+  if read -r answer </dev/tty 2>/dev/null || true; then
+    :
+  fi
+  case "${answer}" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ask VAR QUESTION [DEFAULT] — interactive value prompt via /dev/tty.
+ask() {
+  local var_name="$1"
+  local question="$2"
+  local default_val="${3:-}"
+  local value=""
+  if [ -n "${default_val}" ]; then
+    printf '%s[prisma]%s %s [%s]: ' "${C_CYAN}" "${C_RESET}" "${question}" "${default_val}" >&2
+  else
+    printf '%s[prisma]%s %s: ' "${C_CYAN}" "${C_RESET}" "${question}" >&2
+  fi
+  if read -r value </dev/tty 2>/dev/null || true; then
+    :
+  fi
+  if [ -z "${value}" ] && [ -n "${default_val}" ]; then
+    value="${default_val}"
+  fi
+  local quoted_value
+  quoted_value="$(printf '%q' "${value}")"
+  eval "${var_name}=${quoted_value}"
+}
+
+# ---------------------------------------------------------------------------
+# Stack primitives
+# ---------------------------------------------------------------------------
+
+compose() {
+  docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" "$@"
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 \
+    || fail "docker is required but not found. Install Docker and retry."
+  docker compose version >/dev/null 2>&1 \
+    || fail "'docker compose' v2 plugin is required but not found."
+}
+
+require_env() {
+  [ -f "${ENV_FILE}" ] \
+    || fail "deploy/.env not found. Run deploy/install.sh first (bin/prisma operates on an installed stack)."
+}
+
+require_stack() {
+  require_docker
+  require_env
+}
+
+# env_get KEY — print the value of KEY from deploy/.env ('' if absent).
+env_get() {
+  local key="$1"
+  [ -f "${ENV_FILE}" ] || return 0
+  grep "^${key}=" "${ENV_FILE}" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+# env_set KEY VALUE — replace (or append) KEY in deploy/.env, preserving perms.
+env_set() {
+  local key="$1"
+  local value="$2"
+  local tmp_env
+  local escaped_value
+  require_env
+  # Escape for sed replacement: backslash, ampersand, and the | delimiter.
+  escaped_value="$(printf '%s' "${value}" | sed 's/\\/\\\\/g; s/&/\\&/g; s/|/\\|/g')"
+  tmp_env="$(mktemp)"
+  if grep -q "^${key}=" "${ENV_FILE}"; then
+    sed "s|^${key}=.*|${key}=${escaped_value}|" "${ENV_FILE}" > "${tmp_env}"
+  else
+    cat "${ENV_FILE}" > "${tmp_env}"
+    printf '%s=%s\n' "${key}" "${value}" >> "${tmp_env}"
+  fi
+  mv "${tmp_env}" "${ENV_FILE}"
+  chmod 600 "${ENV_FILE}"
+}
+
+current_tag() {
+  local tag
+  tag="$(env_get IMAGE_TAG)"
+  printf '%s' "${tag:-latest}"
+}
+
+# running_digest SERVICE — sha256 repo digest of the image the service runs ('' if down).
+running_digest() {
+  local service="$1"
+  local cid=""
+  local image_id=""
+  cid="$(compose ps -q "${service}" 2>/dev/null | head -1 || true)"
+  [ -n "${cid}" ] || return 0
+  image_id="$(docker inspect --format '{{.Image}}' "${cid}" 2>/dev/null || true)"
+  [ -n "${image_id}" ] || return 0
+  docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
+    "${image_id}" 2>/dev/null | sed 's/^.*@//' || true
+}
+
+# release_record PIN — append a release line to deploy/.releases.
+release_record() {
+  local pin="$1"
+  printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${pin}" >> "${HISTORY_FILE}"
+}
+
+# release_previous — print the pin of the release before the latest ('' if none).
+release_previous() {
+  [ -f "${HISTORY_FILE}" ] || return 0
+  tail -2 "${HISTORY_FILE}" | head -1 | cut -f2- || true
+}
+
+release_latest() {
+  [ -f "${HISTORY_FILE}" ] || return 0
+  tail -1 "${HISTORY_FILE}" | cut -f2- || true
+}
+
+# current_pin — "tag@sha256:..." when a digest is known, else just the tag.
+current_pin() {
+  local tag
+  local digest
+  tag="$(current_tag)"
+  digest="$(running_digest app)"
+  if [ -n "${digest}" ]; then
+    printf '%s@%s' "${tag%%@*}" "${digest}"
+  else
+    printf '%s' "${tag}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Health polling (S6 contract: /healthz/live only)
+# ---------------------------------------------------------------------------
+
+# poll_health [DEADLINE_SECONDS] — bounded poll; 0 = live, 1 = timed out.
+poll_health() {
+  local deadline="${1:-${HEALTH_DEADLINE_DEFAULT}}"
+  local elapsed=0
+  local sleep_for=5
+  local domain
+  local url
+  local status=""
+  domain="$(env_get PRISMA_DOMAIN)"
+  [ -n "${domain}" ] || fail "PRISMA_DOMAIN is not set in deploy/.env."
+  url="https://${domain}/healthz/live"
+
+  log "Polling ${url} (deadline ${deadline}s)..."
+  while [ "${elapsed}" -lt "${deadline}" ]; do
+    status="$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null || true)"
+    if [ "${status}" = "200" ]; then
+      ok "Live: ${url}"
+      return 0
+    fi
+    # Pre-DNS / split-horizon fallback (matches deploy/install.sh).
+    status="$(curl -fsS --max-time 5 \
+      --resolve "${domain}:443:127.0.0.1" \
+      -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null || true)"
+    if [ "${status}" = "200" ]; then
+      ok "Live (via local resolve): ${url}"
+      return 0
+    fi
+    log "Not healthy yet (${elapsed}s elapsed, HTTP=${status:-none}). Retrying in ${sleep_for}s..."
+    sleep "${sleep_for}"
+    elapsed=$((elapsed + sleep_for))
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+  require_stack
+  local tag
+  local digest
+  tag="$(current_tag)"
+  digest="$(running_digest app)"
+
+  printf '%sStack%s    deploy/docker-compose.prod.yml\n' "${C_BOLD}" "${C_RESET}"
+  printf '%sImage%s    ghcr.io/rynaro/prisma-bot:%s\n' "${C_BOLD}" "${C_RESET}" "${tag}"
+  if [ -n "${digest}" ]; then
+    printf '%sDigest%s   %s\n' "${C_BOLD}" "${C_RESET}" "${digest}"
+  else
+    printf '%sDigest%s   (app not running)\n' "${C_BOLD}" "${C_RESET}"
+  fi
+  printf '\n'
+  compose ps
+  printf '\n'
+  if poll_health 10 >/dev/null 2>&1; then
+    printf '%sHealth%s   %slive%s (/healthz/live)\n' "${C_BOLD}" "${C_RESET}" "${C_GREEN}" "${C_RESET}"
+  else
+    printf '%sHealth%s   %snot live%s (/healthz/live did not return 200)\n' "${C_BOLD}" "${C_RESET}" "${C_RED}" "${C_RESET}"
+  fi
+}
+
+cmd_health() {
+  require_stack
+  if poll_health "${HEALTH_TIMEOUT}"; then
+    printf 'live\n'
+  else
+    printf 'down\n'
+    exit 1
+  fi
+}
+
+# deploy_pin PIN — point the stack at PIN, pull, recreate, health-gate.
+# Returns 0 when the new release is live.
+deploy_pin() {
+  local pin="$1"
+  log "Setting IMAGE_TAG=${pin} in deploy/.env..."
+  env_set IMAGE_TAG "${pin}"
+  log "Pulling image..."
+  if ! compose pull --quiet app worker >&2; then
+    warn "Image pull failed for '${pin}' (tag typo? registry down?)."
+    return 1
+  fi
+  log "Recreating app and worker..."
+  if ! compose up -d app worker >&2; then
+    warn "docker compose up failed."
+    return 1
+  fi
+  if [ "${SKIP_HEALTH}" -eq 1 ]; then
+    warn "--no-health set: skipping the /healthz/live gate."
+    return 0
+  fi
+  poll_health "${HEALTH_TIMEOUT}"
+}
+
+cmd_update() {
+  require_stack
+  local new_tag="${TAG_OPT}"
+  local previous_pin
+  local rollback_pin
+
+  if [ "${SYNC_OPT}" -eq 1 ]; then
+    log "Syncing repo checkout (git pull --ff-only)..."
+    git -C "${REPO_ROOT}" pull --ff-only >&2 \
+      || fail "git pull --ff-only failed. Resolve the checkout state and retry."
+  fi
+
+  if [ -z "${new_tag}" ]; then
+    if [ "${YES_MODE}" -eq 1 ]; then
+      new_tag="$(current_tag)"
+      new_tag="${new_tag%%@*}"
+      log "No --tag given; re-pulling '${new_tag}'."
+    else
+      ask new_tag "Image tag to deploy (latest, vX.Y.Z, or sha-<short>)" "$(current_tag | cut -d@ -f1)"
+    fi
+  fi
+
+  # Pin the pre-update state so we can roll back precisely (tag@digest).
+  previous_pin="$(current_pin)"
+  log "Current release: ${previous_pin}"
+  log "Target release:  ${new_tag}"
+
+  confirm "Deploy ghcr.io/rynaro/prisma-bot:${new_tag} to this stack?" \
+    || fail "Aborted. Nothing was changed."
+
+  if deploy_pin "${new_tag}"; then
+    release_record "$(current_pin)"
+    ok "Update complete. Running: $(current_pin)"
+    printf 'deployed\t%s\n' "$(current_pin)"
+    return 0
+  fi
+
+  warn "Deploy of '${new_tag}' did not become healthy (pull, recreate, or /healthz/live gate failed — see above)."
+  compose logs app worker --tail=40 >&2 || true
+
+  if [ "${NO_ROLLBACK}" -eq 1 ]; then
+    fail "Rollback disabled (--no-rollback). Stack is left on '${new_tag}' — investigate with 'bin/prisma logs'."
+  fi
+
+  rollback_pin="${previous_pin}"
+  warn "Rolling back to ${rollback_pin}..."
+  if deploy_pin "${rollback_pin}"; then
+    ok "Rollback succeeded. Running: ${rollback_pin}"
+    printf 'rolled-back\t%s\n' "${rollback_pin}"
+    exit 1
+  fi
+  fail "Rollback to ${rollback_pin} ALSO failed the health gate. Manual intervention required: 'bin/prisma logs' / 'bin/prisma doctor'."
+}
+
+cmd_rollback() {
+  require_stack
+  local target="${TAG_OPT}"
+  if [ -z "${target}" ]; then
+    target="$(release_previous)"
+  fi
+  if [ -z "${target}" ]; then
+    fail "No previous release recorded in deploy/.releases and no --tag given. Pass --tag <tag|tag@digest> explicitly."
+  fi
+  log "Current release: $(current_pin)"
+  log "Rollback target: ${target}"
+  confirm "Roll the stack back to ${target}?" || fail "Aborted. Nothing was changed."
+  if deploy_pin "${target}"; then
+    release_record "$(current_pin)"
+    ok "Rollback complete. Running: $(current_pin)"
+    printf 'deployed\t%s\n' "$(current_pin)"
+  else
+    fail "Rollback failed the health gate. Manual intervention required: 'bin/prisma logs' / 'bin/prisma doctor'."
+  fi
+}
+
+cmd_releases() {
+  if [ ! -f "${HISTORY_FILE}" ] || [ ! -s "${HISTORY_FILE}" ]; then
+    log "No releases recorded yet (deploy/.releases is written on each successful update)."
+    return 0
+  fi
+  printf '%sDEPLOYED AT (UTC)\tRELEASE%s\n' "${C_BOLD}" "${C_RESET}"
+  cat "${HISTORY_FILE}"
+}
+
+cmd_logs() {
+  require_stack
+  local follow_args=""
+  if [ "${FOLLOW_OPT}" -eq 1 ]; then
+    follow_args="-f"
+  fi
+  # shellcheck disable=SC2086  # follow_args is intentionally word-split ('' or -f)
+  if [ -n "${SERVICE_OPT}" ]; then
+    compose logs ${follow_args} --tail="${TAIL_OPT}" "${SERVICE_OPT}"
+  else
+    compose logs ${follow_args} --tail="${TAIL_OPT}"
+  fi
+}
+
+cmd_restart() {
+  require_stack
+  if [ -n "${SERVICE_OPT}" ]; then
+    confirm "Restart service '${SERVICE_OPT}'?" || fail "Aborted."
+    compose restart "${SERVICE_OPT}" >&2
+    ok "Restarted ${SERVICE_OPT}."
+  else
+    confirm "Restart ALL services (app, worker, redis, traefik)?" || fail "Aborted."
+    compose restart >&2
+    ok "Restarted all services."
+  fi
+}
+
+cmd_up() {
+  require_stack
+  log "Bringing the production stack up..."
+  compose up -d >&2
+  if [ "${SKIP_HEALTH}" -eq 1 ] || poll_health "${HEALTH_TIMEOUT}"; then
+    ok "Stack is up."
+  else
+    fail "Stack came up but /healthz/live never returned 200. Check 'bin/prisma logs app'."
+  fi
+}
+
+cmd_down() {
+  require_stack
+  warn "This stops the public webhook endpoint (Traefik goes down). Redis data is preserved."
+  confirm "Take the whole stack DOWN?" || fail "Aborted."
+  compose down >&2
+  ok "Stack is down. Bring it back with 'bin/prisma up'."
+}
+
+cmd_scale() {
+  require_stack
+  local n="${WORKERS_OPT}"
+  if [ -z "${n}" ]; then
+    if [ "${YES_MODE}" -eq 1 ]; then
+      fail "--scale requires --workers N in headless mode."
+    fi
+    ask n "Number of worker replicas" "2"
+  fi
+  case "${n}" in
+    ''|*[!0-9]*) fail "--workers must be a positive integer. Got: '${n}'" ;;
+  esac
+  [ "${n}" -ge 1 ] || fail "--workers must be >= 1."
+  confirm "Scale worker to ${n} replica(s)?" || fail "Aborted."
+  compose up -d --scale "worker=${n}" worker >&2
+  ok "worker scaled to ${n} replica(s). Note: scale is not persisted across 'down'; re-apply after a full restart."
+}
+
+# Keys whose values are redacted in `config show`.
+is_secret_key() {
+  case "$1" in
+    *KEY*|*SECRET*|*TOKEN*|*PASSWORD*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_config() {
+  require_env
+  local action="${CONFIG_ACTION:-show}"
+  local line=""
+  local key=""
+  local value=""
+  case "${action}" in
+    show)
+      while IFS= read -r line; do
+        case "${line}" in
+          ''|'#'*) continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        if is_secret_key "${key}" && [ -n "${value}" ]; then
+          printf '%s=%s(set, redacted)%s\n' "${key}" "${C_DIM}" "${C_RESET}"
+        else
+          printf '%s\n' "${line}"
+        fi
+      done < "${ENV_FILE}"
+      ;;
+    get)
+      [ -n "${CONFIG_KEY}" ] || fail "config get requires a KEY."
+      env_get "${CONFIG_KEY}"
+      printf '\n'
+      ;;
+    set)
+      [ -n "${CONFIG_KEY}" ] || fail "config set requires KEY=VALUE."
+      confirm "Set ${CONFIG_KEY} in deploy/.env? (services pick it up on next 'restart' or 'update')" \
+        || fail "Aborted."
+      env_set "${CONFIG_KEY}" "${CONFIG_VALUE}"
+      ok "${CONFIG_KEY} updated. Apply with 'bin/prisma restart' (or it lands on the next update)."
+      ;;
+    *)
+      fail "Unknown config action: ${action}. Use: show | get KEY | set KEY=VALUE"
+      ;;
+  esac
+}
+
+cmd_backup() {
+  require_stack
+  local stamp
+  local out
+  local in_progress=""
+  local waited=0
+  stamp="$(date -u '+%Y%m%d-%H%M%S')"
+  out="${BACKUP_DIR}/redis-${stamp}.rdb"
+  mkdir -p "${BACKUP_DIR}"
+
+  log "Triggering redis BGSAVE..."
+  compose exec -T redis redis-cli BGSAVE >&2 \
+    || fail "BGSAVE failed — is the redis service running? ('bin/prisma status')"
+
+  # Wait (bounded) for the background save to finish.
+  while [ "${waited}" -lt 60 ]; do
+    in_progress="$(compose exec -T redis redis-cli INFO persistence 2>/dev/null \
+      | grep 'rdb_bgsave_in_progress:' | tr -d '\r' | cut -d: -f2 || true)"
+    if [ "${in_progress}" = "0" ]; then
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ "${in_progress}" = "0" ] || fail "BGSAVE did not finish within 60s."
+
+  log "Copying dump.rdb out of the redis container..."
+  compose cp redis:/data/dump.rdb "${out}" >&2
+  chmod 600 "${out}"
+  ok "Backup written: ${out}"
+  printf '%s\n' "${out}"
+}
+
+cmd_restore() {
+  require_stack
+  local src="${FILE_OPT}"
+  local redis_cid=""
+  [ -n "${src}" ] || fail "restore requires --file <path-to-.rdb>."
+  [ -f "${src}" ] || fail "Backup file not found: ${src}"
+
+  warn "Restore REPLACES all queue state (jobs, idempotency keys) with the backup contents."
+  confirm "Stop the stack and restore redis from ${src}?" || fail "Aborted."
+
+  log "Stopping app and worker (so nothing writes during restore)..."
+  compose stop app worker >&2
+
+  redis_cid="$(compose ps -q redis | head -1 || true)"
+  [ -n "${redis_cid}" ] || fail "redis container not found — bring the stack up first ('bin/prisma up')."
+
+  log "Stopping redis and replacing dump.rdb..."
+  compose stop redis >&2
+  docker cp "${src}" "${redis_cid}:/data/dump.rdb" >&2
+  compose start redis >&2
+
+  log "Restarting app and worker..."
+  compose start app worker >&2
+
+  if poll_health "${HEALTH_TIMEOUT}"; then
+    ok "Restore complete; stack is live."
+  else
+    fail "Stack restarted but /healthz/live never returned 200. Check 'bin/prisma logs'."
+  fi
+}
+
+cmd_doctor() {
+  local failures=0
+  local domain=""
+  local tag=""
+  local digest=""
+  local perms=""
+  local resolved=""
+  local disk=""
+
+  _check() {
+    # _check LABEL OK_BOOL DETAIL
+    if [ "$2" = "0" ]; then
+      printf '  %s✓%s %s%s\n' "${C_GREEN}" "${C_RESET}" "$1" "${3:+ — $3}"
+    else
+      printf '  %s✗%s %s%s\n' "${C_RED}" "${C_RESET}" "$1" "${3:+ — $3}"
+      failures=$((failures + 1))
+    fi
+  }
+
+  printf '%sprisma doctor%s\n\n' "${C_BOLD}" "${C_RESET}"
+
+  if command -v docker >/dev/null 2>&1; then
+    _check "docker installed" 0 "$(docker --version 2>/dev/null | head -1)"
+  else
+    _check "docker installed" 1 "not found"
+  fi
+
+  if docker compose version >/dev/null 2>&1; then
+    _check "docker compose v2" 0 ""
+  else
+    _check "docker compose v2" 1 "plugin missing"
+  fi
+
+  if [ -f "${ENV_FILE}" ]; then
+    perms="$(stat -f '%Lp' "${ENV_FILE}" 2>/dev/null || stat -c '%a' "${ENV_FILE}" 2>/dev/null || true)"
+    if [ "${perms}" = "600" ]; then
+      _check "deploy/.env present, perms 600" 0 ""
+    else
+      _check "deploy/.env present, perms 600" 1 "perms are ${perms:-unknown} (expected 600)"
+    fi
+    for key in PRISMA_DOMAIN PRISMA_ACME_EMAIL GITHUB_APP_ID GITHUB_APP_PRIVATE_KEY GITHUB_APP_WEBHOOK_SECRET; do
+      if [ -n "$(env_get "${key}")" ]; then
+        _check "env: ${key} set" 0 ""
+      else
+        _check "env: ${key} set" 1 "empty"
+      fi
+    done
+    if [ -n "$(env_get ANTHROPIC_API_KEY)" ] || [ -n "$(env_get COPILOT_API_KEY)" ] || [ -n "$(env_get OPENAI_API_KEY)" ]; then
+      _check "env: a provider API key set" 0 ""
+    else
+      _check "env: a provider API key set" 1 "none of ANTHROPIC/COPILOT/OPENAI set — worker falls back to FakeProvider"
+    fi
+  else
+    _check "deploy/.env present" 1 "run deploy/install.sh"
+  fi
+
+  if [ -f "${REPO_ROOT}/deploy/acme.json" ]; then
+    perms="$(stat -f '%Lp' "${REPO_ROOT}/deploy/acme.json" 2>/dev/null || stat -c '%a' "${REPO_ROOT}/deploy/acme.json" 2>/dev/null || true)"
+    if [ "${perms}" = "600" ]; then
+      _check "deploy/acme.json perms 600" 0 ""
+    else
+      _check "deploy/acme.json perms 600" 1 "perms are ${perms:-unknown} — Traefik refuses to start otherwise"
+    fi
+  else
+    _check "deploy/acme.json present" 1 "missing — created by deploy/install.sh"
+  fi
+
+  domain="$(env_get PRISMA_DOMAIN)"
+  if [ -n "${domain}" ]; then
+    if command -v dig >/dev/null 2>&1; then
+      resolved="$(dig +short "${domain}" 2>/dev/null | head -1 || true)"
+    elif command -v nslookup >/dev/null 2>&1; then
+      resolved="$(nslookup "${domain}" 2>/dev/null | awk '/^Address: / { print $2; exit }' || true)"
+    fi
+    if [ -n "${resolved}" ]; then
+      _check "DNS: ${domain} resolves" 0 "${resolved}"
+    else
+      _check "DNS: ${domain} resolves" 1 "no A record found"
+    fi
+  fi
+
+  disk="$(df -h "${REPO_ROOT}" 2>/dev/null | awk 'NR==2 { print $5 }' | tr -d '%' || true)"
+  if [ -n "${disk}" ]; then
+    if [ "${disk}" -lt 90 ] 2>/dev/null; then
+      _check "disk usage < 90%" 0 "${disk}% used"
+    else
+      _check "disk usage < 90%" 1 "${disk}% used — prune with 'docker system prune'"
+    fi
+  fi
+
+  if [ -f "${ENV_FILE}" ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    for svc in traefik app worker redis; do
+      if [ -n "$(compose ps -q "${svc}" 2>/dev/null | head -1)" ]; then
+        _check "service running: ${svc}" 0 ""
+      else
+        _check "service running: ${svc}" 1 "not running"
+      fi
+    done
+
+    tag="$(current_tag)"
+    digest="$(running_digest app)"
+    if [ -n "${digest}" ]; then
+      _check "image pin known" 0 "${tag%%@*}@${digest}"
+    fi
+
+    if [ -n "${domain}" ]; then
+      if poll_health 10 >/dev/null 2>&1; then
+        _check "/healthz/live returns 200" 0 ""
+      else
+        _check "/healthz/live returns 200" 1 "see 'bin/prisma logs app'"
+      fi
+    fi
+  fi
+
+  printf '\n'
+  if [ "${failures}" -eq 0 ]; then
+    ok "All checks passed."
+  else
+    fail "${failures} check(s) failed."
+  fi
+}
+
+cmd_version() {
+  printf 'prisma CLI %s\n' "${PRISMA_CLI_VERSION}"
+  if [ -f "${ENV_FILE}" ] && command -v docker >/dev/null 2>&1; then
+    printf 'image tag: %s\n' "$(current_tag)"
+    local digest
+    digest="$(running_digest app)"
+    [ -n "${digest}" ] && printf 'running digest: %s\n' "${digest}"
+  fi
+  if command -v git >/dev/null 2>&1 && git -C "${REPO_ROOT}" rev-parse --short HEAD >/dev/null 2>&1; then
+    printf 'checkout: %s\n' "$(git -C "${REPO_ROOT}" rev-parse --short HEAD)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<EOF
+${C_BOLD}prisma${C_RESET} — operations CLI for the deployed prisma-review-bot stack
+
+${C_BOLD}USAGE${C_RESET}
+  bin/prisma                      Interactive console (TUI)
+  bin/prisma <command> [options]  Headless; '--command' works too (--update == update)
+
+${C_BOLD}COMMANDS${C_RESET}
+  update      Deploy a new image: pull, recreate, gate on /healthz/live,
+              auto-rollback to the previous pinned release on failure
+                --tag TAG        latest | vX.Y.Z | sha-<short> | tag@sha256:…
+                --sync           git pull --ff-only the checkout first
+                --no-rollback    leave the stack on the new tag even if unhealthy
+                --no-health      skip the health gate entirely
+  rollback    Redeploy the previous recorded release (or --tag TAG)
+  releases    Show the recorded release history (deploy/.releases)
+  status      Services, image tag + digest, and liveness at a glance
+  health      Probe https://\$PRISMA_DOMAIN/healthz/live  [--timeout N]
+  logs        Tail logs   [SERVICE] [--tail N] [--follow]
+  restart     Restart all services or one  [SERVICE]
+  up          Bring the full stack up (health-gated)
+  down        Stop the whole stack (asks first; data preserved)
+  scale       Scale worker replicas  --workers N
+  config      show | get KEY | set KEY=VALUE   (secrets redacted in show)
+  backup      Snapshot redis (BGSAVE) to deploy/backups/redis-<ts>.rdb
+  restore     Restore redis from a backup  --file PATH  (asks first)
+  doctor      Run every preflight + runtime diagnostic
+  version     CLI, image, and checkout versions
+
+${C_BOLD}GLOBAL OPTIONS${C_RESET}
+  --yes       Never prompt; auto-confirm (for CI / cron / LLM operators)
+  --timeout N Health-gate deadline in seconds (default ${HEALTH_DEADLINE_DEFAULT})
+  --help      This message
+
+${C_BOLD}EXAMPLES${C_RESET}
+  bin/prisma                                   # open the console
+  bin/prisma --update --tag v0.4.0 --yes       # headless release
+  bin/prisma --update --tag sha-1a2b3c4 --yes  # pin an immutable build
+  bin/prisma --rollback --yes                  # back to the previous release
+  bin/prisma logs app --tail 200
+  bin/prisma config set LOG_LEVEL=debug --yes && bin/prisma restart --yes
+EOF
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# TUI console
+# ---------------------------------------------------------------------------
+
+tui_dashboard() {
+  local domain
+  local tag
+  local digest
+  local svc_line=""
+  local svc=""
+  local state=""
+  domain="$(env_get PRISMA_DOMAIN)"
+  tag="$(current_tag)"
+  digest="$(running_digest app)"
+
+  printf '\n' >&2
+  printf '%s╭─ prisma ops console ─────────────────────────────────────╮%s\n' "${C_CYAN}" "${C_RESET}" >&2
+  printf '%s│%s  domain  %s\n' "${C_CYAN}" "${C_RESET}" "${domain:-"(unset)"}" >&2
+  printf '%s│%s  image   ghcr.io/rynaro/prisma-bot:%s\n' "${C_CYAN}" "${C_RESET}" "${tag}" >&2
+  if [ -n "${digest}" ]; then
+    printf '%s│%s  digest  %s\n' "${C_CYAN}" "${C_RESET}" "${digest}" >&2
+  fi
+  for svc in traefik app worker redis; do
+    if [ -n "$(compose ps -q "${svc}" 2>/dev/null | head -1)" ]; then
+      state="${C_GREEN}up${C_RESET}"
+    else
+      state="${C_RED}down${C_RESET}"
+    fi
+    svc_line="${svc_line}${svc} ${state}   "
+  done
+  printf '%s│%s  stack   %s\n' "${C_CYAN}" "${C_RESET}" "${svc_line}" >&2
+  printf '%s╰──────────────────────────────────────────────────────────╯%s\n' "${C_CYAN}" "${C_RESET}" >&2
+}
+
+tui_pause() {
+  printf '\n%s[prisma]%s Press Enter to return to the menu... ' "${C_CYAN}" "${C_RESET}" >&2
+  local _ignored=""
+  if read -r _ignored </dev/tty 2>/dev/null || true; then
+    :
+  fi
+}
+
+# Run a command from the TUI without letting its non-zero exit kill the console.
+tui_run() {
+  if ("$@"); then
+    :
+  else
+    warn "Command finished with a non-zero status (see output above)."
+  fi
+  tui_pause
+}
+
+tui_loop() {
+  local choice=""
+  local svc=""
+  local kv=""
+  while true; do
+    tui_dashboard
+    printf '\n' >&2
+    printf '  %s1%s) Update image      %s6%s) Scale workers\n' "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${C_RESET}" >&2
+    printf '  %s2%s) Rollback          %s7%s) Config\n' "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${C_RESET}" >&2
+    printf '  %s3%s) Status & health   %s8%s) Backup redis\n' "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${C_RESET}" >&2
+    printf '  %s4%s) Logs              %s9%s) Doctor\n' "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${C_RESET}" >&2
+    printf '  %s5%s) Restart           %sd%s) Down / %su%s) Up\n' "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${C_RESET}" >&2
+    printf '  %sr%s) Releases          %sq%s) Quit\n' "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${C_RESET}" >&2
+    printf '\n%s[prisma]%s Choice: ' "${C_CYAN}" "${C_RESET}" >&2
+    if read -r choice </dev/tty 2>/dev/null || true; then
+      :
+    fi
+    case "${choice}" in
+      1)
+        TAG_OPT=""
+        tui_run cmd_update
+        ;;
+      2)
+        TAG_OPT=""
+        tui_run cmd_rollback
+        ;;
+      3)
+        tui_run cmd_status
+        ;;
+      4)
+        ask svc "Service (app/worker/redis/traefik, Enter for all)" ""
+        SERVICE_OPT="${svc}"
+        FOLLOW_OPT=0
+        log "Showing the last ${TAIL_OPT} lines (use 'bin/prisma logs --follow' to stream)."
+        tui_run cmd_logs
+        ;;
+      5)
+        ask svc "Service to restart (Enter for all)" ""
+        SERVICE_OPT="${svc}"
+        tui_run cmd_restart
+        ;;
+      6)
+        WORKERS_OPT=""
+        tui_run cmd_scale
+        ;;
+      7)
+        ask kv "Config: 'show', 'get KEY', or 'set KEY=VALUE'" "show"
+        case "${kv}" in
+          show)
+            CONFIG_ACTION="show"
+            ;;
+          get\ *)
+            CONFIG_ACTION="get"
+            CONFIG_KEY="${kv#get }"
+            ;;
+          set\ *=*)
+            CONFIG_ACTION="set"
+            kv="${kv#set }"
+            CONFIG_KEY="${kv%%=*}"
+            CONFIG_VALUE="${kv#*=}"
+            ;;
+          *)
+            warn "Unrecognized config action: '${kv}'"
+            tui_pause
+            continue
+            ;;
+        esac
+        tui_run cmd_config
+        ;;
+      8)
+        tui_run cmd_backup
+        ;;
+      9)
+        tui_run cmd_doctor
+        ;;
+      d|D)
+        tui_run cmd_down
+        ;;
+      u|U)
+        tui_run cmd_up
+        ;;
+      r|R)
+        tui_run cmd_releases
+        ;;
+      q|Q|"")
+        log "Bye."
+        exit 0
+        ;;
+      *)
+        warn "Unknown choice: '${choice}'"
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Arg parse + dispatch
+# ---------------------------------------------------------------------------
+
+COMMAND=""
+YES_MODE=0
+TAG_OPT=""
+SERVICE_OPT=""
+TAIL_OPT=100
+FOLLOW_OPT=0
+WORKERS_OPT=""
+FILE_OPT=""
+SYNC_OPT=0
+NO_ROLLBACK=0
+SKIP_HEALTH=0
+HEALTH_TIMEOUT="${HEALTH_DEADLINE_DEFAULT}"
+CONFIG_ACTION=""
+CONFIG_KEY=""
+CONFIG_VALUE=""
+
+is_command() {
+  case "$1" in
+    update|rollback|releases|status|health|logs|restart|up|down|scale|config|backup|restore|doctor|version|help) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+while [ "$#" -gt 0 ]; do
+  arg="$1"
+  # Normalize '--command' flag style to subcommand style (DX: both work).
+  case "${arg}" in
+    --*)
+      stripped="${arg#--}"
+      if is_command "${stripped}" && [ -z "${COMMAND}" ]; then
+        COMMAND="${stripped}"
+        shift
+        continue
+      fi
+      ;;
+  esac
+  case "${arg}" in
+    --yes)         YES_MODE=1 ;;
+    --tag)         shift; TAG_OPT="${1:-}";    [ -n "${TAG_OPT}" ]     || fail "--tag requires a value." ;;
+    --tail)        shift; TAIL_OPT="${1:-}";   [ -n "${TAIL_OPT}" ]    || fail "--tail requires a value." ;;
+    --follow|-f)   FOLLOW_OPT=1 ;;
+    --workers)     shift; WORKERS_OPT="${1:-}"; [ -n "${WORKERS_OPT}" ] || fail "--workers requires a value." ;;
+    --file)        shift; FILE_OPT="${1:-}";   [ -n "${FILE_OPT}" ]    || fail "--file requires a value." ;;
+    --timeout)     shift; HEALTH_TIMEOUT="${1:-}"; [ -n "${HEALTH_TIMEOUT}" ] || fail "--timeout requires a value." ;;
+    --sync)        SYNC_OPT=1 ;;
+    --no-rollback) NO_ROLLBACK=1 ;;
+    --no-health)   SKIP_HEALTH=1 ;;
+    --help|-h)     usage ;;
+    --*)           fail "Unknown option: ${arg}. Use --help for usage." ;;
+    *)
+      if [ -z "${COMMAND}" ] && is_command "${arg}"; then
+        COMMAND="${arg}"
+      elif [ "${COMMAND}" = "logs" ] || [ "${COMMAND}" = "restart" ]; then
+        SERVICE_OPT="${arg}"
+      elif [ "${COMMAND}" = "config" ] && [ -z "${CONFIG_ACTION}" ]; then
+        case "${arg}" in
+          show|get|set) CONFIG_ACTION="${arg}" ;;
+          *) fail "config expects: show | get KEY | set KEY=VALUE. Got: '${arg}'" ;;
+        esac
+      elif [ "${COMMAND}" = "config" ] && [ -n "${CONFIG_ACTION}" ] && [ -z "${CONFIG_KEY}" ]; then
+        case "${CONFIG_ACTION}" in
+          set)
+            case "${arg}" in
+              *=*)
+                CONFIG_KEY="${arg%%=*}"
+                CONFIG_VALUE="${arg#*=}"
+                ;;
+              *) fail "config set expects KEY=VALUE. Got: '${arg}'" ;;
+            esac
+            ;;
+          get) CONFIG_KEY="${arg}" ;;
+          *)   fail "Unexpected argument: '${arg}'" ;;
+        esac
+      else
+        fail "Unknown argument: '${arg}'. Use --help for usage."
+      fi
+      ;;
+  esac
+  shift
+done
+
+case "${HEALTH_TIMEOUT}" in
+  ''|*[!0-9]*) fail "--timeout must be a positive integer." ;;
+esac
+
+if [ -z "${COMMAND}" ]; then
+  # No command: open the TUI console (needs a tty).
+  if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    fail "No command given and no TTY available. Use 'bin/prisma --help' for headless usage."
+  fi
+  require_stack
+  tui_loop
+fi
+
+case "${COMMAND}" in
+  update)   cmd_update ;;
+  rollback) cmd_rollback ;;
+  releases) cmd_releases ;;
+  status)   cmd_status ;;
+  health)   cmd_health ;;
+  logs)     cmd_logs ;;
+  restart)  cmd_restart ;;
+  up)       cmd_up ;;
+  down)     cmd_down ;;
+  scale)    cmd_scale ;;
+  config)   cmd_config ;;
+  backup)   cmd_backup ;;
+  restore)  cmd_restore ;;
+  doctor)   cmd_doctor ;;
+  version)  cmd_version ;;
+  help)     usage ;;
+  *)        fail "Unknown command: ${COMMAND}" ;;
+esac

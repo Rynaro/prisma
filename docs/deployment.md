@@ -20,6 +20,8 @@ GitHub App creation is performed out-of-band: the operator visits GitHub's App r
 
 For the procedural detail of rotating the webhook secret or the provider API key, see `operational-runbooks.md` § Rotating webhook secret and § Rotating provider API key. The procedures are not duplicated here.
 
+After the first install, day-2 operations (image updates, rollback, scaling, logs, Redis backup, diagnostics) go through the [`bin/prisma` operations CLI](operations.md) — interactive console or headless via flags (`bin/prisma --update --tag vX.Y.Z --yes`).
+
 ## Networking
 
 Connections required for the App to function are marked **required**; connections used only for telemetry are marked **optional**. Direction is from the App perspective.

@@ -15,6 +15,10 @@ coverage/
 .vscode/
 evals/last-report.md
 
+# bin/prisma runtime state (per-deployment, never committed)
+deploy/.releases
+deploy/backups/
+
 # Per-developer tool state (not project assets)
 .claude/
 .eidolons/
