@@ -17,6 +17,9 @@ export type {
   ChecksListItemData,
   PullsCreateReviewCommentParams,
   PullsReviewCommentData,
+  IssuesCreateCommentParams,
+  IssueCommentData,
+  ReactionsCreateForIssueCommentParams,
 } from './client.js';
 
 export { createDefaultOctokit } from './client.js';

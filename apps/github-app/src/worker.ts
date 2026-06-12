@@ -2,9 +2,11 @@ import { ConfigParseError, REPO_LOCAL_CONFIG_PATH, loadRepoConfig } from '@prism
 import {
   type AppCredentials,
   InstallationAuth,
+  type IssueCommentsClient,
   type OctokitLike,
   type SecretSource,
   buildContentFetcher,
+  buildIssueCommentsClient,
   envSecretSource,
 } from '@prisma-bot/github';
 import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/provider-anthropic';
@@ -16,6 +18,7 @@ import {
   type Provider,
   ProviderErrorThrowable,
   type RepoConfig,
+  parseCommand,
 } from '@prisma-bot/shared';
 import IORedis from 'ioredis';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
@@ -267,6 +270,39 @@ const fetchRepoConfig = async (
   }
 };
 
+/**
+ * Build the text body for a `help` command reply.
+ */
+const buildHelpReply = (botLogin: string): string =>
+  `### ${botLogin} — commands\n\n| Command | Description |\n|---|---|\n| \`@${botLogin} review\` | Run an incremental review (skips already-posted findings) |\n| \`@${botLogin} full review\` | Run a fresh review (re-evaluates all findings) |\n| \`@${botLogin} help\` | Show this command reference |\n| \`@${botLogin} configuration\` | Show the effective repo configuration |\n\nYou can also click **Re-run** on the "AI Code Review" check to trigger an incremental round.`;
+
+/**
+ * Build the text body for a `configuration` command reply.
+ */
+const buildConfigReply = (config: RepoConfig): string => {
+  const lines: string[] = ['### Effective repo configuration\n', '```yaml'];
+  lines.push(`mode: ${config.mode}`);
+  if (config.model !== undefined) lines.push(`model: ${config.model}`);
+  if (config.nickname !== undefined) lines.push(`nickname: ${config.nickname}`);
+  lines.push(
+    'repo_heuristics:',
+    `  security: ${String(config.repo_heuristics.security)}`,
+    `  tests: ${String(config.repo_heuristics.tests)}`,
+    `  migrations: ${String(config.repo_heuristics.migrations)}`,
+    `  layering: ${String(config.repo_heuristics.layering)}`,
+  );
+  const { review_guidance } = config;
+  if (
+    review_guidance.instructions !== undefined ||
+    review_guidance.path_instructions.length > 0 ||
+    review_guidance.context_files.length > 0
+  ) {
+    lines.push('review_guidance: (configured)');
+  }
+  lines.push('```');
+  return lines.join('\n');
+};
+
 const start = async (): Promise<void> => {
   const secretSource = envSecretSource();
   const connection = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
@@ -277,7 +313,180 @@ const start = async (): Promise<void> => {
   const installationAuth = await buildInstallationAuth(secretSource);
   const repoLookup = buildRepoLookup(secretSource);
 
+  // Resolve the bot login once at startup. Used for loop prevention and
+  // nickname resolution. The GITHUB_APP_SLUG env var carries the bot's login
+  // (e.g. "mybot") and GitHub appends "[bot]" to it on comment authorship.
+  const botLogin = (await tryGetSecret(secretSource, 'GITHUB_APP_SLUG')) ?? 'prisma-review-bot';
+  const botCommentLogin = `${botLogin}[bot]`;
+
   const consumer = new BullMqJobConsumer({ connection });
+
+  /**
+   * Dispatch a comment job: ack with 👀, resolve nickname, dispatch command,
+   * ack with ✅ + reply on success. All ack effects fail-open.
+   */
+  const handleCommentJob = async (
+    payload: Extract<JobPayload, { event_type: 'issue_comment.command' }>,
+    octokit: OctokitLike,
+    issueComments: IssueCommentsClient,
+    identity: RepoIdentity,
+    config: RepoConfig,
+    configNotes: string[],
+  ): Promise<JobOutcome> => {
+    const { owner, repo } = identity;
+    const pr_number = payload.pull_request_number;
+    const comment_id = payload.comment_id;
+
+    // 1. Defensive loop prevention (worker-side): discard if comment author is a bot.
+    if (payload.commenter_login === botCommentLogin || payload.commenter_login.endsWith('[bot]')) {
+      log('command.loop_prevention', {
+        idempotency_key: payload.idempotency_key,
+        commenter_login: payload.commenter_login,
+      });
+      return { state: 'discarded_idempotent' };
+    }
+
+    // 2. Post 👀 reaction (fail-open).
+    try {
+      await issueComments.addReaction({ owner, repo, comment_id, content: 'eyes' });
+    } catch (err) {
+      log('command.ack.eyes_failed', {
+        idempotency_key: payload.idempotency_key,
+        message: err instanceof Error ? err.message : 'unknown',
+      });
+    }
+
+    // 3. Nickname resolution (D2): bot_login ∪ { config.nickname if set }.
+    const validTargets = new Set<string>([botLogin, botCommentLogin]);
+    if (config.nickname !== undefined) validTargets.add(config.nickname);
+    if (!validTargets.has(payload.mention_candidate)) {
+      log('command.dropped_nickname_mismatch', {
+        idempotency_key: payload.idempotency_key,
+        candidate: payload.mention_candidate,
+        bot_login: botLogin,
+        nickname: config.nickname,
+      });
+      return { state: 'discarded_idempotent' };
+    }
+
+    // 4. Parse command (authoritative; command_raw was set at ingress).
+    const cmd = parseCommand(payload.command_raw);
+
+    log('command.dispatching', {
+      idempotency_key: payload.idempotency_key,
+      command_kind: cmd.kind,
+    });
+
+    // 5. Dispatch.
+    try {
+      if (cmd.kind === 'help') {
+        const body = buildHelpReply(botLogin);
+        await issueComments.createReply({ owner, repo, issue_number: pr_number, body });
+      } else if (cmd.kind === 'configuration') {
+        const body = buildConfigReply(config);
+        await issueComments.createReply({ owner, repo, issue_number: pr_number, body });
+      } else {
+        // review or full_review: resolve head sha, then run the pipeline.
+        const roundIntent: 'incremental' | 'full' =
+          cmd.kind === 'full_review' ? 'full' : 'incremental';
+
+        // Fetch the live PR head sha (sentinel '' was set at ingress).
+        const prData = await octokit.rest.pulls.get({
+          owner,
+          repo,
+          pull_number: pr_number,
+        });
+        const resolvedHeadSha = prData.data.head.sha;
+
+        const contentFetcher = buildContentFetcher(octokit, owner, repo);
+        const result = await runPipeline(payload, {
+          installationAuth,
+          provider,
+          config,
+          repoLookup,
+          octokit,
+          contentFetcher,
+          configNotes,
+          roundIntent,
+          resolvedHeadSha,
+        });
+        if (result.state !== 'succeeded') {
+          // Post a friendly error reply.
+          try {
+            await issueComments.createReply({
+              owner,
+              repo,
+              issue_number: pr_number,
+              body: 'Sorry, I encountered an error while running the review. Please try again later.',
+            });
+          } catch {
+            // fail-open
+          }
+          return { state: 'failed_terminal', reason: result.reason ?? 'pipeline_failed' };
+        }
+
+        // 6. Post ✅ reaction + reply.
+        try {
+          await issueComments.addReaction({ owner, repo, comment_id, content: '+1' });
+        } catch (err) {
+          log('command.ack.plus1_failed', {
+            idempotency_key: payload.idempotency_key,
+            message: err instanceof Error ? err.message : 'unknown',
+          });
+        }
+        try {
+          await issueComments.createReply({
+            owner,
+            repo,
+            issue_number: pr_number,
+            body: 'Review complete! Check the **AI Code Review** check run for results.',
+          });
+        } catch (err) {
+          log('command.ack.reply_failed', {
+            idempotency_key: payload.idempotency_key,
+            message: err instanceof Error ? err.message : 'unknown',
+          });
+        }
+        if (result.publication === undefined) {
+          return { state: 'discarded_idempotent' };
+        }
+        return {
+          state: 'succeeded',
+          result: result.publication,
+        };
+      }
+
+      // For help/configuration: also post ✅ reaction.
+      try {
+        await issueComments.addReaction({ owner, repo, comment_id, content: '+1' });
+      } catch (err) {
+        log('command.ack.plus1_failed', {
+          idempotency_key: payload.idempotency_key,
+          message: err instanceof Error ? err.message : 'unknown',
+        });
+      }
+
+      return { state: 'discarded_idempotent' };
+    } catch (err) {
+      // Post friendly error reply (fail-open).
+      try {
+        await issueComments.createReply({
+          owner,
+          repo,
+          issue_number: pr_number,
+          body: 'Sorry, I encountered an error while processing your request. Please try again later.',
+        });
+      } catch {
+        // fail-open
+      }
+      if (err instanceof ProviderErrorThrowable) throw err;
+      log('command.dispatch_error', {
+        idempotency_key: payload.idempotency_key,
+        message: err instanceof Error ? err.message : 'unknown',
+      });
+      throw err;
+    }
+  };
 
   const handler = async (payload: JobPayload): Promise<JobOutcome> => {
     log('job.started', { idempotency_key: payload.idempotency_key });
@@ -296,7 +505,13 @@ const start = async (): Promise<void> => {
       // snapshot we don't yet know if it's a fork, so we use head_sha from
       // the payload (same-repo assumption). The orchestrator re-evaluates
       // this from the snapshot for context-file fetching (where fork matters).
-      const configRef = payload.head_sha;
+      // For comment/check_run jobs, head_sha may be absent until pulls.get
+      // is called (Track 6 worker dispatch). Fall back to 'HEAD' so the
+      // config loader uses the default branch ref.
+      const configRef =
+        'head_sha' in payload && typeof payload.head_sha === 'string' && payload.head_sha.length > 0
+          ? payload.head_sha
+          : 'HEAD';
 
       const { config, notes: configNotes } = await fetchRepoConfig(
         octokit,
@@ -314,10 +529,27 @@ const start = async (): Promise<void> => {
           config.review_guidance.instructions !== undefined ||
           config.review_guidance.path_instructions.length > 0 ||
           config.review_guidance.context_files.length > 0,
+        has_nickname: config.nickname !== undefined,
         config_notes: configNotes.length,
       });
 
+      // Route by event_type.
+      if (payload.event_type === 'issue_comment.command') {
+        const issueComments = buildIssueCommentsClient(octokit);
+        return await handleCommentJob(
+          payload,
+          octokit,
+          issueComments,
+          identity,
+          config,
+          configNotes,
+        );
+      }
+
+      // check_run.rerequested: incremental review (same as pull_request.* path).
+      // For pull_request.* and check_run.rerequested, use runPipeline directly.
       const contentFetcher = buildContentFetcher(octokit, identity.owner, identity.repo);
+      const roundIntent: 'incremental' | 'full' = 'incremental';
 
       const result = await runPipeline(payload, {
         installationAuth,
@@ -327,6 +559,7 @@ const start = async (): Promise<void> => {
         octokit,
         contentFetcher,
         configNotes,
+        roundIntent,
       });
       if (result.state === 'succeeded' && result.publication !== undefined) {
         return { state: 'succeeded', result: result.publication };

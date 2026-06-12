@@ -453,3 +453,281 @@ describe('POST /webhooks/github (Phase 5.2)', () => {
     expect(enqueueJob).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Dynamic bot interactions — Track 1 (T1)
+// ---------------------------------------------------------------------------
+
+interface IssueCommentBodyArgs {
+  installation_id?: number;
+  repository_id?: number;
+  repository_owner?: string;
+  repository_name?: string;
+  issue_number?: number;
+  comment_id?: number;
+  comment_body?: string;
+  comment_user_login?: string;
+  comment_user_type?: string;
+  sender_login?: string;
+  sender_type?: string;
+  action?: string;
+  is_pr_comment?: boolean;
+}
+
+const makeIssueCommentBody = (args: IssueCommentBodyArgs = {}): Record<string, unknown> => ({
+  action: args.action ?? 'created',
+  installation: { id: args.installation_id ?? 1234 },
+  repository: {
+    id: args.repository_id ?? 5678,
+    name: args.repository_name ?? 'hello-world',
+    owner: { login: args.repository_owner ?? 'octocat' },
+  },
+  issue: {
+    number: args.issue_number ?? 42,
+    pull_request:
+      args.is_pr_comment !== false ? { url: 'https://api.github.com/pulls/42' } : undefined,
+  },
+  comment: {
+    id: args.comment_id ?? 9999,
+    body: args.comment_body ?? '@test-bot review',
+    user: {
+      login: args.comment_user_login ?? 'alice',
+      type: args.comment_user_type ?? 'User',
+    },
+    author_association: 'COLLABORATOR',
+  },
+  sender: {
+    login: args.sender_login ?? 'alice',
+    type: args.sender_type ?? 'User',
+  },
+});
+
+interface CheckRunBodyArgs {
+  installation_id?: number;
+  repository_id?: number;
+  repository_owner?: string;
+  repository_name?: string;
+  check_run_id?: number;
+  head_sha?: string;
+  pull_request_number?: number;
+  action?: string;
+}
+
+const makeCheckRunBody = (args: CheckRunBodyArgs = {}): Record<string, unknown> => ({
+  action: args.action ?? 'rerequested',
+  installation: { id: args.installation_id ?? 1234 },
+  repository: {
+    id: args.repository_id ?? 5678,
+    name: args.repository_name ?? 'hello-world',
+    owner: { login: args.repository_owner ?? 'octocat' },
+  },
+  check_run: {
+    id: args.check_run_id ?? 7777,
+    head_sha: args.head_sha ?? 'c'.repeat(40),
+    pull_requests:
+      args.pull_request_number !== undefined
+        ? [{ number: args.pull_request_number }]
+        : [{ number: 42 }],
+  },
+});
+
+describe('POST /webhooks/github — issue_comment event (T1)', () => {
+  let app: ReturnType<typeof buildTestServer>;
+  let enqueueJob: ReturnType<typeof vi.fn>;
+  let replayCache: InMemoryReplayCache;
+
+  beforeEach(() => {
+    enqueueJob = vi.fn(async (payload: JobPayload) => ({
+      enqueued: true,
+      idempotency_key: payload.idempotency_key,
+    }));
+    replayCache = new InMemoryReplayCache({ windowSeconds: 60 });
+    app = buildTestServer({ enqueueJob: enqueueJob as unknown as EnqueueJob, replayCache });
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('accepts a valid issue_comment.created on a PR with a mention and enqueues', async () => {
+    const body = makeIssueCommentBody({ comment_body: '@test-bot review' });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'issue_comment',
+        'x-github-delivery': 'ic-delivery-1',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: true }));
+    expect(enqueueJob).toHaveBeenCalledTimes(1);
+    const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+    expect(payload.event_type).toBe('issue_comment.command');
+  });
+
+  it('ignores issue_comment.created on a non-PR issue (no pull_request field)', async () => {
+    const body = makeIssueCommentBody({ comment_body: '@bot review', is_pr_comment: false });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'issue_comment',
+        'x-github-delivery': 'ic-not-pr',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: false, ignored: true }));
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('drops a bot-authored issue_comment and does not enqueue (loop prevention)', async () => {
+    const body = makeIssueCommentBody({
+      comment_body: '@bot review',
+      comment_user_type: 'Bot',
+      comment_user_login: 'prisma-bot[bot]',
+      sender_type: 'Bot',
+    });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'issue_comment',
+        'x-github-delivery': 'ic-bot-author',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: false, ignored: true }));
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('ignores issue_comment with no @mention and does not enqueue', async () => {
+    const body = makeIssueCommentBody({ comment_body: 'LGTM, ship it!' });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'issue_comment',
+        'x-github-delivery': 'ic-no-mention',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: false, ignored: true }));
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('ignores issue_comment.edited (not accepted action)', async () => {
+    const body = makeIssueCommentBody({ action: 'edited', comment_body: '@bot review' });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'issue_comment',
+        'x-github-delivery': 'ic-edited',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: false, ignored: true }));
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /webhooks/github — check_run event (T1)', () => {
+  let app: ReturnType<typeof buildTestServer>;
+  let enqueueJob: ReturnType<typeof vi.fn>;
+  let replayCache: InMemoryReplayCache;
+
+  beforeEach(() => {
+    enqueueJob = vi.fn(async (payload: JobPayload) => ({
+      enqueued: true,
+      idempotency_key: payload.idempotency_key,
+    }));
+    replayCache = new InMemoryReplayCache({ windowSeconds: 60 });
+    app = buildTestServer({ enqueueJob: enqueueJob as unknown as EnqueueJob, replayCache });
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('accepts a valid check_run.rerequested and enqueues', async () => {
+    const body = makeCheckRunBody();
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'check_run',
+        'x-github-delivery': 'cr-delivery-1',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: true }));
+    expect(enqueueJob).toHaveBeenCalledTimes(1);
+    const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+    expect(payload.event_type).toBe('check_run.rerequested');
+  });
+
+  it('ignores check_run.completed (not accepted action)', async () => {
+    const body = makeCheckRunBody({ action: 'completed' });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'check_run',
+        'x-github-delivery': 'cr-completed',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: false, ignored: true }));
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('pull_request.opened still works correctly (regression guard)', async () => {
+    const body = makePullRequestBody();
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'pull_request',
+        'x-github-delivery': 'pr-regression-1',
+      },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual(expect.objectContaining({ accepted: true }));
+    expect(enqueueJob).toHaveBeenCalledTimes(1);
+    const payload = enqueueJob.mock.calls[0]?.[0] as JobPayload;
+    expect(payload.event_type).toBe('pull_request.opened');
+  });
+});

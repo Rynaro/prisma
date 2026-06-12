@@ -30,9 +30,10 @@ describe('.github/review-bot.yml.example', () => {
     const yamlContents = readExample();
     const cfg = loadRepoConfig({ yamlContents }) as Record<string, unknown>;
     const expectedKeys = Object.keys(RepoConfigSchema.shape);
-    // `model` is intentionally optional and commented-out in the example;
-    // the schema shape exposes it as optional, so its absence is allowed.
-    const requiredKeys = expectedKeys.filter((key) => key !== 'model');
+    // `model` and `nickname` are intentionally optional and commented-out in
+    // the example; the schema exposes them as optional without defaults, so
+    // their absence from a parsed config object is expected.
+    const requiredKeys = expectedKeys.filter((key) => key !== 'model' && key !== 'nickname');
     for (const key of requiredKeys) {
       expect(cfg, `expected top-level key '${key}' to be present`).toHaveProperty(key);
     }

@@ -1,4 +1,9 @@
-import { JobPayloadSchema, WebhookIngressRequestSchema } from '@prisma-bot/shared';
+import {
+  JobPayloadSchema,
+  WebhookIngressRequestSchema,
+  parseCommand,
+  parseMentionCandidate,
+} from '@prisma-bot/shared';
 import type { JobPayload } from '@prisma-bot/shared';
 import Fastify, { type FastifyBaseLogger } from 'fastify';
 import type { EnqueueJob } from './webhook/enqueue.js';
@@ -72,12 +77,22 @@ export interface BuildServerOptions {
    * Production wiring (main.ts) injects a real probe.
    */
   depsProbe?: DepsProbe;
+  /**
+   * Bot login (from GITHUB_APP_SLUG env). Used for loop-prevention: comments
+   * authored by the bot itself are dropped at ingress. Optional; when absent,
+   * only the `type === 'Bot'` check is applied.
+   */
+  botLogin?: string;
 }
 
 interface ParsedJsonBody {
   parsed: unknown;
   raw: Buffer;
 }
+
+// ---------------------------------------------------------------------------
+// Envelope guards — per-event structural validation
+// ---------------------------------------------------------------------------
 
 interface PullRequestEnvelope {
   installation: { id: number };
@@ -109,20 +124,101 @@ const isPullRequestEnvelope = (value: unknown): value is PullRequestEnvelope => 
   return true;
 };
 
-const eventTypeFor = (action: string): JobPayload['event_type'] => {
-  switch (action) {
-    case 'opened':
-      return 'pull_request.opened';
-    case 'synchronize':
-      return 'pull_request.synchronize';
-    case 'reopened':
-      return 'pull_request.reopened';
-    default:
-      // The route gates on isAcceptedEvent before reaching this function;
-      // any unexpected action here is a programming error, not a runtime
-      // input error.
-      throw new Error(`unexpected accepted action: ${action}`);
+interface IssueCommentEnvelope {
+  installation: { id: number };
+  repository: { id: number; name: string; owner: { login: string } };
+  issue: { number: number; pull_request?: unknown };
+  comment: { id: number; body: string; user: { login: string; type: string } };
+  sender: { login: string; type: string };
+  action?: string;
+}
+
+const isIssueCommentEnvelope = (value: unknown): value is IssueCommentEnvelope => {
+  if (typeof value !== 'object' || value === null) {
+    return false;
   }
+  const v = value as Record<string, unknown>;
+  const installation = v.installation as { id?: unknown } | undefined;
+  const repository = v.repository as
+    | { id?: unknown; name?: unknown; owner?: { login?: unknown } }
+    | undefined;
+  const issue = v.issue as { number?: unknown; pull_request?: unknown } | undefined;
+  const comment = v.comment as
+    | { id?: unknown; body?: unknown; user?: { login?: unknown; type?: unknown } }
+    | undefined;
+  const sender = v.sender as { login?: unknown; type?: unknown } | undefined;
+  if (!installation || typeof installation.id !== 'number') return false;
+  if (!repository || typeof repository.id !== 'number') return false;
+  if (typeof repository.name !== 'string') return false;
+  if (!repository.owner || typeof repository.owner.login !== 'string') return false;
+  if (!issue || typeof issue.number !== 'number') return false;
+  if (!comment || typeof comment.id !== 'number') return false;
+  if (typeof comment.body !== 'string') return false;
+  if (!comment.user || typeof comment.user.login !== 'string') return false;
+  if (typeof comment.user.type !== 'string') return false;
+  if (!sender || typeof sender.login !== 'string') return false;
+  if (typeof sender.type !== 'string') return false;
+  return true;
+};
+
+interface CheckRunEnvelope {
+  installation: { id: number };
+  repository: { id: number; name: string; owner: { login: string } };
+  check_run: {
+    id: number;
+    head_sha: string;
+    pull_requests: Array<{ number: number }>;
+  };
+  action?: string;
+}
+
+const isCheckRunEnvelope = (value: unknown): value is CheckRunEnvelope => {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  const installation = v.installation as { id?: unknown } | undefined;
+  const repository = v.repository as
+    | { id?: unknown; name?: unknown; owner?: { login?: unknown } }
+    | undefined;
+  const checkRun = v.check_run as
+    | { id?: unknown; head_sha?: unknown; pull_requests?: unknown }
+    | undefined;
+  if (!installation || typeof installation.id !== 'number') return false;
+  if (!repository || typeof repository.id !== 'number') return false;
+  if (typeof repository.name !== 'string') return false;
+  if (!repository.owner || typeof repository.owner.login !== 'string') return false;
+  if (!checkRun || typeof checkRun.id !== 'number') return false;
+  if (typeof checkRun.head_sha !== 'string') return false;
+  if (!Array.isArray(checkRun.pull_requests)) return false;
+  return true;
+};
+
+// ---------------------------------------------------------------------------
+// eventTypeFor — maps event/action to JobPayload['event_type']
+// ---------------------------------------------------------------------------
+
+const eventTypeFor = (eventName: string, action: string): JobPayload['event_type'] => {
+  if (eventName === 'pull_request') {
+    switch (action) {
+      case 'opened':
+        return 'pull_request.opened';
+      case 'synchronize':
+        return 'pull_request.synchronize';
+      case 'reopened':
+        return 'pull_request.reopened';
+    }
+  }
+  if (eventName === 'issue_comment' && action === 'created') {
+    return 'issue_comment.command';
+  }
+  if (eventName === 'check_run' && action === 'rerequested') {
+    return 'check_run.rerequested';
+  }
+  // The route gates on isAcceptedEvent before reaching this function;
+  // any unexpected combination here is a programming error, not a runtime
+  // input error.
+  throw new Error(`unexpected accepted event/action: ${eventName}/${action}`);
 };
 
 /**
@@ -360,23 +456,6 @@ export const buildServer = (opts: BuildServerOptions) => {
       return reply.code(202).send({ accepted: false, ignored: true });
     }
 
-    if (!isPullRequestEnvelope(parsedBody)) {
-      emitAudit(log, 'warn', 'webhook.invalid_request', {
-        payload: {
-          delivery_id: deliveryId ?? null,
-          reason: 'envelope_missing_fields',
-        },
-      });
-      return reply.code(400).send({ ok: false, reason: 'invalid_request' });
-    }
-
-    const installationId = parsedBody.installation.id;
-    const repositoryId = parsedBody.repository.id;
-    const repositoryOwner = parsedBody.repository.owner.login;
-    const repositoryName = parsedBody.repository.name;
-    const pullRequestNumber = parsedBody.pull_request.number;
-    const headSha = parsedBody.pull_request.head.sha;
-
     // delivery_id is required for replay-protection and idempotency-key
     // derivation. The Zod schema enforces presence above, so this branch
     // is defensive against future schema relaxation.
@@ -387,111 +466,457 @@ export const buildServer = (opts: BuildServerOptions) => {
       return reply.code(400).send({ ok: false, reason: 'invalid_request' });
     }
 
-    const idempotencyKey = deriveIdempotencyKey({
-      installation_id: installationId,
-      repository_id: repositoryId,
-      pull_request_number: pullRequestNumber,
-      head_sha: headSha,
-      delivery_id: deliveryId,
-    });
+    // Per-event envelope guard + payload construction.
+    // The guard validates the structural requirements for each event type;
+    // per-event JobPayload fields are built inside each branch.
+    let jobPayload: JobPayload;
 
-    const isReplay = await opts.replayCache.isReplay(installationId, deliveryId);
-    if (isReplay) {
-      emitAudit(log, 'info', 'webhook.discarded_idempotent', {
+    if (eventName === 'pull_request') {
+      if (!isPullRequestEnvelope(parsedBody)) {
+        emitAudit(log, 'warn', 'webhook.invalid_request', {
+          payload: {
+            delivery_id: deliveryId ?? null,
+            reason: 'envelope_missing_fields',
+          },
+        });
+        return reply.code(400).send({ ok: false, reason: 'invalid_request' });
+      }
+
+      const installationId = parsedBody.installation.id;
+      const repositoryId = parsedBody.repository.id;
+      const repositoryOwner = parsedBody.repository.owner.login;
+      const repositoryName = parsedBody.repository.name;
+      const pullRequestNumber = parsedBody.pull_request.number;
+      const headSha = parsedBody.pull_request.head.sha;
+
+      const idempotencyKey = deriveIdempotencyKey({
         installation_id: installationId,
         repository_id: repositoryId,
         pull_request_number: pullRequestNumber,
-        idempotency_key: idempotencyKey,
-        payload: {
-          delivery_id: deliveryId,
-          event_type: eventName ?? null,
-        },
-      });
-      return reply.code(202).send({
-        accepted: true,
-        idempotency_key: idempotencyKey,
-        status: 'discarded_idempotent',
-      });
-    }
-
-    // Build the JobPayload per docs/api-contracts.md § Async job contract;
-    // include `traceparent` if the header is present (Phase 3 additive
-    // extension — system-design.md § Cross-cutting concerns).
-    // `owner` and `repo` are sourced directly from the webhook payload so the
-    // worker can resolve repo identity without an extra GitHub API call.
-    const jobPayload: JobPayload = {
-      idempotency_key: idempotencyKey,
-      installation_id: installationId,
-      repository_id: repositoryId,
-      pull_request_number: pullRequestNumber,
-      head_sha: headSha,
-      event_type: eventTypeFor(action ?? ''),
-      received_at: new Date().toISOString(),
-      owner: repositoryOwner,
-      repo: repositoryName,
-      ...(traceparent !== undefined ? { traceparent } : {}),
-    };
-
-    // Validate the payload against the canonical schema; this is a
-    // last-mile guard so we never enqueue a payload that violates the
-    // Phase 5.1 schema invariants.
-    const payloadParse = JobPayloadSchema.safeParse(jobPayload);
-    if (!payloadParse.success) {
-      emitAudit(log, 'error', 'webhook.invalid_request', {
-        installation_id: installationId,
-        repository_id: repositoryId,
-        pull_request_number: pullRequestNumber,
-        idempotency_key: idempotencyKey,
-        payload: {
-          delivery_id: deliveryId,
-          issues: payloadParse.error.issues.map((issue) => ({
-            path: issue.path,
-            code: issue.code,
-            message: issue.message,
-          })),
-        },
-      });
-      return reply.code(400).send({ ok: false, reason: 'invalid_request' });
-    }
-
-    emitAudit(log, 'info', 'webhook.received', {
-      installation_id: installationId,
-      repository_id: repositoryId,
-      pull_request_number: pullRequestNumber,
-      idempotency_key: idempotencyKey,
-      payload: {
+        head_sha: headSha,
         delivery_id: deliveryId,
-        event_type: eventName,
+      });
+
+      const isReplay = await opts.replayCache.isReplay(installationId, deliveryId);
+      if (isReplay) {
+        emitAudit(log, 'info', 'webhook.discarded_idempotent', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: pullRequestNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            event_type: eventName ?? null,
+          },
+        });
+        return reply.code(202).send({
+          accepted: true,
+          idempotency_key: idempotencyKey,
+          status: 'discarded_idempotent',
+        });
+      }
+
+      const prEventType =
+        action === 'opened'
+          ? ('pull_request.opened' as const)
+          : action === 'synchronize'
+            ? ('pull_request.synchronize' as const)
+            : ('pull_request.reopened' as const);
+
+      jobPayload = {
+        idempotency_key: idempotencyKey,
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: pullRequestNumber,
+        head_sha: headSha,
+        event_type: prEventType,
+        received_at: new Date().toISOString(),
+        owner: repositoryOwner,
+        repo: repositoryName,
+        ...(traceparent !== undefined ? { traceparent } : {}),
+      };
+
+      const payloadParse = JobPayloadSchema.safeParse(jobPayload);
+      if (!payloadParse.success) {
+        emitAudit(log, 'error', 'webhook.invalid_request', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: pullRequestNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            issues: payloadParse.error.issues.map((issue) => ({
+              path: issue.path,
+              code: issue.code,
+              message: issue.message,
+            })),
+          },
+        });
+        return reply.code(400).send({ ok: false, reason: 'invalid_request' });
+      }
+
+      emitAudit(log, 'info', 'webhook.received', {
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: pullRequestNumber,
+        idempotency_key: idempotencyKey,
+        payload: {
+          delivery_id: deliveryId,
+          event_type: eventName,
+        },
+      });
+
+      try {
+        await opts.enqueueJob(payloadParse.data);
+      } catch (err) {
+        emitAudit(log, 'error', 'webhook.enqueue_failed', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: pullRequestNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            message: err instanceof Error ? err.message : 'unknown',
+          },
+        });
+        return reply.code(500).send({ accepted: false });
+      }
+
+      emitAudit(log, 'info', 'job.enqueued', {
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: pullRequestNumber,
+        idempotency_key: idempotencyKey,
+        payload: { head_sha: headSha },
+      });
+
+      await opts.replayCache.remember(installationId, deliveryId);
+
+      return reply.code(202).send({ accepted: true, idempotency_key: idempotencyKey });
+    }
+
+    if (eventName === 'issue_comment') {
+      if (!isIssueCommentEnvelope(parsedBody)) {
+        emitAudit(log, 'warn', 'webhook.invalid_request', {
+          payload: {
+            delivery_id: deliveryId ?? null,
+            reason: 'envelope_missing_fields',
+          },
+        });
+        return reply.code(400).send({ ok: false, reason: 'invalid_request' });
+      }
+
+      // Loop prevention: drop bot-authored comments at ingress (cheapest point).
+      const commentAuthorType = parsedBody.comment.user.type;
+      const commentAuthorLogin = parsedBody.comment.user.login;
+      const senderType = parsedBody.sender.type;
+      const botLogin = opts.botLogin;
+      const isBotAuthor =
+        commentAuthorType === 'Bot' ||
+        senderType === 'Bot' ||
+        (botLogin !== undefined && commentAuthorLogin === `${botLogin}[bot]`);
+      if (isBotAuthor) {
+        emitAudit(log, 'info', 'webhook.event_ignored', {
+          payload: {
+            delivery_id: deliveryId ?? null,
+            event_type: eventName ?? null,
+            action: action ?? null,
+            reason: 'bot_author',
+          },
+        });
+        return reply.code(202).send({ accepted: false, ignored: true });
+      }
+
+      // Only process comments on PRs (issue_comment fires on both issues and PRs).
+      // The presence of `issue.pull_request` signals a PR comment.
+      const isPrComment =
+        parsedBody.issue.pull_request !== undefined && parsedBody.issue.pull_request !== null;
+      if (!isPrComment) {
+        emitAudit(log, 'info', 'webhook.event_ignored', {
+          payload: {
+            delivery_id: deliveryId ?? null,
+            event_type: eventName ?? null,
+            action: action ?? null,
+            reason: 'not_pr_comment',
+          },
+        });
+        return reply.code(202).send({ accepted: false, ignored: true });
+      }
+
+      // Cheap mention candidate pre-filter (no config I/O).
+      const commentBody = parsedBody.comment.body;
+      const mentionResult = parseMentionCandidate(commentBody);
+      if (mentionResult === null) {
+        emitAudit(log, 'info', 'webhook.event_ignored', {
+          payload: {
+            delivery_id: deliveryId ?? null,
+            event_type: eventName ?? null,
+            action: action ?? null,
+            reason: 'no_mention_candidate',
+          },
+        });
+        return reply.code(202).send({ accepted: false, ignored: true });
+      }
+
+      const parsedCommand = parseCommand(mentionResult.rest);
+
+      const installationId = parsedBody.installation.id;
+      const repositoryId = parsedBody.repository.id;
+      const repositoryOwner = parsedBody.repository.owner.login;
+      const repositoryName = parsedBody.repository.name;
+      const issueNumber = parsedBody.issue.number;
+      const commentId = parsedBody.comment.id;
+
+      // For comment jobs, head_sha is not available at ingress (issue_comment
+      // payloads carry `issue`, not `pull_request.head.sha`). We use comment_id
+      // as the primary discriminator and set head_sha = '' sentinel.
+      const idempotencyKey = deriveIdempotencyKey({
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: issueNumber,
+        head_sha: '',
+        delivery_id: deliveryId,
+        comment_id: commentId,
+      });
+
+      const isReplay = await opts.replayCache.isReplay(installationId, deliveryId);
+      if (isReplay) {
+        emitAudit(log, 'info', 'webhook.discarded_idempotent', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: issueNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            event_type: eventName ?? null,
+          },
+        });
+        return reply.code(202).send({
+          accepted: true,
+          idempotency_key: idempotencyKey,
+          status: 'discarded_idempotent',
+        });
+      }
+
+      // Build the author_association from the payload if present.
+      const authorAssociation =
+        typeof (parsedBody as unknown as { comment?: { author_association?: unknown } })?.comment
+          ?.author_association === 'string'
+          ? ((parsedBody as unknown as { comment: { author_association: string } }).comment
+              .author_association as string)
+          : 'NONE';
+
+      const commentJobPayload = {
+        idempotency_key: idempotencyKey,
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: issueNumber,
+        head_sha: '',
+        event_type: 'issue_comment.command' as const,
+        received_at: new Date().toISOString(),
+        owner: repositoryOwner,
+        repo: repositoryName,
+        comment_id: commentId,
+        commenter_login: commentAuthorLogin,
+        commenter_association: authorAssociation,
+        mention_candidate: mentionResult.candidate,
+        command_raw: mentionResult.rest,
+        ...(traceparent !== undefined ? { traceparent } : {}),
+      };
+
+      const payloadParse = JobPayloadSchema.safeParse(commentJobPayload);
+      if (!payloadParse.success) {
+        emitAudit(log, 'error', 'webhook.invalid_request', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: issueNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            issues: payloadParse.error.issues.map((issue) => ({
+              path: issue.path,
+              code: issue.code,
+              message: issue.message,
+            })),
+          },
+        });
+        return reply.code(400).send({ ok: false, reason: 'invalid_request' });
+      }
+
+      emitAudit(log, 'info', 'webhook.received', {
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: issueNumber,
+        idempotency_key: idempotencyKey,
+        payload: {
+          delivery_id: deliveryId,
+          event_type: eventName,
+          comment_id: commentId,
+        },
+      });
+
+      try {
+        await opts.enqueueJob(payloadParse.data);
+      } catch (err) {
+        emitAudit(log, 'error', 'webhook.enqueue_failed', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: issueNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            message: err instanceof Error ? err.message : 'unknown',
+          },
+        });
+        return reply.code(500).send({ accepted: false });
+      }
+
+      emitAudit(log, 'info', 'job.enqueued', {
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: issueNumber,
+        idempotency_key: idempotencyKey,
+        payload: { comment_id: commentId },
+      });
+
+      await opts.replayCache.remember(installationId, deliveryId);
+
+      return reply.code(202).send({ accepted: true, idempotency_key: idempotencyKey });
+    }
+
+    if (eventName === 'check_run') {
+      if (!isCheckRunEnvelope(parsedBody)) {
+        emitAudit(log, 'warn', 'webhook.invalid_request', {
+          payload: {
+            delivery_id: deliveryId ?? null,
+            reason: 'envelope_missing_fields',
+          },
+        });
+        return reply.code(400).send({ ok: false, reason: 'invalid_request' });
+      }
+
+      const installationId = parsedBody.installation.id;
+      const repositoryId = parsedBody.repository.id;
+      const repositoryOwner = parsedBody.repository.owner.login;
+      const repositoryName = parsedBody.repository.name;
+      const checkRunId = parsedBody.check_run.id;
+      const headSha = parsedBody.check_run.head_sha;
+
+      // The check_run.pull_requests array may be empty (e.g. for draft PRs
+      // or cross-repo runs). We use the first element if present, else 0.
+      const pullRequestNumber = parsedBody.check_run.pull_requests[0]?.number ?? 0;
+
+      const idempotencyKey = deriveIdempotencyKey({
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: pullRequestNumber,
+        head_sha: headSha,
+        delivery_id: deliveryId,
+        check_run_id: checkRunId,
+      });
+
+      const isReplay = await opts.replayCache.isReplay(installationId, deliveryId);
+      if (isReplay) {
+        emitAudit(log, 'info', 'webhook.discarded_idempotent', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: pullRequestNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            event_type: eventName ?? null,
+          },
+        });
+        return reply.code(202).send({
+          accepted: true,
+          idempotency_key: idempotencyKey,
+          status: 'discarded_idempotent',
+        });
+      }
+
+      const checkRunJobPayload = {
+        idempotency_key: idempotencyKey,
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: pullRequestNumber,
+        head_sha: headSha,
+        event_type: 'check_run.rerequested' as const,
+        received_at: new Date().toISOString(),
+        owner: repositoryOwner,
+        repo: repositoryName,
+        check_run_id: checkRunId,
+        ...(traceparent !== undefined ? { traceparent } : {}),
+      };
+
+      const payloadParse = JobPayloadSchema.safeParse(checkRunJobPayload);
+      if (!payloadParse.success) {
+        emitAudit(log, 'error', 'webhook.invalid_request', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: pullRequestNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            issues: payloadParse.error.issues.map((issue) => ({
+              path: issue.path,
+              code: issue.code,
+              message: issue.message,
+            })),
+          },
+        });
+        return reply.code(400).send({ ok: false, reason: 'invalid_request' });
+      }
+
+      emitAudit(log, 'info', 'webhook.received', {
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: pullRequestNumber,
+        idempotency_key: idempotencyKey,
+        payload: {
+          delivery_id: deliveryId,
+          event_type: eventName,
+          check_run_id: checkRunId,
+        },
+      });
+
+      try {
+        await opts.enqueueJob(payloadParse.data);
+      } catch (err) {
+        emitAudit(log, 'error', 'webhook.enqueue_failed', {
+          installation_id: installationId,
+          repository_id: repositoryId,
+          pull_request_number: pullRequestNumber,
+          idempotency_key: idempotencyKey,
+          payload: {
+            delivery_id: deliveryId,
+            message: err instanceof Error ? err.message : 'unknown',
+          },
+        });
+        return reply.code(500).send({ accepted: false });
+      }
+
+      emitAudit(log, 'info', 'job.enqueued', {
+        installation_id: installationId,
+        repository_id: repositoryId,
+        pull_request_number: pullRequestNumber,
+        idempotency_key: idempotencyKey,
+        payload: { head_sha: headSha, check_run_id: checkRunId },
+      });
+
+      await opts.replayCache.remember(installationId, deliveryId);
+
+      return reply.code(202).send({ accepted: true, idempotency_key: idempotencyKey });
+    }
+
+    // Fallthrough: should never happen since isAcceptedEvent guards above.
+    emitAudit(log, 'error', 'webhook.invalid_request', {
+      payload: {
+        delivery_id: deliveryId ?? null,
+        reason: 'unhandled_event',
+        event_type: eventName ?? null,
       },
     });
-
-    try {
-      await opts.enqueueJob(payloadParse.data);
-    } catch (err) {
-      emitAudit(log, 'error', 'webhook.enqueue_failed', {
-        installation_id: installationId,
-        repository_id: repositoryId,
-        pull_request_number: pullRequestNumber,
-        idempotency_key: idempotencyKey,
-        payload: {
-          delivery_id: deliveryId,
-          message: err instanceof Error ? err.message : 'unknown',
-        },
-      });
-      return reply.code(500).send({ accepted: false });
-    }
-
-    emitAudit(log, 'info', 'job.enqueued', {
-      installation_id: installationId,
-      repository_id: repositoryId,
-      pull_request_number: pullRequestNumber,
-      idempotency_key: idempotencyKey,
-      payload: { head_sha: headSha },
-    });
-
-    await opts.replayCache.remember(installationId, deliveryId);
-
-    return reply.code(202).send({ accepted: true, idempotency_key: idempotencyKey });
+    return reply.code(400).send({ ok: false, reason: 'invalid_request' });
   });
 
   // Fastify's body-limit guard fires before the content-type parser; map the

@@ -1,7 +1,12 @@
 import { type NormalizedFinding, type RepoConfig, RepoConfigSchema } from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
 import type { CheckRunsClient } from '../../src/check-runs/index.js';
-import { type PublishContext, type PublisherDeps, publish } from '../../src/publisher/index.js';
+import {
+  type PublishContext,
+  type PublisherDeps,
+  harvestPriorRound,
+  publish,
+} from '../../src/publisher/index.js';
 import type { ReviewCommentsClient } from '../../src/review-comments/index.js';
 
 interface FakeChecks extends CheckRunsClient {
@@ -13,6 +18,9 @@ interface FakeChecks extends CheckRunsClient {
     summary: string;
   }>;
   setFinalizeError: (err: unknown) => void;
+  setListOursResults: (
+    items: Array<{ id: number; conclusion: string | null; output_summary: string | null }>,
+  ) => void;
 }
 
 interface FakeComments extends ReviewCommentsClient {
@@ -27,6 +35,11 @@ const buildFakes = (): { checks: FakeChecks; comments: FakeComments } => {
   let nextCheckRunId = 1;
   let finalizeError: unknown;
   let listResults: Array<{ id: number; path: string; line: number | null; body: string }> = [];
+  let listOursResults: Array<{
+    id: number;
+    conclusion: string | null;
+    output_summary: string | null;
+  }> = [];
   let postError: unknown;
 
   const checks: Partial<FakeChecks> = {};
@@ -34,6 +47,9 @@ const buildFakes = (): { checks: FakeChecks; comments: FakeComments } => {
   checks.finalizeCalls = [];
   checks.setFinalizeError = (err) => {
     finalizeError = err;
+  };
+  checks.setListOursResults = (items) => {
+    listOursResults = items;
   };
   checks.startInProgress = async (args) => {
     checks.startCalls?.push({
@@ -57,7 +73,7 @@ const buildFakes = (): { checks: FakeChecks; comments: FakeComments } => {
       summary: args.summary,
     });
   };
-  checks.listOurs = async () => [];
+  checks.listOurs = async () => listOursResults;
 
   const comments: Partial<FakeComments> = {};
   comments.postCalls = [];
@@ -200,7 +216,7 @@ describe('publish', () => {
     expect(result.rejections.some((r) => r.reason_code === 'github.api_error')).toBe(true);
   });
 
-  it('summary truncation: a 1000-finding plan produces a summary ≤ 60 KB', async () => {
+  it('summary truncation: a 1000-finding plan produces a summary ≤ 60 KB + round header overhead', async () => {
     const { checks, comments } = buildFakes();
     const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
     const ranked: NormalizedFinding[] = [];
@@ -217,6 +233,108 @@ describe('publish', () => {
       );
     }
     const result = await publish(ranked, cfg('summary-plus-inline'), ctx, deps);
-    expect(Buffer.byteLength(result.summary_artifact, 'utf8')).toBeLessThanOrEqual(60 * 1024);
+    // The summary_artifact includes the planner summary (≤ 60 KiB) plus a
+    // round-summary header line and round marker (~200 bytes overhead).
+    const MAX_SUMMARY_WITH_ROUND = 60 * 1024 + 512;
+    expect(Buffer.byteLength(result.summary_artifact, 'utf8')).toBeLessThanOrEqual(
+      MAX_SUMMARY_WITH_ROUND,
+    );
+  });
+
+  // --- T5: round model tests ---
+
+  it('round 1 when no prior check-run markers', async () => {
+    const { checks, comments } = buildFakes();
+    // listOurs returns empty (no prior markers)
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
+    const ranked = [finding({ id: 'A', dedupe_key: 'dk-a' })];
+    const result = await publish(ranked, cfg('summary-plus-inline'), ctx, deps);
+    expect(result.summary_artifact).toMatch(/Round 1/);
+    // Round marker should be emitted
+    expect(result.summary_artifact).toMatch(/<!--\s*prisma-bot:round=1\s+head=/);
+  });
+
+  it('round N+1 when prior check-run summary has round=N marker', async () => {
+    const { checks, comments } = buildFakes();
+    checks.setListOursResults([
+      {
+        id: 42,
+        conclusion: 'success',
+        output_summary: '<!-- prisma-bot:round=3 head=abcd1234 -->',
+      },
+    ]);
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
+    const ranked = [finding({ id: 'B', dedupe_key: 'dk-b' })];
+    const result = await publish(ranked, cfg('summary-plus-inline'), ctx, deps);
+    expect(result.summary_artifact).toMatch(/Round 4/);
+    expect(result.summary_artifact).toMatch(/<!--\s*prisma-bot:round=4\s+head=/);
+  });
+
+  it('full round: labels summary "(full)" and ignores prior dedupe keys', async () => {
+    const { checks, comments } = buildFakes();
+    // Set a prior inline comment with a dedupe key (would normally suppress the finding)
+    comments.setListResults([
+      {
+        id: 9001,
+        path: 'src/a.ts',
+        line: 10,
+        body: 'prior body\n<!-- prisma-bot:dedupe=dk-prior -->',
+      },
+    ]);
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
+    const ranked = [finding({ id: 'C', dedupe_key: 'dk-prior' })];
+    // With roundIntent='full', the prior dedupe key is ignored → finding is posted inline
+    const result = await publish(ranked, cfg('summary-plus-inline'), ctx, deps, 'full');
+    expect(result.summary_artifact).toMatch(/Round 1 \(full\)/);
+    // The finding should be posted inline (prior dedupe key ignored in 'full' mode)
+    expect(comments.postCalls).toHaveLength(1);
+  });
+
+  it('round summary: set arithmetic for incremental round', async () => {
+    const { checks, comments } = buildFakes();
+    // Two prior dedupe keys exist on the PR
+    comments.setListResults([
+      { id: 1, path: 'src/a.ts', line: 1, body: '<!-- prisma-bot:dedupe=key-a -->' },
+      { id: 2, path: 'src/b.ts', line: 2, body: '<!-- prisma-bot:dedupe=key-b -->' },
+    ]);
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
+    // Current round produces key-b (still open) and key-c (new); key-a is addressed
+    const ranked = [
+      finding({ id: 'B', dedupe_key: 'key-b', path: 'src/b.ts' }),
+      finding({ id: 'C', dedupe_key: 'key-c', path: 'src/c.ts' }),
+    ];
+    const result = await publish(ranked, cfg('summary-plus-inline'), ctx, deps, 'incremental');
+    // key-a: addressed (prior, not in current)
+    // key-b: still open (prior AND current)
+    // key-c: new (current, not in prior)
+    expect(result.summary_artifact).toMatch(/1 addressed/);
+    expect(result.summary_artifact).toMatch(/1 still open/);
+    expect(result.summary_artifact).toMatch(/1 new/);
+  });
+
+  it('harvestPriorRound returns 0 when listOurs throws (fail-open)', async () => {
+    const { comments } = buildFakes();
+    const failingCheckRuns: CheckRunsClient = {
+      startInProgress: async () => ({ check_run_id: 1 }),
+      finalize: async () => {},
+      listOurs: async () => {
+        throw new Error('github down');
+      },
+    };
+    const deps: PublisherDeps = { checkRuns: failingCheckRuns, reviewComments: comments };
+    const round = await harvestPriorRound(deps, ctx);
+    expect(round).toBe(0);
+  });
+
+  it('harvestPriorRound returns the max round across multiple check runs', async () => {
+    const { checks, comments } = buildFakes();
+    checks.setListOursResults([
+      { id: 1, conclusion: 'success', output_summary: '<!-- prisma-bot:round=2 head=abcd1234 -->' },
+      { id: 2, conclusion: 'success', output_summary: '<!-- prisma-bot:round=5 head=cafe5678 -->' },
+      { id: 3, conclusion: 'success', output_summary: 'no marker here' },
+    ]);
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
+    const round = await harvestPriorRound(deps, ctx);
+    expect(round).toBe(5);
   });
 });

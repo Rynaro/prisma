@@ -25,6 +25,8 @@ const buildStubOctokit = (
       },
       checks: {} as OctokitLike['rest']['checks'],
       pulls_reviews: {} as OctokitLike['rest']['pulls_reviews'],
+      issues: {} as OctokitLike['rest']['issues'],
+      reactions: {} as OctokitLike['rest']['reactions'],
     },
   };
 };

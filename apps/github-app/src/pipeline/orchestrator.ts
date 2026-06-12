@@ -124,6 +124,7 @@ export interface OrchestratorHooks {
     cfg: RepoConfig,
     ctx: PublishContext,
     deps: PublisherDeps,
+    roundIntent?: 'incremental' | 'full',
   ) => Promise<PublicationResult>;
 }
 
@@ -156,6 +157,18 @@ export interface OrchestratorDeps {
    * include them in the summary. Optional.
    */
   configNotes?: string[];
+  /**
+   * Round intent: 'incremental' (default) or 'full'. When 'full', the publisher
+   * ignores prior dedupe keys and reviews fresh. Threaded from the job payload
+   * (Track 5).
+   */
+  roundIntent?: 'incremental' | 'full';
+  /**
+   * Resolved head SHA to use for the publish context. Required when the job
+   * payload carries an empty head_sha sentinel (comment jobs). The worker
+   * resolves this via pulls.get before calling runPipeline.
+   */
+  resolvedHeadSha?: string;
 }
 
 export interface OrchestratorResult {
@@ -222,13 +235,19 @@ const buildProviderInput = (
   return input;
 };
 
-const buildPublishContext = (payload: JobPayload, identity: RepoIdentity): PublishContext => ({
+const buildPublishContext = (
+  payload: JobPayload,
+  identity: RepoIdentity,
+  resolvedHeadSha?: string,
+): PublishContext => ({
   owner: identity.owner,
   repo: identity.repo,
   installation_id: payload.installation_id,
   repository_id: payload.repository_id,
   pull_request_number: payload.pull_request_number,
-  head_sha: payload.head_sha,
+  head_sha:
+    resolvedHeadSha ??
+    ('head_sha' in payload && typeof payload.head_sha === 'string' ? payload.head_sha : ''),
   app_id: identity.app_id,
   app_login: identity.app_login,
   run_id: payload.idempotency_key,
@@ -248,10 +267,11 @@ interface FailureSummaryArgs {
   reason: 'review_unavailable' | 'oversized' | 'no_findings' | 'malformed_provider_output';
   reasonMessage: string;
   rejections: RejectionLogEntry[];
+  resolvedHeadSha?: string | undefined;
 }
 
 const publishSummaryOnly = async (args: FailureSummaryArgs): Promise<PublicationResult> => {
-  const ctx = buildPublishContext(args.payload, args.identity);
+  const ctx = buildPublishContext(args.payload, args.identity, args.resolvedHeadSha);
   const deps = publisherDepsFor(args.octokit);
   const publishFn = args.hooks.runPublish ?? defaultPublish;
   // Force a summary-only publication regardless of the configured mode by
@@ -327,6 +347,7 @@ export const runPipeline = async (
       reason: 'oversized',
       reasonMessage: `prefilter oversized: ${prefilter.reason}`,
       rejections: [],
+      resolvedHeadSha: deps.resolvedHeadSha,
     });
     logger.emit('publisher.published', {
       ...trace,
@@ -358,6 +379,7 @@ export const runPipeline = async (
       reason: 'no_findings',
       reasonMessage: 'no analyzable files in PR after prefilter',
       rejections: [],
+      resolvedHeadSha: deps.resolvedHeadSha,
     });
     logger.emit('publisher.published', {
       ...trace,
@@ -452,6 +474,7 @@ export const runPipeline = async (
           reason: 'malformed_provider_output',
           reasonMessage: 'review unavailable: provider returned malformed output',
           rejections: [rejection],
+          resolvedHeadSha: deps.resolvedHeadSha,
         });
         logger.emit('publisher.published', {
           ...trace,
@@ -484,6 +507,7 @@ export const runPipeline = async (
                 ? 'review unavailable: provider authentication failure'
                 : 'review unavailable: provider capability missing',
             rejections: [],
+            resolvedHeadSha: deps.resolvedHeadSha,
           });
           logger.emit('publisher.published', {
             ...trace,
@@ -534,9 +558,15 @@ export const runPipeline = async (
 
   // Stage: publisher.
   const publishFn = hooks.runPublish ?? defaultPublish;
-  const ctx = buildPublishContext(payload, identity);
+  const ctx = buildPublishContext(payload, identity, deps.resolvedHeadSha);
   const publisherDeps = publisherDepsFor(octokit);
-  const publication = await publishFn(ranked, deps.config, ctx, publisherDeps);
+  const publication = await publishFn(
+    ranked,
+    deps.config,
+    ctx,
+    publisherDeps,
+    deps.roundIntent ?? 'incremental',
+  );
 
   if (publication.dropped.length > 0) {
     logger.emit('publisher.dropped', { ...trace, count: publication.dropped.length });
