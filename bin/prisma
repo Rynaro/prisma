@@ -574,6 +574,13 @@ cmd_restore() {
   fi
 }
 
+# file_perms PATH — print octal permission bits ('' on failure).
+# GNU stat -f means --file-system and succeeds with garbage; use -c '%a' first.
+# BSD/macOS stat has no -c; falls back to -f '%Lp'.
+file_perms() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true
+}
+
 cmd_doctor() {
   local failures=0
   local domain=""
@@ -608,7 +615,7 @@ cmd_doctor() {
   fi
 
   if [ -f "${ENV_FILE}" ]; then
-    perms="$(stat -f '%Lp' "${ENV_FILE}" 2>/dev/null || stat -c '%a' "${ENV_FILE}" 2>/dev/null || true)"
+    perms="$(file_perms "${ENV_FILE}")"
     if [ "${perms}" = "600" ]; then
       _check "deploy/.env present, perms 600" 0 ""
     else
@@ -631,7 +638,7 @@ cmd_doctor() {
   fi
 
   if [ -f "${REPO_ROOT}/deploy/acme.json" ]; then
-    perms="$(stat -f '%Lp' "${REPO_ROOT}/deploy/acme.json" 2>/dev/null || stat -c '%a' "${REPO_ROOT}/deploy/acme.json" 2>/dev/null || true)"
+    perms="$(file_perms "${REPO_ROOT}/deploy/acme.json")"
     if [ "${perms}" = "600" ]; then
       _check "deploy/acme.json perms 600" 0 ""
     else
