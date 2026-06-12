@@ -280,12 +280,31 @@ interface RenderInputs {
   perFileOverflowEntries: PublicationPlanDropEntry[];
   perPrOverflowEntries: PublicationPlanDropEntry[];
   cfg: RepoConfig;
+  /**
+   * Optional notice/preamble prepended to the summary body before the
+   * findings section. Used for outcomes like `oversized` where the publisher
+   * needs to explain _why_ the review was skipped without injecting fake
+   * findings. The notice is inserted as-is (already markdown-formatted by the
+   * caller); it does NOT alter the plan's partition invariant.
+   *
+   * Per `docs/publication-policy.md` § Diff too large: summary-only output
+   * is required; adding an explanatory body is explicitly compatible.
+   */
+  notice?: string;
 }
 
 const renderSummary = (inputs: RenderInputs): string => {
   const lines: string[] = [];
   lines.push(`**Mode: ${inputs.mode}**`);
   lines.push('');
+
+  // Prepend the optional notice/preamble (e.g. oversized explanation) before
+  // the findings section. Inserted as-is; the caller is responsible for valid
+  // markdown. Separate from the findings body with a blank line.
+  if (inputs.notice !== undefined && inputs.notice.length > 0) {
+    lines.push(inputs.notice);
+    lines.push('');
+  }
 
   if (inputs.inline.length > 0) {
     lines.push(`### Inline (${inputs.inline.length})`);
@@ -339,6 +358,13 @@ export const planPublication = (
   ranked: RankedFindings,
   cfg: RepoConfig,
   prior: PriorDedupeState,
+  /**
+   * Optional notice/preamble prepended to the rendered summary markdown. Used
+   * by the oversized fast-path and other summary-only outcomes to surface an
+   * explanatory message without injecting fake findings. Does not alter the
+   * plan partition invariant (inline + summary + dropped === ranked.length).
+   */
+  notice?: string,
 ): PublicationPlan => {
   const mode = cfg.mode;
   const severityFloor = cfg.thresholds.severity_floor.inline;
@@ -419,6 +445,7 @@ export const planPublication = (
       perFileOverflowEntries: [],
       perPrOverflowEntries: [],
       cfg,
+      ...(notice !== undefined ? { notice } : {}),
     });
     return {
       inline: [],
@@ -485,6 +512,7 @@ export const planPublication = (
     perFileOverflowEntries,
     perPrOverflowEntries,
     cfg,
+    ...(notice !== undefined ? { notice } : {}),
   });
 
   return {

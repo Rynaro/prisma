@@ -246,6 +246,146 @@ describe('runPipeline', () => {
     expect(spy.reviewCommentsCreate).toHaveLength(0);
   });
 
+  it('oversized PR (too_many_changed_lines): outcome.kind === oversized with correct detail', async () => {
+    // Per the task spec: outcome field must carry prefilter_reason, counts,
+    // and the configured limits so callers don't need to re-fetch config.
+    const provider = new FakeProvider({ script: [] });
+    const oversized = buildSnapshot({
+      total_changed_lines: 5000,
+      files: [
+        {
+          path: 'src/big.ts',
+          status: 'modified',
+          additions: 3000,
+          deletions: 2000,
+          hunks: [{ new_start: 1, new_lines: 5000, old_start: 1, old_lines: 4000 }],
+          is_binary: false,
+          language: 'typescript',
+        },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({ provider, octokitSpy: spy, snapshot: oversized }),
+    );
+    expect(result.outcome?.kind).toBe('oversized');
+    if (result.outcome?.kind !== 'oversized') return;
+    expect(result.outcome.detail.prefilter_reason).toBe('too_many_changed_lines');
+    expect(result.outcome.detail.files_considered).toBe(1);
+    // lines_considered = additions + deletions = 3000 + 2000 = 5000
+    expect(result.outcome.detail.lines_considered).toBe(5000);
+    // Configured defaults: max_files=50, max_changed_lines=2000
+    expect(result.outcome.detail.max_files).toBe(50);
+    expect(result.outcome.detail.max_changed_lines).toBe(2000);
+  });
+
+  it('oversized PR (too_many_files): outcome.kind === oversized with correct prefilter_reason', async () => {
+    // Build a snapshot with 60 files, each with trivial changes.
+    // Default max_files = 50 → triggers too_many_files.
+    const provider = new FakeProvider({ script: [] });
+    const manyFiles = buildSnapshot({
+      total_changed_lines: 60,
+      files: Array.from({ length: 60 }, (_, i) => ({
+        path: `src/file${i}.ts`,
+        status: 'modified' as const,
+        additions: 1,
+        deletions: 0,
+        hunks: [{ new_start: 1, new_lines: 1, old_start: 1, old_lines: 0 }],
+        is_binary: false,
+        language: 'typescript',
+      })),
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({ provider, octokitSpy: spy, snapshot: manyFiles }),
+    );
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('oversized');
+    if (result.outcome?.kind !== 'oversized') return;
+    expect(result.outcome.detail.prefilter_reason).toBe('too_many_files');
+    expect(result.outcome.detail.files_considered).toBe(60);
+    expect(result.outcome.detail.max_files).toBe(50);
+  });
+
+  it('oversized PR: check-run summary contains the oversized notice text', async () => {
+    // The summary markdown published to GitHub must state the reason and
+    // numbers rather than rendering "_No findings._" as if the PR were clean.
+    const provider = new FakeProvider({ script: [] });
+    const oversized = buildSnapshot({
+      total_changed_lines: 5000,
+      files: [
+        {
+          path: 'src/big.ts',
+          status: 'modified',
+          additions: 3000,
+          deletions: 2000,
+          hunks: [{ new_start: 1, new_lines: 5000, old_start: 1, old_lines: 4000 }],
+          is_binary: false,
+          language: 'typescript',
+        },
+      ],
+    });
+    // Capture what the publisher receives via a runPublish hook.
+    const capturedSummaries: string[] = [];
+    const spy = buildOctokitSpy();
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: oversized });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        if (notice !== undefined) capturedSummaries.push(notice);
+        // Fall through to the real publish (spy already wraps octokit).
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.state).toBe('succeeded');
+    // The notice captured by the hook must mention the size limit outcome.
+    expect(capturedSummaries).toHaveLength(1);
+    expect(capturedSummaries[0]).toMatch(/Review skipped/);
+    expect(capturedSummaries[0]).toMatch(/max_changed_lines/);
+    expect(capturedSummaries[0]).toMatch(/review-bot\.yml/);
+  });
+
+  it('normal review (review_complete): outcome.kind === review_complete', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: validOutputForExampleFile() }],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy }));
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('review_complete');
+  });
+
+  it('empty diff (no_findings): outcome.kind === no_findings', async () => {
+    const provider = new FakeProvider({ script: [] });
+    const empty = buildSnapshot({ total_changed_lines: 0, files: [] });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({ provider, octokitSpy: spy, snapshot: empty }),
+    );
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('no_findings');
+  });
+
+  it('malformed provider output: outcome.kind === malformed_provider_output', async () => {
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: { kind: 'schema_validation', message: 'truncated output' },
+        },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy }));
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('malformed_provider_output');
+  });
+
   it('empty diff (no analyzable files) -> publishes "no findings" summary, no provider call', async () => {
     const provider = new FakeProvider({ script: [] });
     const empty = buildSnapshot({ total_changed_lines: 0, files: [] });
