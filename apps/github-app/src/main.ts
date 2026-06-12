@@ -292,12 +292,18 @@ const start = async (): Promise<void> => {
     await auth.getToken(installationId);
   };
 
+  // Resolve the bot login for loop prevention in the ingress. Uses the same
+  // env var (GITHUB_APP_SLUG) and fallback ('prisma-review-bot') as worker.ts
+  // so the two processes are consistent.
+  const botLogin = (await tryGetSecret('GITHUB_APP_SLUG')) ?? 'prisma-review-bot';
+
   const app = buildServer({
     webhookSecret: buildWebhookSecretResolver(secretSource),
     replayCache,
     enqueueJob: (payload) => jobQueue.enqueue(payload),
     readinessProbe: buildReadinessProbe(secretSource, connection),
     depsProbe: buildDepsProbe(connection, probeMintToken),
+    botLogin,
   });
 
   const shutdown = async (): Promise<void> => {

@@ -216,6 +216,30 @@ Configuration is resolved in this order; each layer overrides the previous on a 
 
 - **Full reference:** [docs/custom-review-prompts.md](./custom-review-prompts.md) — how custom guidance works, token budgets, degradation rules, and security considerations.
 
+### nickname
+
+- **Type.** String.
+- **Required.** Optional.
+- **Default.** Unset (real bot login only).
+- **Validation rule (plain English).** Must be login-shaped: starts with alphanumeric, may contain hyphens, 1–39 characters. Any other shape rejects the file.
+- **Example.** `nickname: prbot`
+
+When set, both the real bot login and the nickname are accepted as valid command targets.
+
+### command_marker
+
+- **Type.** String enum.
+- **Required.** Optional.
+- **Default.** `@`.
+- **Validation rule (plain English).** Value must be exactly one of `@`, `$`, `!`, `/`, case-sensitive. Any other value rejects the file.
+- **Example.** `command_marker: "$"`
+
+Controls which prefix character must appear before the bot login in PR comments for the command to be recognised. Operators who want to avoid GitHub's `@`-autocomplete — which can accidentally ping real users who share a name prefix with the bot slug — can set this to `$`, `!`, or `/`.
+
+**Mention matching is case-insensitive.** Whether the configured marker is `@` or any of the alternatives, the candidate login after the marker is compared case-insensitively against the bot slug and configured nickname. `@Josie` and `@josie` are treated as the same candidate.
+
+**Note on `$`.** GitHub renders `$...$` pairs as inline math (LaTeX) in Markdown. A lone `$josie` at the start of a line (no closing `$` on the same line) is rendered as plain text — this is the common usage pattern and is safe. Operators choosing `$` should ensure command comments do not accidentally form a closed `$...$` pair on the first line.
+
 ## Precedence matrix
 
 The following table declares how filtering keys interact. Rows are the filtering key in question; the cell describes its resolution rule against the named other key. "Applies first" means evaluated before; "applies last" means evaluated after.
@@ -278,6 +302,10 @@ repo_heuristics:
   tests: true
   migrations: true
   layering: true
+# Optional: set a nickname so both '@prisma-bot' and '@prbot' trigger commands.
+nickname: prbot
+# Optional: use '$' instead of '@' to avoid GitHub's @-autocomplete.
+command_marker: "@"
 ```
 
 ## Failure modes

@@ -59,6 +59,18 @@ Subscribe to the following webhook events:
 
 For MVP, prisma is single-tenant; choose "Only on this account" if you are evaluating, or "Any account" if you intend to publish the App. (Single-tenant posture is documented in [`system-design.md` § Multitenancy posture](system-design.md); routing is namespaced by `installation_id` from day one regardless.)
 
+### Approving permission upgrades
+
+When you change the App's permissions after it has already been installed (for example, adding `issue_comment` subscription or requesting `issues: write`), **each existing installation must explicitly approve the upgrade** before GitHub resumes delivering the newly gated events.
+
+To approve:
+
+1. Go to **Settings → GitHub Apps** on the account or organization where the App is installed.
+2. Find the App under "Review request" and click **Approve**.
+3. Until approved, gated events (including `issue_comment`) are **not delivered to the App** — the bot will not respond to PR comments even if the stack is running correctly.
+
+This is a GitHub-enforced safety gate; it cannot be bypassed from the App side. Operators who see missing `issue_comment` deliveries after a permission change should check this approval flow first.
+
 ## Step 2 — Mint and download the App private key
 
 After the App is registered, GitHub presents the option to generate a private key (a `.pem` file). Generate one and download it. **The PEM file is a secret** — store it the same way you store database credentials. You will load its contents (or its path) into `GITHUB_APP_PRIVATE_KEY` in the next step.

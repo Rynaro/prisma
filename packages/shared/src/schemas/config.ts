@@ -127,9 +127,10 @@ export const RepoConfigSchema = z
      */
     review_guidance: ReviewGuidanceSchema,
     /**
-     * Optional mention alias. When set, `@<nickname>` in PR comments is treated
-     * as a mention of the bot in addition to the real bot login. Must be
-     * login-shaped (alphanumeric + hyphens, no leading hyphen, 1–39 chars).
+     * Optional mention alias. When set, `@<nickname>` (or the configured
+     * marker + nickname) in PR comments is treated as a mention of the bot in
+     * addition to the real bot login. Must be login-shaped (alphanumeric +
+     * hyphens, no leading hyphen, 1–39 chars).
      * Absent → today's behavior unchanged (real login only).
      * Per spec § Track 3: sibling of review_guidance.
      */
@@ -139,6 +140,16 @@ export const RepoConfigSchema = z
       .max(39)
       .regex(/^[A-Za-z0-9][A-Za-z0-9-]*$/)
       .optional(),
+    /**
+     * Optional command marker character. Controls which prefix character the
+     * bot recognises before the candidate login in PR comments.
+     * Allowed values: `@` (default), `$`, `!`, `/`.
+     * Using `$` is safe for unpaired leading markers; GitHub only renders
+     * `$...$` pairs as math — a lone `$josie` at the start of a line is
+     * rendered as plain text.
+     * Per spec § configurable-command-marker.
+     */
+    command_marker: z.enum(['@', '$', '!', '/']).default('@'),
   })
   .describe('Repo-local .github/review-bot.yml configuration');
 

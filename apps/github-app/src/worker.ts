@@ -272,9 +272,10 @@ const fetchRepoConfig = async (
 
 /**
  * Build the text body for a `help` command reply.
+ * The `marker` parameter is the configured command_marker (default `@`).
  */
-const buildHelpReply = (botLogin: string): string =>
-  `### ${botLogin} — commands\n\n| Command | Description |\n|---|---|\n| \`@${botLogin} review\` | Run an incremental review (skips already-posted findings) |\n| \`@${botLogin} full review\` | Run a fresh review (re-evaluates all findings) |\n| \`@${botLogin} help\` | Show this command reference |\n| \`@${botLogin} configuration\` | Show the effective repo configuration |\n\nYou can also click **Re-run** on the "AI Code Review" check to trigger an incremental round.`;
+const buildHelpReply = (botLogin: string, marker = '@'): string =>
+  `### ${botLogin} — commands\n\n| Command | Description |\n|---|---|\n| \`${marker}${botLogin} review\` | Run an incremental review (skips already-posted findings) |\n| \`${marker}${botLogin} full review\` | Run a fresh review (re-evaluates all findings) |\n| \`${marker}${botLogin} help\` | Show this command reference |\n| \`${marker}${botLogin} configuration\` | Show the effective repo configuration |\n\nYou can also click **Re-run** on the "AI Code Review" check to trigger an incremental round.`;
 
 /**
  * Build the text body for a `configuration` command reply.
@@ -284,6 +285,8 @@ const buildConfigReply = (config: RepoConfig): string => {
   lines.push(`mode: ${config.mode}`);
   if (config.model !== undefined) lines.push(`model: ${config.model}`);
   if (config.nickname !== undefined) lines.push(`nickname: ${config.nickname}`);
+  // Always show command_marker so operators can confirm the active value.
+  lines.push(`command_marker: "${config.command_marker}"`);
   lines.push(
     'repo_heuristics:',
     `  security: ${String(config.repo_heuristics.security)}`,
@@ -346,20 +349,26 @@ const start = async (): Promise<void> => {
       return { state: 'discarded_idempotent' };
     }
 
-    // 2. Post 👀 reaction (fail-open).
-    try {
-      await issueComments.addReaction({ owner, repo, comment_id, content: 'eyes' });
-    } catch (err) {
-      log('command.ack.eyes_failed', {
+    // 2. Marker enforcement: drop if the marker used does not match the configured one.
+    // command_marker defaults to '@' for old payloads that pre-date this field.
+    const payloadMarker = payload.command_marker ?? '@';
+    const configuredMarker = config.command_marker ?? '@';
+    if (payloadMarker !== configuredMarker) {
+      log('command.dropped_marker_mismatch', {
         idempotency_key: payload.idempotency_key,
-        message: err instanceof Error ? err.message : 'unknown',
+        marker: payloadMarker,
+        expected: configuredMarker,
+        candidate: payload.mention_candidate,
       });
+      return { state: 'discarded_idempotent' };
     }
 
     // 3. Nickname resolution (D2): bot_login ∪ { config.nickname if set }.
-    const validTargets = new Set<string>([botLogin, botCommentLogin]);
-    if (config.nickname !== undefined) validTargets.add(config.nickname);
-    if (!validTargets.has(payload.mention_candidate)) {
+    // Case-insensitive comparison: GitHub mention semantics are case-insensitive.
+    const candidateLower = payload.mention_candidate.toLowerCase();
+    const validTargets = new Set<string>([botLogin.toLowerCase(), botCommentLogin.toLowerCase()]);
+    if (config.nickname !== undefined) validTargets.add(config.nickname.toLowerCase());
+    if (!validTargets.has(candidateLower)) {
       log('command.dropped_nickname_mismatch', {
         idempotency_key: payload.idempotency_key,
         candidate: payload.mention_candidate,
@@ -369,7 +378,18 @@ const start = async (): Promise<void> => {
       return { state: 'discarded_idempotent' };
     }
 
-    // 4. Parse command (authoritative; command_raw was set at ingress).
+    // 4. Post 👀 reaction (fail-open) — only after marker + identity validation,
+    // so the bot never reacts to comments addressed to other people.
+    try {
+      await issueComments.addReaction({ owner, repo, comment_id, content: 'eyes' });
+    } catch (err) {
+      log('command.ack.eyes_failed', {
+        idempotency_key: payload.idempotency_key,
+        message: err instanceof Error ? err.message : 'unknown',
+      });
+    }
+
+    // 5. Parse command (authoritative; command_raw was set at ingress).
     const cmd = parseCommand(payload.command_raw);
 
     log('command.dispatching', {
@@ -377,10 +397,10 @@ const start = async (): Promise<void> => {
       command_kind: cmd.kind,
     });
 
-    // 5. Dispatch.
+    // 6. Dispatch.
     try {
       if (cmd.kind === 'help') {
-        const body = buildHelpReply(botLogin);
+        const body = buildHelpReply(botLogin, configuredMarker);
         await issueComments.createReply({ owner, repo, issue_number: pr_number, body });
       } else if (cmd.kind === 'configuration') {
         const body = buildConfigReply(config);
@@ -425,7 +445,7 @@ const start = async (): Promise<void> => {
           return { state: 'failed_terminal', reason: result.reason ?? 'pipeline_failed' };
         }
 
-        // 6. Post ✅ reaction + reply.
+        // 7. Post ✅ reaction + reply.
         try {
           await issueComments.addReaction({ owner, repo, comment_id, content: '+1' });
         } catch (err) {
