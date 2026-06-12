@@ -14,4 +14,4 @@ export type {
 export { planPublication } from './planner.js';
 
 export type { PublishContext, PublisherDeps } from './effects.js';
-export { publish } from './effects.js';
+export { harvestPriorRound, publish } from './effects.js';

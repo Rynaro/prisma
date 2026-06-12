@@ -124,6 +124,7 @@ export interface OrchestratorHooks {
     cfg: RepoConfig,
     ctx: PublishContext,
     deps: PublisherDeps,
+    roundIntent?: 'incremental' | 'full',
   ) => Promise<PublicationResult>;
 }
 
@@ -559,7 +560,13 @@ export const runPipeline = async (
   const publishFn = hooks.runPublish ?? defaultPublish;
   const ctx = buildPublishContext(payload, identity, deps.resolvedHeadSha);
   const publisherDeps = publisherDepsFor(octokit);
-  const publication = await publishFn(ranked, deps.config, ctx, publisherDeps);
+  const publication = await publishFn(
+    ranked,
+    deps.config,
+    ctx,
+    publisherDeps,
+    deps.roundIntent ?? 'incremental',
+  );
 
   if (publication.dropped.length > 0) {
     logger.emit('publisher.dropped', { ...trace, count: publication.dropped.length });
