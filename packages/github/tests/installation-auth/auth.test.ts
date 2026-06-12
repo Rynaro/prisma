@@ -28,6 +28,13 @@ const fakeOctokit = (): OctokitLike => ({
       }),
       listReviewComments: async () => ({ data: [] }),
     },
+    issues: {
+      createComment: async () => ({ data: { id: 1, body: null, user: null } }),
+      getComment: async () => ({ data: { id: 1, body: null, user: null } }),
+    },
+    reactions: {
+      createForIssueComment: async () => ({ data: { id: 1 } }),
+    },
   },
 });
 

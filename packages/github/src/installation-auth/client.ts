@@ -29,6 +29,10 @@ import { Octokit } from '@octokit/rest';
  *                                 → octokit.rest.pulls.createReviewComment
  *   - rest.pulls_reviews.listReviewComments
  *                                 → octokit.rest.pulls.listReviewComments
+ *   - rest.issues.createComment   → octokit.rest.issues.createComment
+ *   - rest.issues.getComment      → octokit.rest.issues.getComment
+ *   - rest.reactions.createForIssueComment
+ *                                 → octokit.rest.reactions.createForIssueComment
  */
 
 export interface PullsGetData {
@@ -94,6 +98,38 @@ export interface ChecksListItemData {
   conclusion: string | null;
   output: { title: string | null; summary: string | null; text: string | null };
   app: { id: number | null } | null;
+}
+
+/**
+ * Parameters for creating an issue/PR comment.
+ * Mapping: octokit.rest.issues.createComment
+ */
+export interface IssuesCreateCommentParams {
+  owner: string;
+  repo: string;
+  issue_number: number;
+  body: string;
+}
+
+/**
+ * Data returned from issues.createComment and issues.getComment.
+ */
+export interface IssueCommentData {
+  id: number;
+  body: string | null | undefined;
+  user: { login: string; type: string } | null;
+}
+
+/**
+ * Parameters for creating a reaction on an issue comment.
+ * Mapping: octokit.rest.reactions.createForIssueComment
+ */
+export interface ReactionsCreateForIssueCommentParams {
+  owner: string;
+  repo: string;
+  comment_id: number;
+  /** GitHub reaction content: 'eyes' = 👀, '+1' = ✅ (closest available) */
+  content: 'eyes' | '+1' | '-1' | 'laugh' | 'confused' | 'heart' | 'hooray' | 'rocket';
 }
 
 export interface PullsCreateReviewCommentParams {
@@ -171,6 +207,19 @@ export interface OctokitLike {
         page?: number;
       }): Promise<{ data: PullsReviewCommentData[] }>;
     };
+    issues: {
+      createComment(params: IssuesCreateCommentParams): Promise<{ data: IssueCommentData }>;
+      getComment(params: {
+        owner: string;
+        repo: string;
+        comment_id: number;
+      }): Promise<{ data: IssueCommentData }>;
+    };
+    reactions: {
+      createForIssueComment(
+        params: ReactionsCreateForIssueCommentParams,
+      ): Promise<{ data: { id: number } }>;
+    };
   };
 }
 
@@ -223,6 +272,22 @@ export const createDefaultOctokit = (token: string): OctokitLike => {
           inner.rest.pulls.listReviewComments(params) as unknown as Promise<{
             data: PullsReviewCommentData[];
           }>,
+      },
+      issues: {
+        createComment: (params) =>
+          inner.rest.issues.createComment(
+            params as unknown as Parameters<typeof inner.rest.issues.createComment>[0],
+          ) as unknown as Promise<{ data: IssueCommentData }>,
+        getComment: (params) =>
+          inner.rest.issues.getComment(
+            params as unknown as Parameters<typeof inner.rest.issues.getComment>[0],
+          ) as unknown as Promise<{ data: IssueCommentData }>,
+      },
+      reactions: {
+        createForIssueComment: (params) =>
+          inner.rest.reactions.createForIssueComment(
+            params as unknown as Parameters<typeof inner.rest.reactions.createForIssueComment>[0],
+          ) as unknown as Promise<{ data: { id: number } }>,
       },
     },
   };
