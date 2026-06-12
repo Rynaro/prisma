@@ -66,7 +66,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.5.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.6.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 ## Operate the Deployment
 
@@ -182,7 +182,7 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.5.0** — pipeline observability: provider findings-count event, per-rejection validator detail, truncation guards in all three provider adapters.
+**v0.6.0** — configurable command marker (`$josie review`), case-insensitive mentions, ack-after-validation, hardened loop prevention.
 
 - 506 tests across 47 files, all passing · 12/12 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
