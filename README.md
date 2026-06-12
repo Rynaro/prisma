@@ -66,7 +66,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.3.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.4.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 ## Operate the Deployment
 
@@ -172,7 +172,7 @@ Both `@prisma-bot` and `@prbot` will then be accepted as valid triggers.
 
 ## Status
 
-**v0.3.0** — dynamic interactions: comment commands, re-run review rounds, bot nickname.
+**v0.4.0** — operations CLI: `bin/prisma` TUI console + headless flag workflows, health-gated image updates with auto-rollback.
 
 - 454 tests across 47 files, all passing · 12/12 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
