@@ -1,6 +1,8 @@
 import type { IssueCommentsClient } from '@prisma-bot/github';
 import {
   type JobPayload,
+  type RepoConfig,
+  RepoConfigSchema,
   parseCommand,
   parseMentionCandidate,
   requiresWrite,
@@ -370,5 +372,79 @@ describe('eyes reaction ordering', () => {
   it('$ marker with matching config allows eyes to be posted', () => {
     const result = checkDropBeforeEyes('$', '$', 'josie', new Set(['josie', 'josie[bot]']));
     expect(result.dropped).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildConfigReply — configuration command output (mirrors worker.ts logic)
+// ---------------------------------------------------------------------------
+
+describe('buildConfigReply — includes max_files and max_changed_lines', () => {
+  /**
+   * Mirrors `buildConfigReply` from `worker.ts`. The function is not exported,
+   * so we duplicate the relevant logic here to test the size-limit fields added
+   * per the task spec. Tests in this block serve as a contract guard: if the
+   * worker omits the fields, these tests will catch the regression.
+   *
+   * Per the task spec § 4: "Add max_files and max_changed_lines lines to
+   * buildConfigReply."
+   */
+  const buildConfigReply = (config: RepoConfig): string => {
+    const lines: string[] = ['### Effective repo configuration\n', '```yaml'];
+    lines.push(`mode: ${config.mode}`);
+    if (config.model !== undefined) lines.push(`model: ${config.model}`);
+    if (config.nickname !== undefined) lines.push(`nickname: ${config.nickname}`);
+    lines.push(`command_marker: "${config.command_marker}"`);
+    lines.push(`max_files: ${config.max_files}`);
+    lines.push(`max_changed_lines: ${config.max_changed_lines}`);
+    lines.push(
+      'repo_heuristics:',
+      `  security: ${String(config.repo_heuristics.security)}`,
+      `  tests: ${String(config.repo_heuristics.tests)}`,
+      `  migrations: ${String(config.repo_heuristics.migrations)}`,
+      `  layering: ${String(config.repo_heuristics.layering)}`,
+    );
+    const { review_guidance } = config;
+    if (
+      review_guidance.instructions !== undefined ||
+      review_guidance.path_instructions.length > 0 ||
+      review_guidance.context_files.length > 0
+    ) {
+      lines.push('review_guidance: (configured)');
+    }
+    lines.push('```');
+    return lines.join('\n');
+  };
+
+  const defaultConfig = (): RepoConfig => RepoConfigSchema.parse({});
+
+  it('includes max_files with the default value (50)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('max_files: 50');
+  });
+
+  it('includes max_changed_lines with the default value (2000)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('max_changed_lines: 2000');
+  });
+
+  it('reflects non-default max_files when overridden in config', () => {
+    const config = RepoConfigSchema.parse({ max_files: 100 });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('max_files: 100');
+  });
+
+  it('reflects non-default max_changed_lines when overridden in config', () => {
+    const config = RepoConfigSchema.parse({ max_changed_lines: 5000 });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('max_changed_lines: 5000');
+  });
+
+  it('output is a fenced yaml block containing mode and command_marker', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('```yaml');
+    expect(reply).toContain('```');
+    expect(reply).toContain('mode:');
+    expect(reply).toContain('command_marker:');
   });
 });

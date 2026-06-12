@@ -424,6 +424,52 @@ describe('end-to-end webhook → orchestrator → publish', () => {
     expect(spy.reviewCommentsCreate).toHaveLength(0);
   });
 
+  it('oversized PR: check-run summary contains oversized notice (not "_No findings._")', async () => {
+    // Regression guard: before this fix the check-run rendered "_No findings._"
+    // indistinguishable from a clean PR. After the fix it must state the reason.
+    const provider = new FakeProvider({ script: [] });
+    // 1000 changed files comfortably exceeds max_files (default 50).
+    const spy = buildOctokitSpy({ fileCount: 1000 });
+    harness = buildE2E({
+      provider,
+      octokitSpy: spy,
+      config: cfg('summary-plus-inline'),
+    });
+    const body = makePullRequestBody({ pull_request_number: 100 });
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    await harness.app.inject({
+      method: 'POST',
+      url: '/webhooks/github',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': sign(raw),
+        'x-github-event': 'pull_request',
+        'x-github-delivery': 'e2e-oversized-notice-1',
+      },
+      payload: raw,
+    });
+    // The checks.update call carries the summary that GitHub renders.
+    const updateCall = spy.checksUpdate[0];
+    expect(updateCall).toBeDefined();
+    // Must mention the size limit outcome — NOT render a silent "No findings."
+    // The notice must be present, explaining the size limit outcome.
+    expect(updateCall?.summary).toMatch(/Review skipped/);
+    expect(updateCall?.summary).toMatch(/max_files/);
+    expect(updateCall?.summary).toMatch(/review-bot\.yml/);
+    // The summary may still contain "_No findings._" (there are genuinely no
+    // findings). What matters is that the oversized notice appears BEFORE any
+    // "_No findings._" line, so operators see an explanation, not just a
+    // silent clean-PR indicator.
+    const summaryText = updateCall?.summary ?? '';
+    const reviewSkippedIdx = summaryText.indexOf('Review skipped');
+    const noFindingsIdx = summaryText.indexOf('_No findings._');
+    expect(reviewSkippedIdx).toBeGreaterThanOrEqual(0);
+    // When both are present, the notice must precede the _No findings._ line.
+    if (noFindingsIdx >= 0) {
+      expect(reviewSkippedIdx).toBeLessThan(noFindingsIdx);
+    }
+  });
+
   it('provider auth error → publish "review unavailable" summary; job marked terminal', async () => {
     const provider = new FakeProvider({
       script: [

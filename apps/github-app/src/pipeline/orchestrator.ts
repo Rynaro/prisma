@@ -126,6 +126,7 @@ export interface OrchestratorHooks {
     ctx: PublishContext,
     deps: PublisherDeps,
     roundIntent?: 'incremental' | 'full',
+    notice?: string,
   ) => Promise<PublicationResult>;
 }
 
@@ -172,6 +173,45 @@ export interface OrchestratorDeps {
   resolvedHeadSha?: string;
 }
 
+/**
+ * Detail carried when the prefilter short-circuited due to an oversized PR.
+ * Fields mirror the `PrefilterOutcome` oversized branch plus the configured
+ * limits so callers can compose human-readable messages without re-fetching
+ * config.
+ */
+export interface OversizedDetail {
+  /** Which limit was exceeded. */
+  prefilter_reason: 'too_many_files' | 'too_many_changed_lines';
+  files_considered: number;
+  lines_considered: number;
+  /** Configured limit from `config.max_files`. */
+  max_files: number;
+  /** Configured limit from `config.max_changed_lines`. */
+  max_changed_lines: number;
+}
+
+/**
+ * Discriminated outcome union surfaced by `runPipeline`. Callers use this to
+ * compose user-visible messages that reflect what actually happened, rather than
+ * treating every succeeded result as a completed review.
+ *
+ * - `'review_complete'`  — provider was called; findings (if any) were ranked
+ *   and published. "Review complete!" is appropriate.
+ * - `'oversized'`        — prefilter short-circuited; `oversized_detail` carries
+ *   the specifics (reason, counts, limits). PR was not reviewed.
+ * - `'no_findings'`      — provider was called but no analyzable files remained
+ *   after prefilter (e.g. pure-delete or all-generated diff). Review ran clean.
+ * - `'review_unavailable'` — non-transient provider error (auth / capability).
+ * - `'malformed_provider_output'` — provider output failed schema validation;
+ *   job terminated cleanly without retry.
+ */
+export type PipelineOutcome =
+  | { kind: 'review_complete' }
+  | { kind: 'oversized'; detail: OversizedDetail }
+  | { kind: 'no_findings' }
+  | { kind: 'review_unavailable' }
+  | { kind: 'malformed_provider_output' };
+
 export interface OrchestratorResult {
   state: 'succeeded' | 'failed_terminal';
   publication?: PublicationResult;
@@ -179,6 +219,13 @@ export interface OrchestratorResult {
   rejections: RejectionLogEntry[];
   /** Notes from config-fetch / augmentation (config errors, skipped files, etc.). */
   config_notes?: string[];
+  /**
+   * Discriminated outcome that lets callers distinguish pipeline paths without
+   * inspecting log events. Absent only on `failed_terminal` states where the
+   * outcome is implicitly `review_unavailable` (the provider threw and the job
+   * will be retried by the consumer). Always present on `succeeded`.
+   */
+  outcome?: PipelineOutcome;
 }
 
 const buildSyntheticEmptyOutput = (): {
@@ -269,6 +316,13 @@ interface FailureSummaryArgs {
   reasonMessage: string;
   rejections: RejectionLogEntry[];
   resolvedHeadSha?: string | undefined;
+  /**
+   * Optional notice/preamble prepended to the check-run summary body. When
+   * provided, it is forwarded through publish → planPublication → renderSummary
+   * so the check-run body explains the outcome instead of just showing
+   * "_No findings._". Does not alter the plan partition invariant.
+   */
+  notice?: string;
 }
 
 const publishSummaryOnly = async (args: FailureSummaryArgs): Promise<PublicationResult> => {
@@ -281,7 +335,7 @@ const publishSummaryOnly = async (args: FailureSummaryArgs): Promise<Publication
   // "summary-only output regardless of the configured `mode`".
   const summaryOnlyCfg: RepoConfig = { ...args.cfg, mode: 'summary-only' };
   const empty: RankedFindings = buildSyntheticEmptyOutput().empty_findings;
-  return publishFn(empty, summaryOnlyCfg, ctx, deps);
+  return publishFn(empty, summaryOnlyCfg, ctx, deps, undefined, args.notice);
 };
 
 const fetchSnapshotDefault = async (
@@ -339,6 +393,24 @@ export const runPipeline = async (
       files_considered: prefilter.files_considered,
       lines_considered: prefilter.lines_considered,
     });
+    // Build the structured outcome so the worker can compose a user-visible
+    // message without re-fetching config.
+    const oversizedDetail: OversizedDetail = {
+      prefilter_reason: prefilter.reason,
+      files_considered: prefilter.files_considered,
+      lines_considered: prefilter.lines_considered,
+      max_files: deps.config.max_files,
+      max_changed_lines: deps.config.max_changed_lines,
+    };
+    // Build the check-run summary notice per
+    // `docs/publication-policy.md` § Diff too large. The notice explains
+    // which limit was hit, the measured values, and the remediation hint.
+    // Numbers come from the prefilter outcome and the resolved config.
+    const limitClause =
+      prefilter.reason === 'too_many_changed_lines'
+        ? `${prefilter.lines_considered.toLocaleString('en-US')} changed lines considered across ${prefilter.files_considered} files; limit: max_changed_lines=${deps.config.max_changed_lines}, max_files=${deps.config.max_files}`
+        : `${prefilter.files_considered} files considered; limit: max_files=${deps.config.max_files}, max_changed_lines=${deps.config.max_changed_lines}`;
+    const oversizedNotice = `⚠️ Review skipped — this PR exceeds the configured size limit (${limitClause}). Raise the limits in \`.github/review-bot.yml\` or split the PR.`;
     const publication = await publishSummaryOnly({
       payload,
       identity,
@@ -349,6 +421,7 @@ export const runPipeline = async (
       reasonMessage: `prefilter oversized: ${prefilter.reason}`,
       rejections: [],
       resolvedHeadSha: deps.resolvedHeadSha,
+      notice: oversizedNotice,
     });
     logger.emit('publisher.published', {
       ...trace,
@@ -358,7 +431,12 @@ export const runPipeline = async (
       summary_count: publication.published_summary.length,
     });
     logger.emit('job.terminal', { ...trace, state: 'succeeded' });
-    return { state: 'succeeded', publication, rejections: publication.rejections };
+    return {
+      state: 'succeeded',
+      publication,
+      rejections: publication.rejections,
+      outcome: { kind: 'oversized', detail: oversizedDetail },
+    };
   }
 
   logger.emit('prefilter.accepted', {
@@ -390,7 +468,12 @@ export const runPipeline = async (
       summary_count: publication.published_summary.length,
     });
     logger.emit('job.terminal', { ...trace, state: 'succeeded' });
-    return { state: 'succeeded', publication, rejections: publication.rejections };
+    return {
+      state: 'succeeded',
+      publication,
+      rejections: publication.rejections,
+      outcome: { kind: 'no_findings' },
+    };
   }
 
   // Stage: augmentation resolution.
@@ -490,6 +573,7 @@ export const runPipeline = async (
           state: 'succeeded',
           publication,
           rejections: [rejection, ...publication.rejections],
+          outcome: { kind: 'malformed_provider_output' },
         };
       }
       if (kind === 'auth' || kind === 'capability') {
@@ -594,5 +678,6 @@ export const runPipeline = async (
     publication,
     rejections: [...validatorResult.rejections, ...publication.rejections],
     ...(allNotes.length > 0 ? { config_notes: allNotes } : {}),
+    outcome: { kind: 'review_complete' },
   };
 };

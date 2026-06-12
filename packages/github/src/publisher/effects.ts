@@ -210,6 +210,13 @@ export const publish = async (
   ctx: PublishContext,
   deps: PublisherDeps,
   roundIntent: 'incremental' | 'full' = 'incremental',
+  /**
+   * Optional notice/preamble prepended to the check-run summary body. Used
+   * for outcomes like `oversized` where the publisher needs to explain _why_
+   * the review was skipped. Forwarded verbatim to `planPublication` → the
+   * `renderSummary` step. Does not alter the plan partition invariant.
+   */
+  notice?: string,
 ): Promise<PublicationResult> => {
   const ranAt = new Date().toISOString();
 
@@ -227,7 +234,7 @@ export const publish = async (
   // Build the set of current finding dedupe keys for round-summary arithmetic.
   const currentKeys = new Set<string>(ranked.map((f) => f.dedupe_key));
 
-  const plan: PublicationPlan = planPublication(ranked, cfg, prior);
+  const plan: PublicationPlan = planPublication(ranked, cfg, prior, notice);
 
   // Start the Checks run.
   let checkRunId = 0;

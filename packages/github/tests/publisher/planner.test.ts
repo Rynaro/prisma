@@ -326,3 +326,50 @@ describe('planPublication — boundary cases', () => {
     );
   });
 });
+
+describe('planPublication — notice/preamble (oversized + fallback paths)', () => {
+  it('notice is prepended to summary_markdown in summary-only mode (empty findings)', () => {
+    // Simulate the oversized fast-path: no findings, notice supplied.
+    const notice =
+      '⚠️ Review skipped — this PR exceeds the configured size limit (1,931 changed lines across 33 files; limit: max_changed_lines=2000, max_files=50). Raise the limits in `.github/review-bot.yml` or split the PR.';
+    const plan = planPublication([], cfgWithMode('summary-only'), noPrior, notice);
+    expect(plan.summary_markdown).toContain(notice);
+    // The notice must appear BEFORE the findings section (which is empty here,
+    // so it appears before the "Caps:" footer line).
+    const noticeIdx = plan.summary_markdown.indexOf(notice);
+    const capsIdx = plan.summary_markdown.indexOf('Caps:');
+    expect(noticeIdx).toBeGreaterThanOrEqual(0);
+    expect(capsIdx).toBeGreaterThanOrEqual(0);
+    expect(noticeIdx).toBeLessThan(capsIdx);
+  });
+
+  it('notice is prepended to summary_markdown in dry-run mode', () => {
+    const notice = '⚠️ Test notice for dry-run.';
+    const plan = planPublication([], cfgWithMode('dry-run'), noPrior, notice);
+    expect(plan.summary_markdown).toContain(notice);
+  });
+
+  it('notice is prepended to summary_markdown in summary-plus-inline mode', () => {
+    const notice = '⚠️ Test notice for inline mode.';
+    const ranked = [finding({ id: 'A', severity: 'high', confidence: 0.9 })];
+    const plan = planPublication(ranked, cfgWithMode('summary-plus-inline'), noPrior, notice);
+    expect(plan.summary_markdown).toContain(notice);
+  });
+
+  it('without notice, empty findings summary_markdown does NOT contain "Review skipped"', () => {
+    // Sanity: without a notice the old "_No findings._" path is preserved.
+    const plan = planPublication([], cfgWithMode('summary-only'), noPrior);
+    expect(plan.summary_markdown).not.toContain('Review skipped');
+    expect(plan.summary_markdown).toContain('_No findings._');
+  });
+
+  it('partition invariant holds when notice is supplied', () => {
+    const notice = '⚠️ Test notice.';
+    const ranked = [
+      finding({ id: 'A', severity: 'high', confidence: 0.9 }),
+      finding({ id: 'B', severity: 'low', confidence: 0.5, path: 'src/b.ts' }),
+    ];
+    const plan = planPublication(ranked, cfgWithMode('summary-plus-inline'), noPrior, notice);
+    partitionInvariant(ranked, plan);
+  });
+});

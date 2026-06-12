@@ -279,6 +279,9 @@ const buildHelpReply = (botLogin: string, marker = '@'): string =>
 
 /**
  * Build the text body for a `configuration` command reply.
+ *
+ * Includes `max_files` and `max_changed_lines` so operators can identify
+ * which limit an oversized PR is hitting without reading the default docs.
  */
 const buildConfigReply = (config: RepoConfig): string => {
   const lines: string[] = ['### Effective repo configuration\n', '```yaml'];
@@ -287,6 +290,11 @@ const buildConfigReply = (config: RepoConfig): string => {
   if (config.nickname !== undefined) lines.push(`nickname: ${config.nickname}`);
   // Always show command_marker so operators can confirm the active value.
   lines.push(`command_marker: "${config.command_marker}"`);
+  // Size limits: always shown so operators can see which threshold an
+  // oversized PR is hitting. Defaults are max_files=50, max_changed_lines=2000
+  // (config-spec.md § max_files / § max_changed_lines).
+  lines.push(`max_files: ${config.max_files}`);
+  lines.push(`max_changed_lines: ${config.max_changed_lines}`);
   lines.push(
     'repo_heuristics:',
     `  security: ${String(config.repo_heuristics.security)}`,
@@ -445,7 +453,17 @@ const start = async (): Promise<void> => {
           return { state: 'failed_terminal', reason: result.reason ?? 'pipeline_failed' };
         }
 
-        // 7. Post ✅ reaction + reply.
+        // 7. Post ✅ reaction + outcome-aware reply.
+        //
+        // Branch on result.outcome so the reply accurately reflects what
+        // happened (per the logged real-world case: reason=too_many_changed_lines
+        // previously caused a misleading "Review complete!" reply).
+        //
+        // - oversized          → explain which limit was hit, cite numbers and
+        //                        the config pointer (.github/review-bot.yml).
+        // - no_findings        → the review ran clean; no issues were found.
+        // - review_complete    → normal success: direct the user to the check run.
+        // - anything else      → fall back to the generic check-run pointer.
         try {
           await issueComments.addReaction({ owner, repo, comment_id, content: '+1' });
         } catch (err) {
@@ -454,12 +472,26 @@ const start = async (): Promise<void> => {
             message: err instanceof Error ? err.message : 'unknown',
           });
         }
+        let replyBody: string;
+        if (result.outcome?.kind === 'oversized') {
+          const { detail } = result.outcome;
+          const limitClause =
+            detail.prefilter_reason === 'too_many_changed_lines'
+              ? `${detail.lines_considered.toLocaleString('en-US')} changed lines across ${detail.files_considered} files (limit: \`max_changed_lines=${detail.max_changed_lines}\`, \`max_files=${detail.max_files}\`)`
+              : `${detail.files_considered} files (limit: \`max_files=${detail.max_files}\`, \`max_changed_lines=${detail.max_changed_lines}\`)`;
+          replyBody = `Review skipped — this PR exceeds the configured size limit: ${limitClause}. Raise the limits in \`.github/review-bot.yml\` or split the PR. The **AI Code Review** check run shows the same notice.`;
+        } else if (result.outcome?.kind === 'no_findings') {
+          replyBody =
+            'Review complete — no issues found. Check the **AI Code Review** check run for the full summary.';
+        } else {
+          replyBody = 'Review complete! Check the **AI Code Review** check run for results.';
+        }
         try {
           await issueComments.createReply({
             owner,
             repo,
             issue_number: pr_number,
-            body: 'Review complete! Check the **AI Code Review** check run for results.',
+            body: replyBody,
           });
         } catch (err) {
           log('command.ack.reply_failed', {
