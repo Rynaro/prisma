@@ -126,6 +126,19 @@ export const RepoConfigSchema = z
      * Per spec § D2: extends the existing .github/review-bot.yml schema.
      */
     review_guidance: ReviewGuidanceSchema,
+    /**
+     * Optional mention alias. When set, `@<nickname>` in PR comments is treated
+     * as a mention of the bot in addition to the real bot login. Must be
+     * login-shaped (alphanumeric + hyphens, no leading hyphen, 1–39 chars).
+     * Absent → today's behavior unchanged (real login only).
+     * Per spec § Track 3: sibling of review_guidance.
+     */
+    nickname: z
+      .string()
+      .min(1)
+      .max(39)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9-]*$/)
+      .optional(),
   })
   .describe('Repo-local .github/review-bot.yml configuration');
 

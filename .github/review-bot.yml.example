@@ -95,3 +95,9 @@ repo_heuristics:
   tests: true
   migrations: true
   layering: true
+
+# Optional. Mention alias for the bot in PR comments. When set, `@<nickname>`
+# is treated as a mention of the bot in addition to the real bot login.
+# Must be login-shaped: alphanumeric and hyphens only, no leading hyphen,
+# 1–39 characters. Absent → only the real bot login is recognized.
+# nickname: ourbot

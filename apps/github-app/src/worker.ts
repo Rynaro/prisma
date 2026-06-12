@@ -296,7 +296,13 @@ const start = async (): Promise<void> => {
       // snapshot we don't yet know if it's a fork, so we use head_sha from
       // the payload (same-repo assumption). The orchestrator re-evaluates
       // this from the snapshot for context-file fetching (where fork matters).
-      const configRef = payload.head_sha;
+      // For comment/check_run jobs, head_sha may be absent until pulls.get
+      // is called (Track 6 worker dispatch). Fall back to 'HEAD' so the
+      // config loader uses the default branch ref.
+      const configRef =
+        'head_sha' in payload && typeof payload.head_sha === 'string' && payload.head_sha.length > 0
+          ? payload.head_sha
+          : 'HEAD';
 
       const { config, notes: configNotes } = await fetchRepoConfig(
         octokit,

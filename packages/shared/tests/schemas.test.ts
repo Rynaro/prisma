@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parseCommand, parseMentionCandidate, requiresWrite } from '../src/commands/parse.js';
 import {
   DEFAULT_REPO_CONFIG,
   JobPayloadSchema,
@@ -149,6 +150,85 @@ describe('@prisma-bot/shared schemas', () => {
       });
       expect(result.success).toBe(false);
     });
+
+    // --- T2: discriminated union variants ---
+
+    it('accepts a valid issue_comment.command variant', () => {
+      const commentPayload = {
+        idempotency_key: 'idem-comment-1',
+        installation_id: 1234,
+        repository_id: 9876,
+        pull_request_number: 42,
+        head_sha: '',
+        event_type: 'issue_comment.command' as const,
+        received_at: '2026-04-30T17:03:21Z',
+        comment_id: 9001,
+        commenter_login: 'alice',
+        commenter_association: 'COLLABORATOR',
+        mention_candidate: 'mybot',
+        command_raw: 'review',
+        owner: 'octocat',
+        repo: 'hello-world',
+      };
+      const result = JobPayloadSchema.safeParse(commentPayload);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.event_type).toBe('issue_comment.command');
+      }
+    });
+
+    it('rejects a comment variant missing command_raw with a path-specific issue', () => {
+      const commentPayload = {
+        idempotency_key: 'idem-comment-2',
+        installation_id: 1234,
+        repository_id: 9876,
+        pull_request_number: 42,
+        event_type: 'issue_comment.command' as const,
+        received_at: '2026-04-30T17:03:21Z',
+        comment_id: 9001,
+        commenter_login: 'alice',
+        commenter_association: 'COLLABORATOR',
+        mention_candidate: 'mybot',
+        // command_raw is missing
+      };
+      const result = JobPayloadSchema.safeParse(commentPayload);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const paths = result.error.issues.map((i) => i.path.join('.'));
+        expect(paths.some((p) => p.includes('command_raw'))).toBe(true);
+      }
+    });
+
+    it('accepts a valid check_run.rerequested variant', () => {
+      const checkRunPayload = {
+        idempotency_key: 'idem-cr-1',
+        installation_id: 1234,
+        repository_id: 9876,
+        pull_request_number: 42,
+        head_sha: 'c'.repeat(40),
+        event_type: 'check_run.rerequested' as const,
+        received_at: '2026-04-30T17:03:21Z',
+        check_run_id: 7777,
+        owner: 'octocat',
+        repo: 'hello-world',
+      };
+      const result = JobPayloadSchema.safeParse(checkRunPayload);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.event_type).toBe('check_run.rerequested');
+      }
+    });
+
+    it('PR variant is byte-identical to pre-union shape (regression)', () => {
+      // This is the exact existing payload used in other tests. It must still pass.
+      const result = JobPayloadSchema.safeParse(validJobPayload);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.idempotency_key).toBe(validJobPayload.idempotency_key);
+        expect(result.data.event_type).toBe('pull_request.opened');
+        expect(result.data.head_sha).toBe(validJobPayload.head_sha);
+      }
+    });
   });
 
   describe('RejectionLogEntry', () => {
@@ -272,6 +352,133 @@ describe('@prisma-bot/shared schemas', () => {
         custom_guidance: { unknown_key: 'nope' },
       });
       expect(result.success).toBe(false);
+    });
+  });
+
+  // --- T3: Nickname config ---
+
+  describe('RepoConfigSchema nickname key', () => {
+    it('accepts a valid login-shaped nickname', () => {
+      const result = RepoConfigSchema.safeParse({ nickname: 'reviewbot' });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.nickname).toBe('reviewbot');
+      }
+    });
+
+    it('accepts nickname with hyphens', () => {
+      const result = RepoConfigSchema.safeParse({ nickname: 'my-review-bot' });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.nickname).toBe('my-review-bot');
+      }
+    });
+
+    it('config WITHOUT nickname has undefined nickname and DEFAULT_REPO_CONFIG is unchanged', () => {
+      const result = RepoConfigSchema.safeParse({});
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.nickname).toBeUndefined();
+      }
+      // DEFAULT_REPO_CONFIG regression guard
+      expect(DEFAULT_REPO_CONFIG.nickname).toBeUndefined();
+    });
+
+    it('rejects nickname with spaces (invalid login shape)', () => {
+      const result = RepoConfigSchema.safeParse({ nickname: 'has spaces' });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects nickname starting with a hyphen', () => {
+      const result = RepoConfigSchema.safeParse({ nickname: '-bad' });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects nickname exceeding 39 chars', () => {
+      const tooLong = 'a'.repeat(40);
+      const result = RepoConfigSchema.safeParse({ nickname: tooLong });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects empty string nickname', () => {
+      const result = RepoConfigSchema.safeParse({ nickname: '' });
+      expect(result.success).toBe(false);
+    });
+  });
+});
+
+// --- T4: Command parser ---
+
+describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)', () => {
+  describe('parseMentionCandidate', () => {
+    it.each([
+      ['@reviewbot full review please', 'reviewbot', 'full review please'],
+      ['@reviewbot   REVIEW', 'reviewbot', 'REVIEW'],
+      ['@bot help', 'bot', 'help'],
+      ['@bot', 'bot', ''],
+      ['  @mybot config', 'mybot', 'config'],
+    ])('parses "%s" → candidate=%s, rest=%s', (body, candidate, rest) => {
+      const result = parseMentionCandidate(body);
+      expect(result).not.toBeNull();
+      expect(result?.candidate).toBe(candidate);
+      expect(result?.rest).toBe(rest);
+    });
+
+    it.each([
+      ['LGTM, ship it!'],
+      ['nice work!'],
+      ['// @bot review'], // mid-comment (not at start)
+      ['```\n@bot review\n```'], // code fence (first char is backtick, not @)
+      [''],
+    ])('returns null for "%s" (no mention at start)', (body) => {
+      expect(parseMentionCandidate(body)).toBeNull();
+    });
+
+    it('only inspects the first line (mid-body mention ignored)', () => {
+      const body = 'LGTM\n@bot review';
+      expect(parseMentionCandidate(body)).toBeNull();
+    });
+  });
+
+  describe('parseCommand', () => {
+    it.each([
+      ['review', 'review'],
+      ['REVIEW', 'review'],
+      ['  review  ', 'review'],
+      ['full review', 'full_review'],
+      ['Full Review', 'full_review'],
+      ['help', 'help'],
+      ['HELP', 'help'],
+      ['configuration', 'configuration'],
+      ['config', 'configuration'],
+      ['Config', 'configuration'],
+    ])('parses "%s" → kind=%s', (rest, kind) => {
+      const cmd = parseCommand(rest);
+      expect(cmd.kind).toBe(kind);
+    });
+
+    it.each([['frobnicate'], [''], ['unknown command']])(
+      'parses unknown "%s" → help with unknown:true',
+      (rest) => {
+        const cmd = parseCommand(rest);
+        expect(cmd.kind).toBe('help');
+        expect((cmd as { unknown?: boolean }).unknown).toBe(true);
+      },
+    );
+
+    it('help without unknown flag for explicit "help"', () => {
+      const cmd = parseCommand('help');
+      expect(cmd.kind).toBe('help');
+      expect((cmd as { unknown?: boolean }).unknown).toBe(false);
+    });
+  });
+
+  describe('requiresWrite', () => {
+    it('returns false for all v1 commands', () => {
+      expect(requiresWrite({ kind: 'review' })).toBe(false);
+      expect(requiresWrite({ kind: 'full_review' })).toBe(false);
+      expect(requiresWrite({ kind: 'help', unknown: false })).toBe(false);
+      expect(requiresWrite({ kind: 'configuration' })).toBe(false);
     });
   });
 });

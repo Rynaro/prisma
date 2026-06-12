@@ -27,7 +27,12 @@ const REPO_ID: RepoIdentity = {
 
 const repoLookup: RepoLookup = async () => REPO_ID;
 
-const makePayload = (over: Partial<JobPayload> = {}): JobPayload => ({
+type PrJobPayload = Extract<
+  JobPayload,
+  { event_type: 'pull_request.opened' | 'pull_request.synchronize' | 'pull_request.reopened' }
+>;
+
+const makePayload = (over: Partial<PrJobPayload> = {}): PrJobPayload => ({
   idempotency_key: 'idemp-1',
   installation_id: 100,
   repository_id: 200,
