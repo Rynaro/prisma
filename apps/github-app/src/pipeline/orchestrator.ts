@@ -191,6 +191,24 @@ export interface OversizedDetail {
 }
 
 /**
+ * Detail carried when the pipeline terminated due to a non-transient provider
+ * error. Mirrors the `ProviderError` kind so callers can compose user-visible
+ * messages that distinguish auth vs. capability failures without inspecting
+ * log events.
+ */
+export interface ReviewUnavailableDetail {
+  /** Which provider error kind caused the unavailability. */
+  provider_error_kind: 'auth' | 'capability';
+  /**
+   * The safe, redaction-scrubbed message from `err.value.message`. Present when
+   * the provider error carries a non-empty message; absent otherwise. The message
+   * originates from the provider adapter's `safeMessage` mapping and is safe to
+   * surface to operators (no credential, no raw HTTP body).
+   */
+  message?: string;
+}
+
+/**
  * Discriminated outcome union surfaced by `runPipeline`. Callers use this to
  * compose user-visible messages that reflect what actually happened, rather than
  * treating every succeeded result as a completed review.
@@ -202,6 +220,8 @@ export interface OversizedDetail {
  * - `'no_findings'`      — provider was called but no analyzable files remained
  *   after prefilter (e.g. pure-delete or all-generated diff). Review ran clean.
  * - `'review_unavailable'` — non-transient provider error (auth / capability).
+ *   `detail` carries the provider_error_kind and the safe message so callers
+ *   can compose specific, actionable replies instead of a generic failure.
  * - `'malformed_provider_output'` — provider output failed schema validation;
  *   job terminated cleanly without retry.
  */
@@ -209,7 +229,7 @@ export type PipelineOutcome =
   | { kind: 'review_complete' }
   | { kind: 'oversized'; detail: OversizedDetail }
   | { kind: 'no_findings' }
-  | { kind: 'review_unavailable' }
+  | { kind: 'review_unavailable'; detail: ReviewUnavailableDetail }
   | { kind: 'malformed_provider_output' };
 
 export interface OrchestratorResult {
@@ -222,8 +242,15 @@ export interface OrchestratorResult {
   /**
    * Discriminated outcome that lets callers distinguish pipeline paths without
    * inspecting log events. Absent only on `failed_terminal` states where the
-   * outcome is implicitly `review_unavailable` (the provider threw and the job
-   * will be retried by the consumer). Always present on `succeeded`.
+   * pipeline did not return a result (re-threw). Always present on `succeeded`.
+   * For `review_unavailable` the outcome carries a `detail` field with the
+   * provider error kind and the safe message so the worker catch block can post
+   * a specific reply without re-inspecting the thrown error.
+   *
+   * NOTE: The auth/capability branch in the provider catch re-throws after
+   * publishing. The outcome is therefore NOT readable from a return value by
+   * the outer caller — it is instead inspected in the worker's inner catch
+   * via `err instanceof ProviderErrorThrowable` (see item 5 of the spec).
    */
   outcome?: PipelineOutcome;
 }
@@ -535,7 +562,20 @@ export const runPipeline = async (
   } catch (err) {
     if (err instanceof ProviderErrorThrowable) {
       const kind = err.value.kind;
-      logger.emit('provider.error', { ...trace, kind, provider: deps.provider.name });
+      // Log the safe message and retryable flag so operators can distinguish
+      // e.g. `context_length_exceeded` from `model_not_found`. The message
+      // originates from the provider adapter's `safeMessage` mapping and has
+      // already been redaction-scrubbed (per docs/observability.md § Provider
+      // error logging). `retryable` is optional on all ProviderError variants
+      // (ProviderErrorSchema § ProviderErrorBase); include it when present.
+      const providerErrorLogFields: Record<string, unknown> = {
+        ...trace,
+        kind,
+        provider: deps.provider.name,
+        message: err.value.message,
+        ...(err.value.retryable !== undefined ? { retryable: err.value.retryable } : {}),
+      };
+      logger.emit('provider.error', providerErrorLogFields);
       if (kind === 'schema_validation') {
         // Drop with audit log; never downgrade.
         // Per `publication-policy.md` § Malformed ProviderReviewOutput we
@@ -580,6 +620,21 @@ export const runPipeline = async (
         // Non-transient: publish a "review unavailable" summary so the user
         // sees a status, then re-throw so the consumer marks terminal.
         // Per `publication-policy.md` § Provider error (non-transient).
+        //
+        // Build a check-run notice that:
+        //   - explains the failure category (auth vs capability) in plain English;
+        //   - cites the safe message inline where available so operators can act;
+        //   - for capability, explicitly states this is NOT a PR-size limit
+        //     (per the real-world incident: tiny PR → model rejection → looked
+        //      identical to the oversized path to the operator).
+        // err.value.message is always non-empty (required by ProviderErrorSchema).
+        // It originates from the provider adapter's safeMessage mapping and has
+        // been redaction-scrubbed before being stored on the error value.
+        const safeMsg = err.value.message;
+        const providerNotice =
+          kind === 'capability'
+            ? `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the model setting in \`.github/review-bot.yml\` (or the provider's model env var). This is not a PR-size limit.`
+            : `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key.`;
         try {
           await publishSummaryOnly({
             payload,
@@ -594,6 +649,7 @@ export const runPipeline = async (
                 : 'review unavailable: provider capability missing',
             rejections: [],
             resolvedHeadSha: deps.resolvedHeadSha,
+            notice: providerNotice,
           });
           logger.emit('publisher.published', {
             ...trace,
