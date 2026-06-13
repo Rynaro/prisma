@@ -520,7 +520,60 @@ const start = async (): Promise<void> => {
 
       return { state: 'discarded_idempotent' };
     } catch (err) {
-      // Post friendly error reply (fail-open).
+      // Post a reply that accurately reflects the failure reason (fail-open).
+      //
+      // For ProviderErrorThrowable with kind === 'auth' or 'capability', post a
+      // specific, operator-actionable reply instead of the generic error message.
+      // This ensures exactly ONE clear reply for provider errors: the orchestrator
+      // already published the check-run notice; this reply adds the comment-level
+      // signal pointing the operator at the root cause.
+      //
+      // For capability: make it explicit that this is NOT a PR-size limit so the
+      // operator doesn't conflate it with the oversized path (the real-world
+      // incident that prompted this change: tiny PR → model rejection → looked
+      // identical to oversized).
+      //
+      // Still re-throw ProviderErrorThrowable afterward so the consumer can mark
+      // the job failed_terminal (terminal classification is done in the consumer
+      // wrapper, not here).
+      if (err instanceof ProviderErrorThrowable) {
+        const { kind } = err.value;
+        if (kind === 'capability' || kind === 'auth') {
+          // err.value.message is always non-empty (required by ProviderErrorSchema).
+          const safeMsg = err.value.message;
+          let providerReply: string;
+          if (kind === 'capability') {
+            providerReply = `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the \`model\` setting in \`.github/review-bot.yml\` (or the provider's model env var). This is **not** a PR-size limit — the check run shows the same notice.`;
+          } else {
+            providerReply = `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key. The **AI Code Review** check run shows the same notice.`;
+          }
+          try {
+            await issueComments.createReply({
+              owner,
+              repo,
+              issue_number: pr_number,
+              body: providerReply,
+            });
+          } catch {
+            // fail-open
+          }
+          throw err;
+        }
+        // Other provider error kinds (transport, rate_limited): post the generic
+        // message and re-throw for retry classification by the consumer.
+        try {
+          await issueComments.createReply({
+            owner,
+            repo,
+            issue_number: pr_number,
+            body: 'Sorry, I encountered an error while processing your request. Please try again later.',
+          });
+        } catch {
+          // fail-open
+        }
+        throw err;
+      }
+      // Non-provider errors: post generic message and log.
       try {
         await issueComments.createReply({
           owner,
@@ -531,7 +584,6 @@ const start = async (): Promise<void> => {
       } catch {
         // fail-open
       }
-      if (err instanceof ProviderErrorThrowable) throw err;
       log('command.dispatch_error', {
         idempotency_key: payload.idempotency_key,
         message: err instanceof Error ? err.message : 'unknown',

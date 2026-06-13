@@ -483,6 +483,109 @@ describe('runPipeline', () => {
     expect(spy.checksCreate).toHaveLength(1);
   });
 
+  it('auth error: provider.error log includes message field', async () => {
+    // The message comes from the provider adapter's safeMessage and must appear
+    // in the provider.error log event so operators can distinguish failure causes.
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: { kind: 'auth', message: 'invalid api key' },
+        },
+      ],
+    });
+    const logger = buildLogger();
+    const spy = buildOctokitSpy();
+    await expect(
+      runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, logger })),
+    ).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    const errorEvent = logger.events.find((e) => e.event === 'provider.error');
+    expect(errorEvent).toBeDefined();
+    expect(errorEvent?.fields.kind).toBe('auth');
+    expect(errorEvent?.fields.message).toBe('invalid api key');
+  });
+
+  it('capability error: provider.error log includes message field', async () => {
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: { kind: 'capability', message: 'model_not_found' },
+        },
+      ],
+    });
+    const logger = buildLogger();
+    const spy = buildOctokitSpy();
+    await expect(
+      runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, logger })),
+    ).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    const errorEvent = logger.events.find((e) => e.event === 'provider.error');
+    expect(errorEvent).toBeDefined();
+    expect(errorEvent?.fields.kind).toBe('capability');
+    expect(errorEvent?.fields.message).toBe('model_not_found');
+  });
+
+  it('capability error: notice passed to runPublish contains model-pointer text and NOT-size-limit text', async () => {
+    // Per spec: the capability notice must make clear this is a provider/model
+    // rejection, NOT a size limit, and point at the model config.
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: { kind: 'capability', message: 'model_not_found' },
+        },
+      ],
+    });
+    const capturedNotices: Array<string | undefined> = [];
+    const spy = buildOctokitSpy();
+    const deps = buildDeps({ provider, octokitSpy: spy });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+    await expect(runPipeline(makePayload(), deps)).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    expect(capturedNotices).toHaveLength(1);
+    const notice = capturedNotices[0];
+    expect(notice).toBeDefined();
+    expect(notice).toMatch(/capability/);
+    expect(notice).toMatch(/model_not_found/);
+    expect(notice).toMatch(/review-bot\.yml/);
+    expect(notice).toMatch(/not a PR-size limit/i);
+  });
+
+  it('auth error: notice passed to runPublish contains credentials text', async () => {
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: { kind: 'auth', message: 'invalid api key' },
+        },
+      ],
+    });
+    const capturedNotices: Array<string | undefined> = [];
+    const spy = buildOctokitSpy();
+    const deps = buildDeps({ provider, octokitSpy: spy });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+    await expect(runPipeline(makePayload(), deps)).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    expect(capturedNotices).toHaveLength(1);
+    const notice = capturedNotices[0];
+    expect(notice).toBeDefined();
+    expect(notice).toMatch(/authentication failure/i);
+    expect(notice).toMatch(/invalid api key/);
+    expect(notice).toMatch(/API key/i);
+  });
+
   it('validator rejects all findings (out-of-diff) -> publishes summary listing rejections', async () => {
     const provider = new FakeProvider({
       script: [

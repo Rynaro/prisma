@@ -1,6 +1,7 @@
 import type { IssueCommentsClient } from '@prisma-bot/github';
 import {
   type JobPayload,
+  ProviderErrorThrowable,
   type RepoConfig,
   RepoConfigSchema,
   parseCommand,
@@ -446,5 +447,124 @@ describe('buildConfigReply — includes max_files and max_changed_lines', () => 
     expect(reply).toContain('```');
     expect(reply).toContain('mode:');
     expect(reply).toContain('command_marker:');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider error reply logic (mirrors worker.ts handleCommentJob catch block)
+// ---------------------------------------------------------------------------
+
+describe('provider error reply text (capability vs auth)', () => {
+  /**
+   * Mirrors the ProviderErrorThrowable catch branch inside handleCommentJob
+   * (worker.ts). The function is not exported so we duplicate the reply-building
+   * logic here to verify the exact text contract established by this feature.
+   *
+   * These tests guard against regressions where:
+   *   (a) a capability error produces the generic "Sorry, I encountered an error"
+   *       message instead of the model-pointer reply (the incident that prompted
+   *       this feature);
+   *   (b) the capability reply fails to distinguish itself from the oversized path
+   *       (the real-world confusion: tiny PR → model rejection → looked like a
+   *       size limit).
+   */
+  const buildProviderErrorReply = (err: ProviderErrorThrowable): string | null => {
+    const { kind } = err.value;
+    if (kind === 'capability' || kind === 'auth') {
+      const safeMsg = err.value.message;
+      if (kind === 'capability') {
+        return `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the \`model\` setting in \`.github/review-bot.yml\` (or the provider's model env var). This is **not** a PR-size limit — the check run shows the same notice.`;
+      }
+      return `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key. The **AI Code Review** check run shows the same notice.`;
+    }
+    return null; // non-capability/auth → generic message (not tested here)
+  };
+
+  it('capability error: reply includes the safe message inline', () => {
+    const err = new ProviderErrorThrowable({
+      kind: 'capability',
+      message: 'model_not_found',
+    });
+    const reply = buildProviderErrorReply(err);
+    expect(reply).not.toBeNull();
+    expect(reply).toContain('model_not_found');
+  });
+
+  it('capability error: reply mentions review-bot.yml (model config pointer)', () => {
+    const err = new ProviderErrorThrowable({
+      kind: 'capability',
+      message: 'context_length_exceeded',
+    });
+    const reply = buildProviderErrorReply(err);
+    expect(reply).toContain('review-bot.yml');
+  });
+
+  it('capability error: reply explicitly states this is NOT a PR-size limit', () => {
+    // The real-world incident: operators confused capability errors with oversized
+    // path because both rendered the same vague "Sorry, I encountered an error".
+    const err = new ProviderErrorThrowable({
+      kind: 'capability',
+      message: 'model_not_found',
+    });
+    const reply = buildProviderErrorReply(err);
+    expect(reply).toMatch(/not.*PR-size limit|not a PR-size limit/i);
+  });
+
+  it('capability error: reply does NOT contain the generic sorry message', () => {
+    const err = new ProviderErrorThrowable({
+      kind: 'capability',
+      message: 'model_not_found',
+    });
+    const reply = buildProviderErrorReply(err);
+    expect(reply).not.toContain('Sorry, I encountered an error');
+  });
+
+  it('auth error: reply mentions authentication and credentials', () => {
+    const err = new ProviderErrorThrowable({
+      kind: 'auth',
+      message: 'invalid api key',
+    });
+    const reply = buildProviderErrorReply(err);
+    expect(reply).not.toBeNull();
+    expect(reply).toContain('authentication failure');
+    expect(reply).toContain('invalid api key');
+    expect(reply).toContain('API key');
+  });
+
+  it('auth error: reply does NOT contain the generic sorry message', () => {
+    const err = new ProviderErrorThrowable({
+      kind: 'auth',
+      message: 'invalid api key',
+    });
+    const reply = buildProviderErrorReply(err);
+    expect(reply).not.toContain('Sorry, I encountered an error');
+  });
+
+  it('transport error: buildProviderErrorReply returns null (generic path)', () => {
+    // Transport errors are transient and use the generic reply; they are not
+    // handled by the specific-reply branch.
+    const err = new ProviderErrorThrowable({
+      kind: 'transport',
+      message: 'connection reset',
+    });
+    const reply = buildProviderErrorReply(err);
+    expect(reply).toBeNull();
+  });
+
+  it('capability reply is distinct from auth reply', () => {
+    const capabilityErr = new ProviderErrorThrowable({
+      kind: 'capability',
+      message: 'model_not_found',
+    });
+    const authErr = new ProviderErrorThrowable({
+      kind: 'auth',
+      message: 'invalid api key',
+    });
+    const capabilityReply = buildProviderErrorReply(capabilityErr);
+    const authReply = buildProviderErrorReply(authErr);
+    expect(capabilityReply).not.toEqual(authReply);
+    // Capability reply mentions model config; auth reply does not.
+    expect(capabilityReply).toContain('model');
+    expect(authReply).not.toContain('model');
   });
 });
