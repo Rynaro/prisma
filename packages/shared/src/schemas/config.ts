@@ -71,6 +71,44 @@ const CategoriesEnabledSchema = z
   .default(['security', 'correctness', 'performance', 'tests', 'style', 'migration', 'dependency']);
 
 /**
+ * `chunking` configures the diff-chunking subsystem introduced in v0.7.0.
+ *
+ * When a PR is too large for a single provider call but within the chunkable
+ * ceiling, the pipeline batches prefiltered files across multiple provider
+ * calls, merges the findings, and runs the existing validator→ranker→publisher
+ * chain once. Per docs/config-spec.md § chunking.
+ *
+ * Defaults:
+ *   enabled                   true
+ *   max_files                 200   (chunkable ceiling; above → oversized skip)
+ *   max_changed_lines        12000  (chunkable ceiling; above → oversized skip)
+ *   max_provider_calls_per_pr    6  (cost guard; exceeding → oversized skip)
+ *   call_token_budget        60000  (per-call input token budget; greedy bin-pack)
+ *
+ * The existing top-level `max_files` (default 50) / `max_changed_lines`
+ * (default 2000) remain the SINGLE-CALL threshold. Between the two sets of
+ * limits → chunked review. Above `chunking.max_*` → oversized skip.
+ */
+export const ChunkingSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    max_files: z.number().int().positive().default(200),
+    max_changed_lines: z.number().int().positive().default(12000),
+    max_provider_calls_per_pr: z.number().int().positive().default(6),
+    call_token_budget: z.number().int().positive().default(60000),
+  })
+  .strict()
+  .default({
+    enabled: true,
+    max_files: 200,
+    max_changed_lines: 12000,
+    max_provider_calls_per_pr: 6,
+    call_token_budget: 60000,
+  });
+
+export type ChunkingConfig = z.infer<typeof ChunkingSchema>;
+
+/**
  * `language_overrides` is a map from a language tag to an object whose shape is a
  * subset of this top-level configuration (config-spec.md § language_overrides).
  * For Phase 5.1 we accept any subset of the public top-level keys; the validator
@@ -150,6 +188,12 @@ export const RepoConfigSchema = z
      * Per spec § configurable-command-marker.
      */
     command_marker: z.enum(['@', '$', '!', '/']).default('@'),
+    /**
+     * Diff-chunking configuration. Controls whether and how large PRs are
+     * batched across multiple provider calls.
+     * Per docs/config-spec.md § chunking.
+     */
+    chunking: ChunkingSchema,
   })
   .describe('Repo-local .github/review-bot.yml configuration');
 

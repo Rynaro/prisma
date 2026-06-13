@@ -88,9 +88,32 @@ The policy is **drop with audit log**, never downgrade. Partially valid provider
 
 ### Diff too large
 
-When the prefilter detects that the PR exceeds `max_files` or `max_changed_lines` (defined in `config-spec.md` § `max_files` and § `max_changed_lines`), the prefilter short-circuits before any provider call. No `ProviderReviewOutput` is requested.
+When the prefilter detects that the PR exceeds `max_files` or `max_changed_lines` (defined in `config-spec.md` § `max_files` and § `max_changed_lines`) AND also exceeds the chunkable ceiling (`chunking.max_files` / `chunking.max_changed_lines`, or `chunking.enabled = false`), the prefilter short-circuits before any provider call. No `ProviderReviewOutput` is requested.
 
 The publisher emits **summary-only output regardless of the configured `mode`**. The summary states which limit was hit (`max_files` or `max_changed_lines` or both) and lists the affected paths in aggregate (no per-finding inline comments, no per-finding rendering — there are no findings). No inline comments are created even if the configured `mode` is `summary-plus-inline`.
+
+The same oversized path applies when greedy bin-packing would need more provider calls than `chunking.max_provider_calls_per_pr`. The Checks summary states the required call count and the current cap value.
+
+### Diff too large — chunked review
+
+When the prefilter detects that the PR exceeds `max_files` / `max_changed_lines` but fits within the chunkable ceiling (`chunking.max_files` / `chunking.max_changed_lines`) and `chunking.enabled = true`, the pipeline performs a chunked review:
+
+1. Files are sorted by path (deterministic order) and packed into batches using a greedy algorithm bounded by `chunking.call_token_budget` per batch.
+2. Each batch is sent as an independent provider call.
+3. All batch findings are merged into a single `ProviderReviewOutput` **before** the validator runs.
+4. The existing validator → ranker → publisher chain runs once on the merged findings.
+
+The result is a `review_complete_chunked` pipeline outcome. The Checks summary includes a preamble notice: "Reviewed in N section(s) (large PR)." Dedupe, ranking, and per-PR caps apply to the full merged finding set — not per batch.
+
+### Partial review
+
+When some (but not all) batches in a chunked review return a `schema_validation` error, those batches are dropped and the review continues with the remaining findings. The outcome is still `review_complete_chunked` and the Checks summary preamble is extended with: "M of N section(s) could not be analyzed and were skipped."
+
+If all batches fail `schema_validation`, the pipeline routes to the existing `malformed_provider_output` path — no partial summary is published.
+
+Files whose individual token estimate exceeds the hard safety cap (≈110,000 tokens) are excluded from all batches. If any files are skipped for this reason, the Checks summary preamble includes: "K file(s) were too large to analyze individually and were skipped."
+
+`auth` and `capability` errors in any batch abort the entire chunked review and route to `review_unavailable`. `transport` and `rate_limit` errors abort the loop and re-throw so the BullMQ job is retried from scratch (partial-publish-then-retry would cause double-publication).
 
 ### Provider error (non-transient)
 

@@ -1,7 +1,9 @@
 import {
   type AugmentationCaps,
+  type BatcherSkippedFile,
   type SnapshotterOctokitLike,
   fetchPrSnapshot,
+  planBatches,
   resolveAugmentation,
   runPrefilter,
   runRanker,
@@ -91,7 +93,11 @@ export type LogEvent =
   | 'ranker.dropped'
   | 'publisher.published'
   | 'publisher.dropped'
-  | 'job.terminal';
+  | 'job.terminal'
+  | 'chunking.planned'
+  | 'provider.batch.called'
+  | 'provider.batch.output'
+  | 'provider.batch.error';
 
 export interface PipelineLogger {
   emit(event: LogEvent, fields: Record<string, unknown>): void;
@@ -209,24 +215,48 @@ export interface ReviewUnavailableDetail {
 }
 
 /**
+ * Detail carried when a chunked review completes (all or some batches).
+ * Exported from the pipeline index so callers (worker, tests) can reference
+ * the type directly without importing the orchestrator module.
+ */
+export interface ReviewCompleteChunkedDetail {
+  /** Total number of batches planned. */
+  batch_count: number;
+  /**
+   * Indices of batches that returned `schema_validation` and whose findings
+   * were dropped. When empty the review is complete; when non-empty it is a
+   * partial review.
+   */
+  failed_batches: number[];
+  /**
+   * Files excluded from all batches because their individual token estimate
+   * exceeded the hard safety cap (≈110,000 tokens).
+   */
+  skipped_files: BatcherSkippedFile[];
+}
+
+/**
  * Discriminated outcome union surfaced by `runPipeline`. Callers use this to
  * compose user-visible messages that reflect what actually happened, rather than
  * treating every succeeded result as a completed review.
  *
- * - `'review_complete'`  — provider was called; findings (if any) were ranked
- *   and published. "Review complete!" is appropriate.
- * - `'oversized'`        — prefilter short-circuited; `oversized_detail` carries
- *   the specifics (reason, counts, limits). PR was not reviewed.
- * - `'no_findings'`      — provider was called but no analyzable files remained
- *   after prefilter (e.g. pure-delete or all-generated diff). Review ran clean.
- * - `'review_unavailable'` — non-transient provider error (auth / capability).
- *   `detail` carries the provider_error_kind and the safe message so callers
- *   can compose specific, actionable replies instead of a generic failure.
+ * - `'review_complete'`          — provider was called; findings (if any) were
+ *   ranked and published. "Review complete!" is appropriate.
+ * - `'review_complete_chunked'`  — PR was reviewed in multiple provider calls
+ *   (diff chunking). `detail` carries batch_count, failed_batches, and any
+ *   files skipped for size.
+ * - `'oversized'`                — prefilter short-circuited; `oversized_detail`
+ *   carries the specifics (reason, counts, limits). PR was not reviewed.
+ * - `'no_findings'`              — provider was called but no analyzable files
+ *   remained after prefilter (e.g. pure-delete or all-generated diff).
+ * - `'review_unavailable'`       — non-transient provider error (auth /
+ *   capability). `detail` carries the provider_error_kind and the safe message.
  * - `'malformed_provider_output'` — provider output failed schema validation;
  *   job terminated cleanly without retry.
  */
 export type PipelineOutcome =
   | { kind: 'review_complete' }
+  | { kind: 'review_complete_chunked'; detail: ReviewCompleteChunkedDetail }
   | { kind: 'oversized'; detail: OversizedDetail }
   | { kind: 'no_findings' }
   | { kind: 'review_unavailable'; detail: ReviewUnavailableDetail }
@@ -466,10 +496,16 @@ export const runPipeline = async (
     };
   }
 
+  // Determine the working file set and whether chunking is in play.
+  // Both 'accepted' and 'chunkable' carry `files`; we unify the downstream
+  // augmentation + provider + validator path over a single `activeFiles`.
+  const isChunkable = prefilter.kind === 'chunkable';
+
   logger.emit('prefilter.accepted', {
     ...trace,
     files: prefilter.files.length,
     skipped: prefilter.skipped.length,
+    chunkable: isChunkable,
   });
 
   if (prefilter.files.length === 0) {
@@ -552,6 +588,311 @@ export const runPipeline = async (
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Helper: handle a non-transient provider error (auth/capability).
+  // Publishes a review_unavailable summary and re-throws so the consumer
+  // marks the job terminal. Reused in both the single-call and batch paths.
+  // -------------------------------------------------------------------------
+  const handleAuthCapabilityError = async (err: ProviderErrorThrowable): Promise<never> => {
+    const kind = err.value.kind as 'auth' | 'capability';
+    const safeMsg = err.value.message;
+    const providerNotice =
+      kind === 'capability'
+        ? `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the model setting in \`.github/review-bot.yml\` (or the provider's model env var). This is not a PR-size limit.`
+        : `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key.`;
+    try {
+      await publishSummaryOnly({
+        payload,
+        identity,
+        octokit,
+        cfg: deps.config,
+        hooks,
+        reason: 'review_unavailable',
+        reasonMessage:
+          kind === 'auth'
+            ? 'review unavailable: provider authentication failure'
+            : 'review unavailable: provider capability missing',
+        rejections: [],
+        resolvedHeadSha: deps.resolvedHeadSha,
+        notice: providerNotice,
+      });
+      logger.emit('publisher.published', {
+        ...trace,
+        mode: 'summary-only',
+        reason: 'review_unavailable',
+        provider_error_kind: kind,
+      });
+    } catch (publishErr) {
+      // Best-effort publish; if it also fails, fall through and let the
+      // outer caller record the terminal failure.
+      logger.emit('publisher.dropped', {
+        ...trace,
+        reason: 'publish_failed_during_provider_error',
+        provider_error_kind: kind,
+        message: publishErr instanceof Error ? publishErr.message : 'unknown publish error',
+      });
+    }
+    logger.emit('job.terminal', { ...trace, state: 'failed_terminal', reason: kind });
+    throw err;
+  };
+
+  // -------------------------------------------------------------------------
+  // Chunked path: plan batches and call provider once per batch.
+  // -------------------------------------------------------------------------
+  if (isChunkable) {
+    const chunking = deps.config.chunking;
+    const batchPlan = planBatches(prefilter.files, {
+      callTokenBudget: chunking.call_token_budget,
+      maxCalls: chunking.max_provider_calls_per_pr,
+    });
+
+    if (batchPlan.overCap) {
+      // More batches would be needed than `max_provider_calls_per_pr` allows.
+      // Treat as oversized so the operator sees a clear remediation hint.
+      logger.emit('prefilter.skipped', {
+        ...trace,
+        reason: 'too_many_batches',
+        batch_count_needed: batchPlan.batches.length,
+        max_calls: chunking.max_provider_calls_per_pr,
+      });
+      const oversizedNotice = `⚠️ Review skipped — this PR is too large to review even in sections (would need ${batchPlan.batches.length} provider calls; cap is \`chunking.max_provider_calls_per_pr=${chunking.max_provider_calls_per_pr}\`). Split the PR or raise \`chunking.max_provider_calls_per_pr\` in \`.github/review-bot.yml\`.`;
+      const oversizedDetail: OversizedDetail = {
+        prefilter_reason:
+          prefilter.lines_considered > deps.config.max_changed_lines
+            ? 'too_many_changed_lines'
+            : 'too_many_files',
+        files_considered: prefilter.files_considered,
+        lines_considered: prefilter.lines_considered,
+        max_files: deps.config.max_files,
+        max_changed_lines: deps.config.max_changed_lines,
+      };
+      const publication = await publishSummaryOnly({
+        payload,
+        identity,
+        octokit,
+        cfg: deps.config,
+        hooks,
+        reason: 'oversized',
+        reasonMessage: `chunking overCap: would need ${batchPlan.batches.length} calls`,
+        rejections: [],
+        resolvedHeadSha: deps.resolvedHeadSha,
+        notice: oversizedNotice,
+      });
+      logger.emit('publisher.published', {
+        ...trace,
+        mode: 'summary-only',
+        reason: 'oversized',
+        inline_count: publication.published_inline.length,
+        summary_count: publication.published_summary.length,
+      });
+      logger.emit('job.terminal', { ...trace, state: 'succeeded' });
+      return {
+        state: 'succeeded',
+        publication,
+        rejections: publication.rejections,
+        outcome: { kind: 'oversized', detail: oversizedDetail },
+      };
+    }
+
+    // Plan is within the cap. Emit an observability event before starting.
+    logger.emit('chunking.planned', {
+      ...trace,
+      batch_count: batchPlan.batches.length,
+      est_total_tokens: batchPlan.estTotalTokens,
+      skipped_files: batchPlan.skippedFiles.length,
+    });
+
+    // Loop over batches, accumulating findings and recording which failed.
+    const allFindings: ProviderReviewOutput['findings'] = [];
+    const failedBatches: number[] = [];
+
+    for (let batchIdx = 0; batchIdx < batchPlan.batches.length; batchIdx++) {
+      const batch = batchPlan.batches[batchIdx];
+      if (batch === undefined) continue;
+
+      const batchInput = buildProviderInput(batch, deps.config, resolvedGuidance);
+      logger.emit('provider.batch.called', {
+        ...trace,
+        batch_index: batchIdx,
+        batch_count: batchPlan.batches.length,
+        files_in_batch: batch.length,
+        provider: deps.provider.name,
+      });
+
+      try {
+        const batchOutput = await deps.provider.review(batchInput);
+        logger.emit('provider.batch.output', {
+          ...trace,
+          batch_index: batchIdx,
+          batch_count: batchPlan.batches.length,
+          findings_count: batchOutput.findings.length,
+        });
+        allFindings.push(...batchOutput.findings);
+      } catch (batchErr) {
+        if (batchErr instanceof ProviderErrorThrowable) {
+          const kind = batchErr.value.kind;
+          logger.emit('provider.batch.error', {
+            ...trace,
+            batch_index: batchIdx,
+            batch_count: batchPlan.batches.length,
+            kind,
+            provider: deps.provider.name,
+            message: batchErr.value.message,
+          });
+          if (kind === 'schema_validation') {
+            // Partial failure: drop this batch's findings, continue.
+            // The merged output will be marked partial in the notice.
+            failedBatches.push(batchIdx);
+            continue;
+          }
+          if (kind === 'auth' || kind === 'capability') {
+            // Non-transient: abort and publish review_unavailable (same as
+            // single-call path). Re-throws — does not return.
+            await handleAuthCapabilityError(batchErr);
+          }
+          // transport / rate_limit / retryable: abort and re-throw so
+          // BullMQ retries the whole job (all batches). Partial-publish-
+          // then-retry would double-publish; preserving today's retry
+          // semantics is safer.
+          throw batchErr;
+        }
+        // Unknown error: re-throw for consumer retry classification.
+        logger.emit('provider.error', {
+          ...trace,
+          kind: 'unknown',
+          batch_index: batchIdx,
+          message: batchErr instanceof Error ? batchErr.message : 'unknown',
+        });
+        throw batchErr;
+      }
+    }
+
+    // All batches attempted. If ALL failed schema_validation → malformed path.
+    if (failedBatches.length === batchPlan.batches.length) {
+      const rejection: RejectionLogEntry = {
+        finding_id: null,
+        stage: 'validator',
+        reason_code: 'provider_output_zod_failed',
+        reason_message: 'all batches returned malformed output',
+        provider_output_excerpt: '',
+        timestamp: now(),
+      };
+      const publication = await publishSummaryOnly({
+        payload,
+        identity,
+        octokit,
+        cfg: deps.config,
+        hooks,
+        reason: 'malformed_provider_output',
+        reasonMessage: 'review unavailable: all batches returned malformed output',
+        rejections: [rejection],
+        resolvedHeadSha: deps.resolvedHeadSha,
+      });
+      logger.emit('publisher.published', {
+        ...trace,
+        mode: 'summary-only',
+        reason: 'malformed_provider_output',
+        inline_count: publication.published_inline.length,
+        summary_count: publication.published_summary.length,
+      });
+      logger.emit('job.terminal', { ...trace, state: 'succeeded' });
+      return {
+        state: 'succeeded',
+        publication,
+        rejections: [rejection, ...publication.rejections],
+        outcome: { kind: 'malformed_provider_output' },
+      };
+    }
+
+    // Merge all successful batch findings → ONE ProviderReviewOutput before
+    // the validator so dedupe, ranking, and caps apply to the full PR.
+    // Per scout-report Seam 4: the dedupe key is (path, normalized-message)
+    // and is batch-agnostic — merging before the validator gives cross-batch
+    // dedup for free.
+    const mergedProviderOutput: ProviderReviewOutput = { findings: allFindings };
+
+    // Build a notice describing the chunked run. Prepended to the check-run
+    // summary via the existing v0.7.0 `notice` param (does NOT alter the
+    // plan partition invariant).
+    const partialNote =
+      failedBatches.length > 0
+        ? ` — ${failedBatches.length} of ${batchPlan.batches.length} sections could not be analyzed and were skipped.`
+        : '';
+    const skippedFileNote =
+      batchPlan.skippedFiles.length > 0
+        ? ` ${batchPlan.skippedFiles.length} file(s) skipped (too large to analyze): ${batchPlan.skippedFiles.map((f) => f.path).join(', ')}.`
+        : '';
+    const chunkedNotice = `Reviewed in ${batchPlan.batches.length} section(s) (large PR).${partialNote}${skippedFileNote}`;
+
+    // Feed the merged output into the EXISTING validator → ranker → publisher
+    // tail. This is unchanged — dedupe and caps apply to the whole PR.
+    const validatorResultChunked = runValidator(mergedProviderOutput, {
+      snapshot,
+      config: deps.config,
+      run_id: payload.idempotency_key,
+      ran_at: now(),
+      ...(deps.generateId !== undefined ? { generateId: deps.generateId } : {}),
+    });
+    if (validatorResultChunked.rejections.length > 0) {
+      logger.emit('validator.rejected', {
+        ...trace,
+        count: validatorResultChunked.rejections.length,
+        rejections: validatorResultChunked.rejections.map((r) => ({
+          finding_id: r.finding_id,
+          stage: r.stage,
+          reason_code: r.reason_code,
+          reason_message: r.reason_message,
+          provider_output_excerpt: r.provider_output_excerpt,
+          timestamp: r.timestamp,
+        })),
+      });
+    }
+
+    const rankedChunked = runRanker(validatorResultChunked.findings);
+    const publishFnChunked = hooks.runPublish ?? defaultPublish;
+    const ctxChunked = buildPublishContext(payload, identity, deps.resolvedHeadSha);
+    const publisherDepsChunked = publisherDepsFor(octokit);
+    const publicationChunked = await publishFnChunked(
+      rankedChunked,
+      deps.config,
+      ctxChunked,
+      publisherDepsChunked,
+      deps.roundIntent ?? 'incremental',
+      chunkedNotice,
+    );
+
+    if (publicationChunked.dropped.length > 0) {
+      logger.emit('publisher.dropped', { ...trace, count: publicationChunked.dropped.length });
+    }
+    logger.emit('publisher.published', {
+      ...trace,
+      mode: deps.config.mode,
+      inline_count: publicationChunked.published_inline.length,
+      summary_count: publicationChunked.published_summary.length,
+      batch_count: batchPlan.batches.length,
+      failed_batches: failedBatches.length,
+    });
+    logger.emit('job.terminal', { ...trace, state: 'succeeded' });
+
+    const chunkedDetail: ReviewCompleteChunkedDetail = {
+      batch_count: batchPlan.batches.length,
+      failed_batches: failedBatches,
+      skipped_files: batchPlan.skippedFiles,
+    };
+
+    return {
+      state: 'succeeded',
+      publication: publicationChunked,
+      rejections: [...validatorResultChunked.rejections, ...publicationChunked.rejections],
+      ...(allNotes.length > 0 ? { config_notes: allNotes } : {}),
+      outcome: { kind: 'review_complete_chunked', detail: chunkedDetail },
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Single-call path (prefilter.kind === 'accepted').
+  // -------------------------------------------------------------------------
+
   // Stage: provider.
   const providerInput = buildProviderInput(prefilter.files, deps.config, resolvedGuidance);
   logger.emit('provider.called', { ...trace, provider: deps.provider.name });
@@ -619,55 +960,7 @@ export const runPipeline = async (
       if (kind === 'auth' || kind === 'capability') {
         // Non-transient: publish a "review unavailable" summary so the user
         // sees a status, then re-throw so the consumer marks terminal.
-        // Per `publication-policy.md` § Provider error (non-transient).
-        //
-        // Build a check-run notice that:
-        //   - explains the failure category (auth vs capability) in plain English;
-        //   - cites the safe message inline where available so operators can act;
-        //   - for capability, explicitly states this is NOT a PR-size limit
-        //     (per the real-world incident: tiny PR → model rejection → looked
-        //      identical to the oversized path to the operator).
-        // err.value.message is always non-empty (required by ProviderErrorSchema).
-        // It originates from the provider adapter's safeMessage mapping and has
-        // been redaction-scrubbed before being stored on the error value.
-        const safeMsg = err.value.message;
-        const providerNotice =
-          kind === 'capability'
-            ? `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the model setting in \`.github/review-bot.yml\` (or the provider's model env var). This is not a PR-size limit.`
-            : `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key.`;
-        try {
-          await publishSummaryOnly({
-            payload,
-            identity,
-            octokit,
-            cfg: deps.config,
-            hooks,
-            reason: 'review_unavailable',
-            reasonMessage:
-              kind === 'auth'
-                ? 'review unavailable: provider authentication failure'
-                : 'review unavailable: provider capability missing',
-            rejections: [],
-            resolvedHeadSha: deps.resolvedHeadSha,
-            notice: providerNotice,
-          });
-          logger.emit('publisher.published', {
-            ...trace,
-            mode: 'summary-only',
-            reason: 'review_unavailable',
-            provider_error_kind: kind,
-          });
-        } catch (publishErr) {
-          // Best-effort publish; if it also fails, fall through and let the
-          // outer caller record the terminal failure.
-          logger.emit('publisher.dropped', {
-            ...trace,
-            reason: 'publish_failed_during_provider_error',
-            provider_error_kind: kind,
-            message: publishErr instanceof Error ? publishErr.message : 'unknown publish error',
-          });
-        }
-        logger.emit('job.terminal', { ...trace, state: 'failed_terminal', reason: kind });
+        await handleAuthCapabilityError(err);
       }
       throw err;
     }

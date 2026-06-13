@@ -398,6 +398,15 @@ describe('buildConfigReply — includes max_files and max_changed_lines', () => 
     lines.push(`command_marker: "${config.command_marker}"`);
     lines.push(`max_files: ${config.max_files}`);
     lines.push(`max_changed_lines: ${config.max_changed_lines}`);
+    // Chunking settings block (mirrors worker.ts buildConfigReply).
+    lines.push(
+      'chunking:',
+      `  enabled: ${String(config.chunking.enabled)}`,
+      `  max_files: ${config.chunking.max_files}`,
+      `  max_changed_lines: ${config.chunking.max_changed_lines}`,
+      `  max_provider_calls_per_pr: ${config.chunking.max_provider_calls_per_pr}`,
+      `  call_token_budget: ${config.chunking.call_token_budget}`,
+    );
     lines.push(
       'repo_heuristics:',
       `  security: ${String(config.repo_heuristics.security)}`,
@@ -566,5 +575,152 @@ describe('provider error reply text (capability vs auth)', () => {
     // Capability reply mentions model config; auth reply does not.
     expect(capabilityReply).toContain('model');
     expect(authReply).not.toContain('model');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildConfigReply — chunking section
+// ---------------------------------------------------------------------------
+
+describe('buildConfigReply — chunking section', () => {
+  /**
+   * Same local mirror as the block above, extended with chunking fields.
+   * Guards the contract that operators can see chunking settings via the
+   * `configuration` command (docs/config-spec.md § chunking).
+   */
+  const buildConfigReply = (config: RepoConfig): string => {
+    const lines: string[] = ['### Effective repo configuration\n', '```yaml'];
+    lines.push(`mode: ${config.mode}`);
+    if (config.model !== undefined) lines.push(`model: ${config.model}`);
+    if (config.nickname !== undefined) lines.push(`nickname: ${config.nickname}`);
+    lines.push(`command_marker: "${config.command_marker}"`);
+    lines.push(`max_files: ${config.max_files}`);
+    lines.push(`max_changed_lines: ${config.max_changed_lines}`);
+    lines.push(
+      'chunking:',
+      `  enabled: ${String(config.chunking.enabled)}`,
+      `  max_files: ${config.chunking.max_files}`,
+      `  max_changed_lines: ${config.chunking.max_changed_lines}`,
+      `  max_provider_calls_per_pr: ${config.chunking.max_provider_calls_per_pr}`,
+      `  call_token_budget: ${config.chunking.call_token_budget}`,
+    );
+    lines.push('```');
+    return lines.join('\n');
+  };
+
+  const defaultConfig = (): RepoConfig => RepoConfigSchema.parse({});
+
+  it('includes chunking block with default enabled: true', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('chunking:');
+    expect(reply).toContain('enabled: true');
+  });
+
+  it('includes chunking.max_files default (200)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('max_files: 200');
+  });
+
+  it('includes chunking.max_changed_lines default (12000)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('max_changed_lines: 12000');
+  });
+
+  it('includes chunking.max_provider_calls_per_pr default (6)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('max_provider_calls_per_pr: 6');
+  });
+
+  it('includes chunking.call_token_budget default (60000)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('call_token_budget: 60000');
+  });
+
+  it('reflects chunking disabled when set in config', () => {
+    const config = RepoConfigSchema.parse({
+      chunking: {
+        enabled: false,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 60000,
+      },
+    });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('enabled: false');
+  });
+
+  it('reflects custom max_provider_calls_per_pr when overridden', () => {
+    const config = RepoConfigSchema.parse({
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 3,
+        call_token_budget: 60000,
+      },
+    });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('max_provider_calls_per_pr: 3');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chunked review reply text
+// ---------------------------------------------------------------------------
+
+describe('chunked review reply text', () => {
+  /**
+   * Mirrors the `review_complete_chunked` reply branch inside
+   * `handleCommentJob` in `worker.ts`. The function is not exported so we
+   * duplicate the reply-building logic here to verify the exact text contract.
+   */
+  const buildChunkedReply = (detail: {
+    batch_count: number;
+    failed_batches: number[];
+    skipped_files: Array<{ path: string; est_tokens: number }>;
+  }): string => {
+    const baseLine = `Reviewed your large PR in ${detail.batch_count} section(s).`;
+    const partialNote =
+      detail.failed_batches.length > 0
+        ? ` ${detail.failed_batches.length} of ${detail.batch_count} section(s) could not be analyzed and were skipped.`
+        : '';
+    const skippedFileNote =
+      detail.skipped_files.length > 0
+        ? ` ${detail.skipped_files.length} file(s) were too large to analyze individually and were skipped.`
+        : '';
+    return `${baseLine}${partialNote}${skippedFileNote} Check the **AI Code Review** check run for results.`;
+  };
+
+  it('full success reply mentions batch count', () => {
+    const reply = buildChunkedReply({ batch_count: 3, failed_batches: [], skipped_files: [] });
+    expect(reply).toContain('3 section(s)');
+    expect(reply).toContain('AI Code Review');
+    expect(reply).not.toContain('could not be analyzed');
+    expect(reply).not.toContain('skipped');
+  });
+
+  it('partial review reply mentions failed batches', () => {
+    const reply = buildChunkedReply({ batch_count: 3, failed_batches: [1], skipped_files: [] });
+    expect(reply).toContain('1 of 3 section(s) could not be analyzed');
+  });
+
+  it('skipped-file reply mentions count of skipped files', () => {
+    const reply = buildChunkedReply({
+      batch_count: 2,
+      failed_batches: [],
+      skipped_files: [{ path: 'src/huge.ts', est_tokens: 150_000 }],
+    });
+    expect(reply).toContain('1 file(s) were too large');
+  });
+
+  it('partial + skipped combined: both notes appear', () => {
+    const reply = buildChunkedReply({
+      batch_count: 4,
+      failed_batches: [0, 2],
+      skipped_files: [{ path: 'a.ts', est_tokens: 200_000 }],
+    });
+    expect(reply).toContain('2 of 4 section(s) could not be analyzed');
+    expect(reply).toContain('1 file(s) were too large');
   });
 });

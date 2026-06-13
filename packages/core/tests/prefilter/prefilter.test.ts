@@ -153,10 +153,33 @@ describe('runPrefilter', () => {
     }
   });
 
-  it('reports oversized too_many_files when kept files exceed max_files', () => {
+  it('reports chunkable (not oversized) when kept files exceed max_files but fit chunking ceiling', () => {
+    // With default chunking.max_files=200, 5 files that exceed max_files=2 are chunkable.
     const files = Array.from({ length: 5 }, (_, i) => file({ path: `src/f${i}.ts` }));
     const snapshot = baseSnapshot(files);
     const config = withConfig({ max_files: 2 });
+    const result = runPrefilter({ snapshot, config });
+    expect(result.kind).toBe('chunkable');
+    if (result.kind === 'chunkable') {
+      expect(result.files_considered).toBe(5);
+      expect(result.files).toHaveLength(5);
+    }
+  });
+
+  it('reports oversized too_many_files when kept files exceed BOTH max_files and chunking.max_files', () => {
+    const files = Array.from({ length: 5 }, (_, i) => file({ path: `src/f${i}.ts` }));
+    const snapshot = baseSnapshot(files);
+    // Set chunking ceiling below the kept count
+    const config = withConfig({
+      max_files: 2,
+      chunking: {
+        enabled: true,
+        max_files: 3,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 60000,
+      },
+    });
     const result = runPrefilter({ snapshot, config });
     expect(result.kind).toBe('oversized');
     if (result.kind === 'oversized') {
@@ -165,15 +188,45 @@ describe('runPrefilter', () => {
     }
   });
 
-  it('reports oversized too_many_changed_lines when sum exceeds max_changed_lines', () => {
+  it('reports chunkable (not oversized) when lines exceed max_changed_lines but fit chunking ceiling', () => {
+    // 1500 + 600 = 2100 lines > 1000 (max_changed_lines) but < 12000 (chunking.max_changed_lines)
     const snapshot = baseSnapshot([file({ path: 'src/big.ts', additions: 1500, deletions: 600 })]);
+    const config = withConfig({ max_files: 50, max_changed_lines: 1000 });
+    const result = runPrefilter({ snapshot, config });
+    expect(result.kind).toBe('chunkable');
+    if (result.kind === 'chunkable') {
+      expect(result.lines_considered).toBe(2100);
+      expect(result.files).toHaveLength(1);
+    }
+  });
+
+  it('reports oversized too_many_changed_lines when lines exceed BOTH limits', () => {
+    // 15000 lines > 1000 (max_changed_lines) and > 12000 (chunking.max_changed_lines)
+    const snapshot = baseSnapshot([file({ path: 'src/big.ts', additions: 9000, deletions: 6000 })]);
     const config = withConfig({ max_files: 50, max_changed_lines: 1000 });
     const result = runPrefilter({ snapshot, config });
     expect(result.kind).toBe('oversized');
     if (result.kind === 'oversized') {
       expect(result.reason).toBe('too_many_changed_lines');
-      expect(result.lines_considered).toBe(2100);
+      expect(result.lines_considered).toBe(15000);
     }
+  });
+
+  it('reports oversized when chunking is disabled even if within chunking ceiling', () => {
+    const files = Array.from({ length: 5 }, (_, i) => file({ path: `src/f${i}.ts` }));
+    const snapshot = baseSnapshot(files);
+    const config = withConfig({
+      max_files: 2,
+      chunking: {
+        enabled: false,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 60000,
+      },
+    });
+    const result = runPrefilter({ snapshot, config });
+    expect(result.kind).toBe('oversized');
   });
 
   it('invokes hunkContent resolver and lands its return value into Hunk.content', () => {
