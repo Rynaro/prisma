@@ -299,6 +299,86 @@ describe('@prisma-bot/shared schemas', () => {
     });
   });
 
+  describe('chunking config schema', () => {
+    it('DEFAULT_REPO_CONFIG.chunking has correct defaults', () => {
+      expect(DEFAULT_REPO_CONFIG.chunking).toBeDefined();
+      expect(DEFAULT_REPO_CONFIG.chunking.enabled).toBe(true);
+      expect(DEFAULT_REPO_CONFIG.chunking.max_files).toBe(200);
+      expect(DEFAULT_REPO_CONFIG.chunking.max_changed_lines).toBe(12000);
+      expect(DEFAULT_REPO_CONFIG.chunking.max_provider_calls_per_pr).toBe(6);
+      expect(DEFAULT_REPO_CONFIG.chunking.call_token_budget).toBe(60000);
+    });
+
+    it('accepts a chunking block with all fields set', () => {
+      const result = RepoConfigSchema.safeParse({
+        chunking: {
+          enabled: false,
+          max_files: 100,
+          max_changed_lines: 5000,
+          max_provider_calls_per_pr: 3,
+          call_token_budget: 30000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.chunking.enabled).toBe(false);
+        expect(result.data.chunking.max_files).toBe(100);
+        expect(result.data.chunking.max_changed_lines).toBe(5000);
+        expect(result.data.chunking.max_provider_calls_per_pr).toBe(3);
+        expect(result.data.chunking.call_token_budget).toBe(30000);
+      }
+    });
+
+    it('rejects a non-positive max_files in chunking', () => {
+      const result = RepoConfigSchema.safeParse({
+        chunking: {
+          enabled: true,
+          max_files: 0,
+          max_changed_lines: 12000,
+          max_provider_calls_per_pr: 6,
+          call_token_budget: 60000,
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a non-positive call_token_budget', () => {
+      const result = RepoConfigSchema.safeParse({
+        chunking: {
+          enabled: true,
+          max_files: 200,
+          max_changed_lines: 12000,
+          max_provider_calls_per_pr: 6,
+          call_token_budget: -1,
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects unknown keys in chunking block (strict)', () => {
+      const result = RepoConfigSchema.safeParse({
+        chunking: {
+          enabled: true,
+          max_files: 200,
+          max_changed_lines: 12000,
+          max_provider_calls_per_pr: 6,
+          call_token_budget: 60000,
+          unknown_key: 'nope',
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('absent chunking block fills all defaults', () => {
+      const result = RepoConfigSchema.safeParse({});
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.chunking.enabled).toBe(true);
+        expect(result.data.chunking.max_provider_calls_per_pr).toBe(6);
+      }
+    });
+  });
+
   describe('ReviewGuidance schema', () => {
     it('accepts an empty object and applies defaults', () => {
       const result = ReviewGuidanceSchema.safeParse({});

@@ -8,6 +8,7 @@ export type {
   PipelineOutcome,
   RepoIdentity,
   RepoLookup,
+  ReviewCompleteChunkedDetail,
   ReviewUnavailableDetail,
   SnapshotterCall,
 } from './orchestrator.js';

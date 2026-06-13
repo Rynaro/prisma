@@ -1,0 +1,124 @@
+id: chunked-pr
+name: "PR above single-call limit splits into multiple batches (chunked review)"
+description: >-
+  The PR contains 3 changed files, which exceeds the configured single-call
+  max_files limit (2) but fits within the chunking ceiling (200 files). With a
+  tiny call_token_budget (5 tokens), each file's hunk line-span estimate (~4
+  tokens) causes the greedy bin-packer to place each file in its own batch,
+  producing 3 provider calls. Findings from all batches are merged before the
+  validator → ranker → publisher tail. Exercises the chunkable arm of the
+  prefilter and the chunked review path in the orchestrator.
+
+config_overrides:
+  mode: summary-plus-inline
+  max_files: 2
+  max_changed_lines: 50
+  chunking:
+    enabled: true
+    call_token_budget: 5
+    max_files: 200
+    max_changed_lines: 12000
+    max_provider_calls_per_pr: 6
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
+  pull_request:
+    number: 77
+    head:
+      sha: "cccccccccccccccccccccccccccccccccccccccc"
+
+octokit_responses:
+  pulls_get:
+    number: 77
+    head:
+      sha: "cccccccccccccccccccccccccccccccccccccccc"
+      ref: feature/chunked-pr
+    base:
+      sha: "dddddddddddddddddddddddddddddddddddddddd"
+      ref: main
+  pulls_list_files:
+    - filename: src/chunked-a.ts
+      status: modified
+      additions: 3
+      deletions: 1
+      patch: "@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n const d = 4;\n"
+    - filename: src/chunked-b.ts
+      status: modified
+      additions: 3
+      deletions: 1
+      patch: "@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n const d = 4;\n"
+    - filename: src/chunked-c.ts
+      status: modified
+      additions: 3
+      deletions: 1
+      patch: "@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n const d = 4;\n"
+
+# The batcher sorts files by path and places each in its own batch because
+# each file's line-span token estimate (~4 tokens) plus the running batch
+# total (also ~4) exceeds call_token_budget (5). The FakeProvider consumes
+# one script step per provider.review() call, so three steps cover three
+# batches: batch-0 (chunked-a), batch-1 (chunked-b), batch-2 (chunked-c).
+provider_script:
+  - kind: output
+    output:
+      findings:
+        - path: src/chunked-a.ts
+          line: 2
+          severity: medium
+          category: tests
+          message: "Missing test coverage for new constant in chunked-a"
+          rationale: "The new constant b is not covered by any test."
+          confidence: 0.8
+  - kind: output
+    output:
+      findings:
+        - path: src/chunked-b.ts
+          line: 2
+          severity: medium
+          category: tests
+          message: "Missing test coverage for new constant in chunked-b"
+          rationale: "The new constant b is not covered by any test."
+          confidence: 0.8
+  - kind: output
+    output:
+      findings:
+        - path: src/chunked-c.ts
+          line: 2
+          severity: medium
+          category: tests
+          message: "Missing test coverage for new constant in chunked-c"
+          rationale: "The new constant b is not covered by any test."
+          confidence: 0.8
+
+expectations:
+  prefilter:
+    outcome: chunkable
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 3
+  provider:
+    calls: 3
+  validator:
+    findings: 3
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 3
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: ["tests"]
+    rejection_reasons: []
+
+metrics:
+  - large_diff_degradation

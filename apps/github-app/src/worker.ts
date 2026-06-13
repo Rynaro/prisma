@@ -295,6 +295,16 @@ const buildConfigReply = (config: RepoConfig): string => {
   // (config-spec.md § max_files / § max_changed_lines).
   lines.push(`max_files: ${config.max_files}`);
   lines.push(`max_changed_lines: ${config.max_changed_lines}`);
+  // Chunking settings: always shown so operators can diagnose large-PR behavior.
+  // Per docs/config-spec.md § chunking.
+  lines.push(
+    'chunking:',
+    `  enabled: ${String(config.chunking.enabled)}`,
+    `  max_files: ${config.chunking.max_files}`,
+    `  max_changed_lines: ${config.chunking.max_changed_lines}`,
+    `  max_provider_calls_per_pr: ${config.chunking.max_provider_calls_per_pr}`,
+    `  call_token_budget: ${config.chunking.call_token_budget}`,
+  );
   lines.push(
     'repo_heuristics:',
     `  security: ${String(config.repo_heuristics.security)}`,
@@ -480,6 +490,18 @@ const start = async (): Promise<void> => {
               ? `${detail.lines_considered.toLocaleString('en-US')} changed lines across ${detail.files_considered} files (limit: \`max_changed_lines=${detail.max_changed_lines}\`, \`max_files=${detail.max_files}\`)`
               : `${detail.files_considered} files (limit: \`max_files=${detail.max_files}\`, \`max_changed_lines=${detail.max_changed_lines}\`)`;
           replyBody = `Review skipped — this PR exceeds the configured size limit: ${limitClause}. Raise the limits in \`.github/review-bot.yml\` or split the PR. The **AI Code Review** check run shows the same notice.`;
+        } else if (result.outcome?.kind === 'review_complete_chunked') {
+          const { detail } = result.outcome;
+          const baseLine = `Reviewed your large PR in ${detail.batch_count} section(s).`;
+          const partialNote =
+            detail.failed_batches.length > 0
+              ? ` ${detail.failed_batches.length} of ${detail.batch_count} section(s) could not be analyzed and were skipped.`
+              : '';
+          const skippedFileNote =
+            detail.skipped_files.length > 0
+              ? ` ${detail.skipped_files.length} file(s) were too large to analyze individually and were skipped.`
+              : '';
+          replyBody = `${baseLine}${partialNote}${skippedFileNote} Check the **AI Code Review** check run for results.`;
         } else if (result.outcome?.kind === 'no_findings') {
           replyBody =
             'Review complete — no issues found. Check the **AI Code Review** check run for the full summary.';

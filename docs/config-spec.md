@@ -240,6 +240,83 @@ Controls which prefix character must appear before the bot login in PR comments 
 
 **Note on `$`.** GitHub renders `$...$` pairs as inline math (LaTeX) in Markdown. A lone `$josie` at the start of a line (no closing `$` on the same line) is rendered as plain text — this is the common usage pattern and is safe. Operators choosing `$` should ensure command comments do not accidentally form a closed `$...$` pair on the first line.
 
+### chunking
+
+Controls the diff-chunking subsystem. When a PR is too large for a single
+provider call but within the chunkable ceiling, the pipeline batches
+prefiltered files across multiple provider calls, merges the findings, then
+runs the existing validator→ranker→publisher chain once.
+
+**Cost implication.** Chunking can multiply provider API costs by up to
+`max_provider_calls_per_pr` for very large PRs. Set `enabled: false` or reduce
+`max_provider_calls_per_pr` if cost is a concern.
+
+The existing top-level `max_files` (default 50) / `max_changed_lines` (default
+2000) remain the **single-call** threshold. A PR between those limits and the
+chunking ceiling gets a chunked review. Above the chunking ceiling →
+`oversized` skip.
+
+#### chunking.enabled
+
+- **Type.** Boolean.
+- **Required.** Optional.
+- **Default.** `true`.
+- **Validation rule.** Must be a boolean.
+- **Example.** `enabled: false`
+
+When `false`, the chunked-review path is disabled. PRs above `max_files` /
+`max_changed_lines` are hard-skipped as `oversized` (today's behavior).
+
+#### chunking.max_files
+
+- **Type.** Integer, positive.
+- **Required.** Optional.
+- **Default.** `200`.
+- **Validation rule.** Must be a positive integer.
+- **Example.** `max_files: 150`
+
+The chunkable ceiling for kept-file count. A PR with more files than this value
+is hard-skipped as `oversized` even if chunking is enabled.
+
+#### chunking.max_changed_lines
+
+- **Type.** Integer, positive.
+- **Required.** Optional.
+- **Default.** `12000`.
+- **Validation rule.** Must be a positive integer.
+- **Example.** `max_changed_lines: 8000`
+
+The chunkable ceiling for total changed lines. A PR with more changed lines
+than this value is hard-skipped as `oversized` even if chunking is enabled.
+
+#### chunking.max_provider_calls_per_pr
+
+- **Type.** Integer, positive.
+- **Required.** Optional.
+- **Default.** `6`.
+- **Validation rule.** Must be a positive integer.
+- **Example.** `max_provider_calls_per_pr: 3`
+
+Cost guard: the maximum number of provider API calls allowed for a single PR
+review. If greedy bin-packing would need more batches than this cap, the PR is
+skipped as `oversized` with a notice explaining the batch count. Reduce this
+value to bound cost; raise it to enable review of very large PRs.
+
+#### chunking.call_token_budget
+
+- **Type.** Integer, positive.
+- **Required.** Optional.
+- **Default.** `60000`.
+- **Validation rule.** Must be a positive integer.
+- **Example.** `call_token_budget: 40000`
+
+Per-call input token budget for greedy bin-packing. Files are accumulated into
+a batch until the next file would push the batch's estimated token count over
+this value, then a new batch is opened. A single file whose estimate exceeds
+this value is sent in its own batch (the model's real context window may still
+accept it). A file whose estimate exceeds the hard safety cap (≈110,000 tokens)
+is excluded from all batches and surfaced in a notice.
+
 ## Precedence matrix
 
 The following table declares how filtering keys interact. Rows are the filtering key in question; the cell describes its resolution rule against the named other key. "Applies first" means evaluated before; "applies last" means evaluated after.
@@ -306,6 +383,13 @@ repo_heuristics:
 nickname: prbot
 # Optional: use '$' instead of '@' to avoid GitHub's @-autocomplete.
 command_marker: "@"
+# Optional: diff-chunking controls (see § chunking for cost implications).
+chunking:
+  enabled: true
+  max_files: 200
+  max_changed_lines: 12000
+  max_provider_calls_per_pr: 6
+  call_token_budget: 60000
 ```
 
 ## Failure modes

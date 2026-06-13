@@ -2,17 +2,21 @@ id: oversized-pr
 name: "PR exceeds max_files"
 description: >-
   The PR contains 6 changed files, one above the configured max_files cap
-  (5). The prefilter short-circuits with reason `too_many_files`; the
-  orchestrator publishes summary-only output regardless of the configured
-  `summary-plus-inline` mode (per docs/publication-policy.md § Diff too
-  large) and the provider is never called. Exercises the oversized arm of
-  large_diff_degradation. The 6-file changed-file payload lives in
-  `oversized-pr/files.json` (referenced via `from_file`).
+  (5). With chunking disabled, the prefilter short-circuits with reason
+  `too_many_files`; the orchestrator publishes summary-only output regardless
+  of the configured `summary-plus-inline` mode (per docs/publication-policy.md
+  § Diff too large) and the provider is never called. Exercises the oversized
+  arm of large_diff_degradation with chunking disabled, proving that
+  exceeding max_files still hard-skips (too_many_files). The 6-file
+  changed-file payload lives in `oversized-pr/files.json` (referenced via
+  `from_file`).
 
 config_overrides:
   mode: summary-plus-inline
   max_files: 5
   max_changed_lines: 200
+  chunking:
+    enabled: false
 
 pr_payload:
   action: opened

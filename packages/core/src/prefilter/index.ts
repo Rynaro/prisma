@@ -49,6 +49,25 @@ export type PrefilterOutcome =
       skipped: PrefilterSkipped[];
     }
   | {
+      /**
+       * `chunkable` — the kept file set exceeds the single-call limits
+       * (`max_files`/`max_changed_lines`) but fits within the chunking
+       * ceiling (`chunking.max_files`/`chunking.max_changed_lines`).
+       *
+       * Carries the full `PrefilteredFile[]` (unlike `oversized`, which
+       * discards them) so the orchestrator can hand the set to the batcher
+       * for greedy bin-packing. Dedupe, ranking, and publication happen
+       * ONCE over the merged batch findings — not per batch.
+       *
+       * Per docs/config-spec.md § chunking and docs/_planning/diff-chunking/.
+       */
+      kind: 'chunkable';
+      files: PrefilteredFile[];
+      files_considered: number;
+      lines_considered: number;
+      skipped: PrefilterSkipped[];
+    }
+  | {
       kind: 'oversized';
       reason: 'too_many_files' | 'too_many_changed_lines';
       files_considered: number;
@@ -273,25 +292,45 @@ export const runPrefilter = (opts: PrefilterOptions): PrefilterOutcome => {
 
   const lines_considered = kept.reduce((sum, f) => sum + f.additions + f.deletions, 0);
 
-  if (kept.length > config.max_files) {
-    return {
-      kind: 'oversized',
-      reason: 'too_many_files',
-      files_considered: kept.length,
-      lines_considered,
-      skipped,
-    };
+  // Single-call tier: within max_files / max_changed_lines → accepted (unchanged).
+  if (kept.length <= config.max_files && lines_considered <= config.max_changed_lines) {
+    const files = kept.map((f) => toPrefilteredFile(f, opts.hunkContent));
+    return { kind: 'accepted', files, skipped };
   }
-  if (lines_considered > config.max_changed_lines) {
+
+  // Determine the chunkable ceiling from config. If chunking is disabled,
+  // these are effectively irrelevant — we fall through to oversized below.
+  const chunking = config.chunking;
+  const chunkMaxFiles = chunking.max_files;
+  const chunkMaxLines = chunking.max_changed_lines;
+
+  // Chunkable tier: between single-call limits and chunking ceiling.
+  // Build PrefilteredFile[] here (unlike oversized which discards them)
+  // so the orchestrator can hand them to the batcher. Only reachable when
+  // chunking is enabled; when disabled skip straight to oversized.
+  if (chunking.enabled && kept.length <= chunkMaxFiles && lines_considered <= chunkMaxLines) {
+    const files = kept.map((f) => toPrefilteredFile(f, opts.hunkContent));
     return {
-      kind: 'oversized',
-      reason: 'too_many_changed_lines',
+      kind: 'chunkable',
+      files,
       files_considered: kept.length,
       lines_considered,
       skipped,
     };
   }
 
-  const files = kept.map((f) => toPrefilteredFile(f, opts.hunkContent));
-  return { kind: 'accepted', files, skipped };
+  // Oversized tier: above chunking ceiling (or chunking disabled and above
+  // single-call limits). Determine which limit was exceeded — prefer the
+  // files check so the reason matches the first exceeded limit.
+  const oversizedReason: 'too_many_files' | 'too_many_changed_lines' =
+    kept.length > (chunking.enabled ? chunkMaxFiles : config.max_files)
+      ? 'too_many_files'
+      : 'too_many_changed_lines';
+  return {
+    kind: 'oversized',
+    reason: oversizedReason,
+    files_considered: kept.length,
+    lines_considered,
+    skipped,
+  };
 };
