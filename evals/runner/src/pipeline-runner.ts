@@ -47,7 +47,7 @@ export interface RunOutcomeError {
 }
 
 export interface PrefilterMirror {
-  outcome: 'accepted' | 'oversized' | 'all-excluded';
+  outcome: 'accepted' | 'chunkable' | 'oversized' | 'all-excluded';
   skipped_paths: string[];
   skipped_reasons: string[];
   files_sent_to_provider: number;
@@ -178,6 +178,14 @@ const derivePrefilterOutcome = async (args: DerivePrefilterArgs): Promise<Prefil
       skipped_paths,
       skipped_reasons,
       files_sent_to_provider: 0,
+    };
+  }
+  if (prefilter.kind === 'chunkable') {
+    return {
+      outcome: 'chunkable',
+      skipped_paths,
+      skipped_reasons,
+      files_sent_to_provider: prefilter.files.length,
     };
   }
   return {

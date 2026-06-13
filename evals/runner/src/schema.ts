@@ -201,7 +201,7 @@ export type ProviderScriptStep = z.infer<typeof ProviderScriptStepSchema>;
 
 const PrefilterExpectationsSchema = z
   .object({
-    outcome: z.enum(['accepted', 'oversized', 'all-excluded']),
+    outcome: z.enum(['accepted', 'chunkable', 'oversized', 'all-excluded']),
     skipped_paths: z.array(z.string().min(1)).default([]),
     skipped_reasons: z.array(z.string().min(1)).default([]),
     files_sent_to_provider: z.number().int().nonnegative(),

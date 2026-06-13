@@ -47,3 +47,7 @@ scenarios:
     name: "Missing review guidance degrades gracefully (zero-config invariant)"
     fixture: fixtures/malformed-config-degrades.yaml
     tags: ["malformed_config_resilience", "false_positive_rate"]
+  - id: chunked-pr
+    name: "PR above single-call limit splits into multiple batches (chunked review)"
+    fixture: fixtures/chunked-pr.yaml
+    tags: ["large_diff_degradation"]
