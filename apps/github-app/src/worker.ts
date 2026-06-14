@@ -16,6 +16,7 @@ import {
   OpenAIProvider,
   type OpenAIProviderOptions,
   type TokenParamStyle,
+  type ToolChoiceStyle,
 } from '@prisma-bot/provider-openai';
 import {
   type JobPayload,
@@ -158,6 +159,18 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
       if (Number.isFinite(parsed) && parsed > 0) {
         opts.maxOutputTokens = parsed;
       }
+    }
+    // OPENAI_TOOL_CHOICE — optional override for the tool_choice parameter.
+    // `auto` (default) applies the heuristic: `'required'` for reasoning models
+    // (gpt-5*/o-series), forced-specific function object for classic models.
+    // `forced` always sends the forced-specific object (bypass heuristic for
+    // proxy gateways that reject `'required'`).
+    // `required` always sends `'required'` (bypass heuristic).
+    // Invalid values are silently ignored and fall back to `auto`.
+    // See deployment.md § Config and docs/model-compatibility.md for details.
+    const toolChoiceRaw = await tryGetSecret(secretSource, 'OPENAI_TOOL_CHOICE');
+    if (toolChoiceRaw === 'forced' || toolChoiceRaw === 'required' || toolChoiceRaw === 'auto') {
+      opts.toolChoiceStyle = toolChoiceRaw as ToolChoiceStyle;
     }
     log('worker.provider.selected', { provider: 'openai' });
     return new OpenAIProvider(opts);
@@ -580,8 +593,13 @@ const start = async (): Promise<void> => {
               : '';
           replyBody = `${baseLine}${partialNote}${skippedFileNote} Check the **AI Code Review** check run for results.`;
         } else if (result.outcome?.kind === 'no_findings') {
-          replyBody =
-            'Review complete — no issues found. Check the **AI Code Review** check run for the full summary.';
+          if (result.outcome.detail?.reasoning_model_empty === true) {
+            const modelName = result.outcome.detail.model;
+            replyBody = `Review produced no findings. The configured model (\`${modelName}\`) is a reasoning model and may be under-producing with this review flow. If you expected findings, try \`openai/gpt-4.1\`, or set \`OPENAI_TOOL_CHOICE=required\`. See \`docs/model-compatibility.md\`.`;
+          } else {
+            replyBody =
+              'Review complete — no issues found. Check the **AI Code Review** check run for the full summary.';
+          }
         } else {
           replyBody = 'Review complete! Check the **AI Code Review** check run for results.';
         }

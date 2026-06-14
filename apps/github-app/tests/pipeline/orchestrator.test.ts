@@ -18,6 +18,7 @@ import {
   type RepoLookup,
   runPipeline,
 } from '../../src/pipeline/index.js';
+import { type NoFindingsReasoningHint } from '../../src/pipeline/index.js';
 
 const REPO_ID: RepoIdentity = {
   owner: 'octocat',
@@ -1391,5 +1392,122 @@ describe('buildProviderInput: request_shaping threading through the orchestrator
       (n) => n.includes('names provider') && n.includes('but this deployment'),
     );
     expect(hasMismatchNote).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// no_findings + reasoning model hint (Change 2)
+// ---------------------------------------------------------------------------
+
+describe('runPipeline — no_findings reasoning model hint', () => {
+  // Helper: build a RepoConfig with the given model slug
+  const cfgWithModel = (model: string): RepoConfig =>
+    RepoConfigSchema.parse({ mode: 'summary-plus-inline', model });
+
+  it('no_findings + reasoning model (gpt-5.4-nano) + provider called -> hint emitted', async () => {
+    // Provider returns empty findings on a non-trivial diff.
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({
+        provider,
+        octokitSpy: spy,
+        config: cfgWithModel('openai/gpt-5.4-nano'),
+      }),
+    );
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('no_findings');
+    const outcome = result.outcome as { kind: 'no_findings'; detail?: NoFindingsReasoningHint };
+    expect(outcome.detail?.reasoning_model_empty).toBe(true);
+    expect(outcome.detail?.model).toBe('gpt-5.4-nano');
+  });
+
+  it('no_findings + reasoning model (o3) + provider called -> hint emitted', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({
+        provider,
+        octokitSpy: spy,
+        config: cfgWithModel('openai/o3'),
+      }),
+    );
+    expect(result.outcome?.kind).toBe('no_findings');
+    const outcome = result.outcome as { kind: 'no_findings'; detail?: NoFindingsReasoningHint };
+    expect(outcome.detail?.reasoning_model_empty).toBe(true);
+    expect(outcome.detail?.model).toBe('o3');
+  });
+
+  it('no_findings + classic model (gpt-4o) + provider called -> NO hint', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({
+        provider,
+        octokitSpy: spy,
+        config: cfgWithModel('openai/gpt-4o'),
+      }),
+    );
+    // When the provider returns findings (none here) and the model is classic,
+    // the pipeline proceeds to the validator/ranker/publisher path normally.
+    // Outcome is review_complete (no findings -> 0 published, still complete).
+    expect(result.state).toBe('succeeded');
+    // Classic model with 0 findings -> review_complete (not no_findings hint path)
+    expect(result.outcome?.kind).toBe('review_complete');
+  });
+
+  it('no_findings prefilter-excluded path (provider not called) -> NO hint, no detail', async () => {
+    // Use a snapshot with NO files (all filtered), so the orchestrator hits
+    // the prefilter.files.length === 0 branch and never calls the provider.
+    const emptySnapshot = buildSnapshot({ files: [], total_changed_lines: 0 });
+    const provider = new FakeProvider({ script: [] });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({
+        provider,
+        octokitSpy: spy,
+        snapshot: emptySnapshot,
+        config: cfgWithModel('openai/gpt-5.4-nano'),
+      }),
+    );
+    // Provider was NOT called
+    expect(provider.calls).toHaveLength(0);
+    // The outcome is no_findings but without the reasoning hint
+    expect(result.outcome?.kind).toBe('no_findings');
+    const outcome = result.outcome as { kind: 'no_findings'; detail?: NoFindingsReasoningHint };
+    expect(outcome.detail).toBeUndefined();
+  });
+
+  it('no_findings + reasoning model: outcome detail carries model name for worker notice', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+    const spy = buildOctokitSpy();
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({
+        provider,
+        octokitSpy: spy,
+        config: cfgWithModel('openai/gpt-5.4-nano'),
+      }),
+    );
+    // Outcome detail carries the model name so the worker can compose
+    // the model-aware reply without re-parsing config.
+    expect(result.outcome?.kind).toBe('no_findings');
+    const outcome = result.outcome as { kind: 'no_findings'; detail?: NoFindingsReasoningHint };
+    expect(outcome.detail?.model).toBe('gpt-5.4-nano');
+    // Check-run was still published (summary-only path).
+    expect(spy.checksCreate).toHaveLength(1);
+    expect(spy.checksUpdate).toHaveLength(1);
   });
 });

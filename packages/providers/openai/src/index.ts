@@ -5,6 +5,7 @@ import {
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputSchema,
+  isReasoningModel,
 } from '@prisma-bot/shared';
 import { type OpenAIChatCompletionsArgs, createOpenAIClient } from './client.js';
 import { mapOpenAIError } from './error-mapping.js';
@@ -32,26 +33,20 @@ import { buildPrompt } from './prompt.js';
 export type TokenParamStyle = 'auto' | 'max_tokens' | 'max_completion_tokens';
 
 /**
- * Regex that matches OpenAI model identifiers which require
- * `max_completion_tokens` instead of the classic `max_tokens` parameter.
+ * `resolveTokenParam` — pure helper that maps a model identifier + an optional
+ * operator override to the correct token-limit field name.
  *
- * Pattern rationale:
+ * The heuristic delegates to `isReasoningModel` from `@prisma-bot/shared`,
+ * which is the single source of truth for the reasoning-family classification
+ * (used also by `resolveToolChoice` and the orchestrator's `no_findings` hint).
+ *
+ * Pattern covered by `isReasoningModel`:
  *   - `o[1-9]`        — o-series reasoning models: o1, o3, o4, …
  *   - `gpt-[5-9]`     — gpt-5, gpt-6, … (gpt-5.4-nano matches on the `5`)
  *   - `gpt-\d{2,}`    — gpt-10, gpt-11, … (future two-digit major versions)
  *
- * Classic models (`gpt-4o`, `gpt-4`, `gpt-4.1`, `gpt-3.5-turbo`) do NOT
- * match: `gpt-4` has a single-digit major ≤ 4; `gpt-4o` has a letter suffix.
- *
- * The regex is anchored at the start to avoid false positives in suffixes
- * (e.g., a hypothetical `ft:gpt-4-my-o1-finetune` should NOT match).
- * The `i` flag is defensive for any mixed-case API identifiers.
- */
-const NEWER_MODEL_RE = /^(o[1-9]|gpt-(?:[5-9]|\d{2,}))/i;
-
-/**
- * `resolveTokenParam` — pure helper that maps a model identifier + an optional
- * operator override to the correct token-limit field name.
+ * Classic models (`gpt-4o`, `gpt-4`, `gpt-4.1`, `gpt-3.5-turbo`) return
+ * `max_tokens`; the regex anchored at start avoids suffix false positives.
  *
  * @param model    - The model id as it will be sent in the API request
  *                   (already resolved from per-request shaping or provider
@@ -73,9 +68,75 @@ export function resolveTokenParam(
 ): 'max_tokens' | 'max_completion_tokens' {
   if (override === 'max_tokens') return 'max_tokens';
   if (override === 'max_completion_tokens') return 'max_completion_tokens';
-  // auto: apply the heuristic regex.
-  return NEWER_MODEL_RE.test(model) ? 'max_completion_tokens' : 'max_tokens';
+  // auto: delegate to the shared reasoning-family detector.
+  return isReasoningModel(model) ? 'max_completion_tokens' : 'max_tokens';
 }
+
+// ---------------------------------------------------------------------------
+// Tool-choice resolution — D2 (per-request tool_choice selection)
+// ---------------------------------------------------------------------------
+
+// ToolChoiceStyle: three modes for the tool_choice field per request.
+//   'auto'     - heuristic: reasoning models (gpt-5+/o-series) use 'required',
+//                classic models (gpt-4o, gpt-4.1) use forced-specific object.
+//   'forced'   - always send the forced-specific function object.
+//   'required' - always send 'required'.
+// Operators set this via OPENAI_TOOL_CHOICE env var (deployment.md - Config).
+export type ToolChoiceStyle = 'auto' | 'forced' | 'required';
+
+/**
+ * Wire type for the `tool_choice` field on an OpenAI chat completions request.
+ * Reasoning models use the string `'required'`; classic models use the
+ * forced-specific function object.
+ */
+export type ResolvedToolChoice = 'required' | { type: 'function'; function: { name: string } };
+
+/**
+ * `resolveToolChoice` — pure helper that maps a model identifier, an optional
+ * operator style override, and a tool name to the correct `tool_choice` value.
+ *
+ * Root-cause context (production incident):
+ *   Forcing a specific function with `tool_choice: { type: 'function', function:
+ *   { name: 'submit_review_findings' } }` short-circuits reasoning on GPT-5/
+ *   o-series models. The model skips its interleaved thinking step and calls
+ *   the tool immediately with an empty `findings` array, producing a silent
+ *   clean review on PRs that should have findings.
+ *
+ *   OpenAI's recommendation for reasoning models is `tool_choice: 'required'`
+ *   (must call a tool; with a single tool registered the model reasons first,
+ *   then calls it). Classic models (gpt-4o, gpt-4.1, …) continue to use the
+ *   forced-specific object — this is the proven pattern for those families.
+ *
+ * References:
+ *   - https://platform.openai.com/docs/guides/reasoning (tool use section)
+ *   - https://platform.openai.com/docs/api-reference/chat/create (tool_choice)
+ *
+ * @param model     - Bare model identifier (no `provider/` prefix).
+ * @param toolName  - The name of the single tool registered on the request
+ *                    (e.g. `'submit_review_findings'`).
+ * @param style     - Operator override from `OPENAI_TOOL_CHOICE`. When
+ *                    `'forced'` or `'required'`, the heuristic is bypassed.
+ *                    Defaults to `'auto'`.
+ *
+ * @returns `'required'` for reasoning models (auto or explicit); a
+ *          forced-specific function object for classic models (auto or explicit).
+ *
+ * Exported for direct unit-testing.
+ */
+export function resolveToolChoice(
+  model: string,
+  toolName: string,
+  style: ToolChoiceStyle = 'auto',
+): ResolvedToolChoice {
+  if (style === 'required') return 'required';
+  if (style === 'forced') return { type: 'function', function: { name: toolName } };
+  // auto: use the reasoning-family heuristic.
+  return isReasoningModel(model) ? 'required' : { type: 'function', function: { name: toolName } };
+}
+
+// Re-export the shared helper so existing callers that imported from this
+// package can still reach it. The canonical import is `@prisma-bot/shared`.
+export { isReasoningModel };
 
 /**
  * `OPENAI_PROVIDER_NAME` — canonical `Provider.name` value for the OpenAI
@@ -213,7 +274,12 @@ export interface OpenAIClientLike {
       type: 'function';
       function: { name: string; description: string; parameters: object };
     }>;
-    tool_choice: { type: 'function'; function: { name: string } };
+    /**
+     * tool_choice: 'required' for reasoning models (gpt-5+/o-series, allows
+     * interleaved thinking) or a forced-specific function object for classic
+     * models (gpt-4o, gpt-4.1). See resolveToolChoice.
+     */
+    tool_choice: 'required' | { type: 'function'; function: { name: string } };
     max_tokens?: number;
     max_completion_tokens?: number;
     seed?: number;
@@ -253,6 +319,15 @@ export interface OpenAIProviderOptions {
    * Wired from `OPENAI_MAX_OUTPUT_TOKENS` env var (deployment.md § Config).
    */
   maxOutputTokens?: number;
+  /**
+   * toolChoiceStyle: controls how tool_choice is set per request.
+   * 'auto' (default): reasoning models (gpt-5+/o-series) get 'required',
+   * classic models (gpt-4o, gpt-4.1) get the forced-specific function object.
+   * 'forced': always send the forced-specific object (bypass heuristic).
+   * 'required': always send 'required' (bypass heuristic).
+   * Wired from OPENAI_TOOL_CHOICE env var (deployment.md - Config).
+   */
+  toolChoiceStyle?: ToolChoiceStyle;
 }
 
 interface ToolCall {
@@ -371,6 +446,7 @@ export class OpenAIProvider implements Provider {
   private readonly maxTokensPerCall: number | undefined;
   private readonly tokenParamStyle: TokenParamStyle;
   private readonly maxOutputTokens: number;
+  private readonly toolChoiceStyle: ToolChoiceStyle;
 
   constructor(options: OpenAIProviderOptions) {
     this.capabilities = options.capabilities ?? OPENAI_CAPABILITIES;
@@ -378,6 +454,7 @@ export class OpenAIProvider implements Provider {
     this.maxTokensPerCall = options.maxTokensPerCall;
     this.tokenParamStyle = options.tokenParamStyle ?? 'auto';
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+    this.toolChoiceStyle = options.toolChoiceStyle ?? 'auto';
     if (options.client !== undefined) {
       this.client = options.client;
     } else {
@@ -413,20 +490,50 @@ export class OpenAIProvider implements Provider {
 
     // D1: select the correct token-limit parameter for the resolved model.
     // `resolveTokenParam` applies the `tokenParamStyle` override (operator escape
-    // hatch via `OPENAI_TOKEN_PARAM`) or falls back to the heuristic regex that
-    // distinguishes gpt-5*/o-series (`max_completion_tokens`) from classic models
-    // (`max_tokens`). Never send both; JSON.stringify elides undefined keys so
-    // only the set field reaches the wire.
+    // hatch via `OPENAI_TOKEN_PARAM`) or falls back to the heuristic (via
+    // `isReasoningModel`) that distinguishes gpt-5*/o-series
+    // (`max_completion_tokens`) from classic models (`max_tokens`).
+    // Never send both; JSON.stringify elides undefined keys so only the set
+    // field reaches the wire.
     const tokenParam = resolveTokenParam(model, this.tokenParamStyle);
+
+    // D2: resolve tool_choice for the resolved model.
+    // Reasoning models (gpt-5*/o-series) need `tool_choice: 'required'` to
+    // allow interleaved thinking before the tool call. Forcing a specific
+    // function on these models short-circuits reasoning and yields an empty
+    // findings array. Classic models continue to use the forced-specific object.
+    // The `OPENAI_TOOL_CHOICE` env var (→ `this.toolChoiceStyle`) lets
+    // operators override the heuristic for proxy gateways or misclassifications.
+    const toolChoice = resolveToolChoice(model, prompt.tool.function.name, this.toolChoiceStyle);
+
+    // D2b: conservative prompt nudge for reasoning models only.
+    // Appending a short instruction to the system message directly counters the
+    // empty-array pattern: the model is explicitly told to reason thoroughly
+    // before calling the tool and only submit an empty array when there are
+    // genuinely no issues. Classic-model messages are NOT modified — this
+    // ensures byte-identical requests for gpt-4o/gpt-4.1 (no regression).
+    const REASONING_NUDGE =
+      '\n\nAnalyze the diff thoroughly, then call submit_review_findings exactly once with every real finding; use an empty findings array only if there are genuinely no issues.';
+
+    const effectiveMessages: OpenAIChatCompletionsArgs['messages'] = isReasoningModel(model)
+      ? [
+          {
+            ...prompt.messages[0],
+            // Append the nudge to the system message (index 0).
+            content: (prompt.messages[0]?.content ?? '') + REASONING_NUDGE,
+          } as { role: 'system' | 'user' | 'assistant'; content: string },
+          ...prompt.messages.slice(1),
+        ]
+      : prompt.messages;
 
     // Step 1: base args — model, prompt structure, and the deployment-level
     // output token budget (`this.maxOutputTokens`, from OPENAI_MAX_OUTPUT_TOKENS
     // or the 4096 default).
     let args: OpenAIChatCompletionsArgs = {
       model,
-      messages: prompt.messages,
+      messages: effectiveMessages,
       tools: [prompt.tool],
-      tool_choice: prompt.tool_choice,
+      tool_choice: toolChoice,
     };
     args[tokenParam] = this.maxOutputTokens;
 

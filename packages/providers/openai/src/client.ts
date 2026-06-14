@@ -49,7 +49,12 @@ export interface OpenAIChatCompletionsArgs {
     type: 'function';
     function: { name: string; description: string; parameters: object };
   }>;
-  tool_choice: { type: 'function'; function: { name: string } };
+  /**
+   * tool_choice: either 'required' (reasoning models: gpt-5+/o-series, allows
+   * interleaved thinking) or a forced-specific function object (classic models:
+   * gpt-4o, gpt-4.1). See resolveToolChoice in index.ts.
+   */
+  tool_choice: 'required' | { type: 'function'; function: { name: string } };
   /**
    * Output token cap for classic model families (`gpt-4o`, `gpt-4`, `gpt-3.5-turbo`, …).
    * Mutually exclusive with `max_completion_tokens` — set exactly one per request.

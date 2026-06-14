@@ -10,6 +10,7 @@ import {
   OpenAIProvider,
   applyProviderOptions,
   resolveTokenParam,
+  resolveToolChoice,
 } from '../src/index.js';
 
 const validInput: ProviderReviewInput = {
@@ -752,5 +753,259 @@ describe('applyProviderOptions', () => {
       response_format: {},
     });
     expect(droppedNotes).toHaveLength(7);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveToolChoice — unit tests (D2)
+// ---------------------------------------------------------------------------
+
+describe('resolveToolChoice', () => {
+  const TOOL_NAME = 'submit_review_findings';
+  const FORCED_OBJECT = { type: 'function', function: { name: TOOL_NAME } };
+
+  // Auto mode: reasoning models -> 'required'
+  it('auto: gpt-5.4-nano -> required', () => {
+    expect(resolveToolChoice('gpt-5.4-nano', TOOL_NAME)).toBe('required');
+  });
+
+  it('auto: gpt-5-nano -> required', () => {
+    expect(resolveToolChoice('gpt-5-nano', TOOL_NAME)).toBe('required');
+  });
+
+  it('auto: o3 -> required', () => {
+    expect(resolveToolChoice('o3', TOOL_NAME)).toBe('required');
+  });
+
+  it('auto: o1 -> required', () => {
+    expect(resolveToolChoice('o1', TOOL_NAME)).toBe('required');
+  });
+
+  it('auto: o4-mini -> required', () => {
+    expect(resolveToolChoice('o4-mini', TOOL_NAME)).toBe('required');
+  });
+
+  // Auto mode: classic models -> forced object
+  it('auto: gpt-4o -> forced object', () => {
+    expect(resolveToolChoice('gpt-4o', TOOL_NAME)).toEqual(FORCED_OBJECT);
+  });
+
+  it('auto: gpt-4.1 -> forced object', () => {
+    expect(resolveToolChoice('gpt-4.1', TOOL_NAME)).toEqual(FORCED_OBJECT);
+  });
+
+  it('auto: gpt-3.5-turbo -> forced object', () => {
+    expect(resolveToolChoice('gpt-3.5-turbo', TOOL_NAME)).toEqual(FORCED_OBJECT);
+  });
+
+  it('auto: gpt-4-turbo -> forced object', () => {
+    expect(resolveToolChoice('gpt-4-turbo', TOOL_NAME)).toEqual(FORCED_OBJECT);
+  });
+
+  // Explicit 'required' style bypasses heuristic for classic models
+  it("explicit 'required' forces required even for gpt-4o", () => {
+    expect(resolveToolChoice('gpt-4o', TOOL_NAME, 'required')).toBe('required');
+  });
+
+  it("explicit 'required' forces required even for gpt-3.5-turbo", () => {
+    expect(resolveToolChoice('gpt-3.5-turbo', TOOL_NAME, 'required')).toBe('required');
+  });
+
+  // Explicit 'forced' style bypasses heuristic for reasoning models
+  it("explicit 'forced' forces object even for gpt-5.4-nano", () => {
+    expect(resolveToolChoice('gpt-5.4-nano', TOOL_NAME, 'forced')).toEqual(FORCED_OBJECT);
+  });
+
+  it("explicit 'forced' forces object even for o3", () => {
+    expect(resolveToolChoice('o3', TOOL_NAME, 'forced')).toEqual(FORCED_OBJECT);
+  });
+
+  // Default style 'auto' is same as omitting it
+  it("'auto' style is equivalent to omitting the style argument", () => {
+    expect(resolveToolChoice('gpt-5', TOOL_NAME, 'auto')).toBe('required');
+    expect(resolveToolChoice('gpt-4o', TOOL_NAME, 'auto')).toEqual(FORCED_OBJECT);
+    expect(resolveToolChoice('gpt-5', TOOL_NAME)).toBe('required');
+    expect(resolveToolChoice('gpt-4o', TOOL_NAME)).toEqual(FORCED_OBJECT);
+  });
+
+  // Tool name is reflected in the forced object
+  it('uses the provided toolName in the forced object', () => {
+    const result = resolveToolChoice('gpt-4o', 'my_custom_tool', 'auto');
+    expect(result).toEqual({ type: 'function', function: { name: 'my_custom_tool' } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adapter: reasoning model -> tool_choice='required' + prompt nudge
+// Classic model -> forced object + unchanged prompt (golden snapshot)
+// ---------------------------------------------------------------------------
+
+describe('OpenAIProvider — tool_choice + prompt per model family', () => {
+  function makeCapturingClient(): {
+    client: OpenAIClientLike;
+    getArgs: () => Record<string, unknown>;
+  } {
+    let capturedArgs: Record<string, unknown> = {};
+    const client: OpenAIClientLike = {
+      chatCompletions: vi.fn().mockImplementation((args: unknown) => {
+        capturedArgs = args as Record<string, unknown>;
+        return Promise.resolve(
+          (() => ({
+            id: 'chatcmpl-fake',
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: 'call_1',
+                      type: 'function',
+                      function: {
+                        name: 'submit_review_findings',
+                        arguments: JSON.stringify({ findings: [] }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+          }))(),
+        );
+      }),
+    };
+    return { client, getArgs: () => capturedArgs };
+  }
+
+  // Reasoning model: tool_choice must be 'required'
+  it('reasoning model (gpt-5.4-nano) sends tool_choice="required"', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review({ ...validInput, request_shaping: { model: 'gpt-5.4-nano' } });
+    expect(getArgs().tool_choice).toBe('required');
+  });
+
+  it('reasoning model (o3) sends tool_choice="required"', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review({ ...validInput, request_shaping: { model: 'o3' } });
+    expect(getArgs().tool_choice).toBe('required');
+  });
+
+  // Reasoning model: system message contains the nudge
+  it('reasoning model: system message contains the reasoning nudge', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review({ ...validInput, request_shaping: { model: 'gpt-5.4-nano' } });
+    const messages = getArgs().messages as Array<{ role: string; content: string }>;
+    const systemMsg = messages.find((m) => m.role === 'system');
+    expect(systemMsg?.content).toContain('submit_review_findings');
+    expect(systemMsg?.content).toContain('Analyze the diff thoroughly');
+  });
+
+  // Classic model (gpt-4o default): tool_choice must be forced object
+  it('classic model (gpt-4o default) sends forced tool_choice object', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review(validInput);
+    const tc = getArgs().tool_choice as Record<string, unknown>;
+    expect(tc.type).toBe('function');
+    expect((tc.function as Record<string, unknown>).name).toBe('submit_review_findings');
+  });
+
+  // Classic model: system message does NOT contain the nudge (golden snapshot)
+  it('classic model (gpt-4o): system message does NOT contain the reasoning nudge', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review(validInput);
+    const messages = getArgs().messages as Array<{ role: string; content: string }>;
+    const systemMsg = messages.find((m) => m.role === 'system');
+    expect(systemMsg?.content).not.toContain('Analyze the diff thoroughly');
+  });
+
+  // explicit toolChoiceStyle='required' override on a classic model
+  it("toolChoiceStyle='required' sends 'required' even for classic model", async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client, toolChoiceStyle: 'required' });
+    await provider.review(validInput); // gpt-4o default
+    expect(getArgs().tool_choice).toBe('required');
+  });
+
+  // explicit toolChoiceStyle='forced' override on a reasoning model
+  it("toolChoiceStyle='forced' sends forced object even for reasoning model", async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-5.4-nano',
+      toolChoiceStyle: 'forced',
+    });
+    await provider.review(validInput);
+    const tc = getArgs().tool_choice as Record<string, unknown>;
+    expect(tc.type).toBe('function');
+  });
+
+  // denylist: tool_choice from provider_options is still blocked
+  it('tool_choice from provider_options is still blocked by denylist', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review({
+      ...validInput,
+      request_shaping: { provider_options: { tool_choice: 'none' } },
+    });
+    // tool_choice should still be the forced object (gpt-4o default)
+    const tc = getArgs().tool_choice as Record<string, unknown>;
+    expect(tc.type).toBe('function');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adapter: reasoning model findings are extracted regardless of tool_choice mode
+// ---------------------------------------------------------------------------
+
+describe('OpenAIProvider — extractToolCallArguments works with required tool_choice', () => {
+  it('reasoning model with tool_choice=required still extracts findings correctly', async () => {
+    const chatCompletions = vi.fn().mockResolvedValue({
+      id: 'chatcmpl-reasoning',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_reasoning_1',
+                type: 'function',
+                function: {
+                  name: 'submit_review_findings',
+                  arguments: JSON.stringify({
+                    findings: [
+                      {
+                        path: 'src/a.ts',
+                        line: 3,
+                        severity: 'medium',
+                        category: 'correctness',
+                        message: 'reasoning finding',
+                        rationale: 'detected via reasoning',
+                        confidence: 0.8,
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    });
+    const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
+    // o3 is a reasoning model -> tool_choice will be 'required'
+    const out = await provider.review({ ...validInput, request_shaping: { model: 'o3' } });
+    expect(out.findings).toHaveLength(1);
+    expect(out.findings[0]?.message).toBe('reasoning finding');
   });
 });

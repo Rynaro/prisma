@@ -53,6 +53,7 @@ Configuration is resolved in this order; each layer overrides the previous on a 
 - **Malformed slugs.** `openai/` (empty name) → warning, no model override; `/gpt-4o` (empty provider) → treated as bare `gpt-4o`; `a/b/c` (multiple slashes) → warning, no model override. None of these reject the file.
 - **Example.** `model: openai/gpt-5.4-nano`  (slug form, preferred)
 - **Migration.** Replace `provider: openai` + `model: gpt-5.4-nano` with `model: openai/gpt-5.4-nano` and remove the `provider:` key.
+- **Model compatibility.** Reasoning-family models (gpt-5+/o-series) use a different `tool_choice` mode than classic models. If a reasoning model returns an empty review, see [`docs/model-compatibility.md`](model-compatibility.md) for the compatibility matrix and remedies.
 
 ### generation
 

@@ -37,6 +37,59 @@
  */
 const KNOWN_PROVIDERS = new Set(['openai', 'anthropic', 'copilot', 'fake']);
 
+// ---------------------------------------------------------------------------
+// Reasoning-family detector — shared single source of truth
+// ---------------------------------------------------------------------------
+
+/**
+ * `REASONING_MODEL_RE` — regex that identifies OpenAI reasoning-family models
+ * (o-series and gpt-5+) from a bare model identifier (no `provider/` prefix).
+ *
+ * Pattern rationale — same as `NEWER_MODEL_RE` in
+ * `packages/providers/openai/src/index.ts`:
+ *   - `o[1-9]`       — o-series: o1, o3, o4, o4-mini, …
+ *   - `gpt-[5-9]`    — gpt-5, gpt-5.4-nano, gpt-6, …
+ *   - `gpt-\d{2,}`   — gpt-10, gpt-11, … (future two-digit major versions)
+ *
+ * Classic models (`gpt-4o`, `gpt-4`, `gpt-4.1`, `gpt-3.5-turbo`) do NOT
+ * match: `gpt-4` has a single-digit major ≤ 4; `gpt-4o` has a letter suffix.
+ *
+ * Anchored at the start to avoid false positives in suffix tokens.
+ * The `i` flag is defensive for mixed-case API identifiers.
+ *
+ * References:
+ *   - OpenAI reasoning model docs: https://platform.openai.com/docs/guides/reasoning
+ *   - The empty-review root cause: reasoning models' interleaved thinking is
+ *     short-circuited when `tool_choice` names a specific function; they
+ *     skip reasoning and emit an empty call. Detected models use
+ *     `tool_choice: 'required'` instead.
+ */
+const REASONING_MODEL_RE = /^(o[1-9]|gpt-(?:[5-9]|\d{2,}))/i;
+
+/**
+ * `isReasoningModel` — returns `true` when `model` belongs to the OpenAI
+ * reasoning family (o-series or gpt-5+) that requires `tool_choice: 'required'`
+ * rather than a forced-specific function call.
+ *
+ * This is the **single source of truth** for the reasoning-family classification.
+ * Both the OpenAI adapter (`resolveToolChoice`) and the orchestrator
+ * (`no_findings` hint branch) import this helper so the classification is
+ * never duplicated.
+ *
+ * @param model - Bare model identifier (no `provider/` prefix). The caller
+ *                is responsible for stripping the prefix via `parseModelSlug`
+ *                before calling this function.
+ *
+ * @returns `true`  for o1, o3, o4-mini, gpt-5, gpt-5.4-nano, gpt-6, gpt-10, …
+ *          `false` for gpt-4o, gpt-4.1, gpt-4, gpt-3.5-turbo, …
+ *
+ * Exported from `@prisma-bot/shared` so every package that needs the
+ * classification imports from one place.
+ */
+export function isReasoningModel(model: string): boolean {
+  return REASONING_MODEL_RE.test(model);
+}
+
 export interface ParsedModelSlug {
   /** Provider portion of the slug, or `undefined` for a bare slug. */
   provider: string | undefined;
