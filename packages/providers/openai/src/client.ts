@@ -20,6 +20,22 @@ export interface CreateOpenAIClientOptions {
   timeoutMs?: number;
 }
 
+/**
+ * `OpenAIChatCompletionsArgs` — the wire shape sent to `/chat/completions`.
+ *
+ * The token-limit parameter changed across OpenAI model families:
+ *   - Classic models (`gpt-4o`, `gpt-4`, `gpt-3.5-turbo`, …): `max_tokens`.
+ *   - Newer families (gpt-5*, o1, o3, o4, …): `max_completion_tokens`.
+ *
+ * Exactly one of the two optional token fields must be set per request;
+ * `resolveTokenParam` (index.ts) selects the correct key. Both are typed as
+ * optional here so the TS type can carry either without carrying both. The
+ * `createOpenAIClient` implementation serialises the body via `JSON.stringify`,
+ * which elides undefined keys, ensuring only the populated field is sent.
+ *
+ * Per ADR-002: no vendor types leak past `client.ts`. The caller (index.ts) is
+ * responsible for populating exactly one token field.
+ */
 export interface OpenAIChatCompletionsArgs {
   model: string;
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
@@ -28,7 +44,16 @@ export interface OpenAIChatCompletionsArgs {
     function: { name: string; description: string; parameters: object };
   }>;
   tool_choice: { type: 'function'; function: { name: string } };
-  max_tokens: number;
+  /**
+   * Output token cap for classic model families (`gpt-4o`, `gpt-4`, `gpt-3.5-turbo`, …).
+   * Mutually exclusive with `max_completion_tokens` — set exactly one per request.
+   */
+  max_tokens?: number;
+  /**
+   * Output token cap for newer model families (`gpt-5*`, `o1`, `o3`, `o4`, …).
+   * Mutually exclusive with `max_tokens` — set exactly one per request.
+   */
+  max_completion_tokens?: number;
   seed?: number;
 }
 

@@ -6,6 +6,7 @@ import {
   OPENAI_PROVIDER_NAME,
   type OpenAIClientLike,
   OpenAIProvider,
+  resolveTokenParam,
 } from '../src/index.js';
 
 const validInput: ProviderReviewInput = {
@@ -259,5 +260,253 @@ describe('OpenAIProvider', () => {
     const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
     const out = await provider.review(validInput);
     expect(out.findings).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveTokenParam — unit tests across model matrix (D1)
+// ---------------------------------------------------------------------------
+
+describe('resolveTokenParam', () => {
+  // Auto-select: newer models → max_completion_tokens
+  it('auto: gpt-5.4-nano → max_completion_tokens', () => {
+    expect(resolveTokenParam('gpt-5.4-nano')).toBe('max_completion_tokens');
+  });
+
+  it('auto: gpt-5-nano → max_completion_tokens', () => {
+    expect(resolveTokenParam('gpt-5-nano')).toBe('max_completion_tokens');
+  });
+
+  it('auto: gpt-5 → max_completion_tokens', () => {
+    expect(resolveTokenParam('gpt-5')).toBe('max_completion_tokens');
+  });
+
+  it('auto: o3 → max_completion_tokens', () => {
+    expect(resolveTokenParam('o3')).toBe('max_completion_tokens');
+  });
+
+  it('auto: o1 → max_completion_tokens', () => {
+    expect(resolveTokenParam('o1')).toBe('max_completion_tokens');
+  });
+
+  it('auto: o4-mini → max_completion_tokens', () => {
+    expect(resolveTokenParam('o4-mini')).toBe('max_completion_tokens');
+  });
+
+  it('auto: gpt-6 (future) → max_completion_tokens', () => {
+    expect(resolveTokenParam('gpt-6')).toBe('max_completion_tokens');
+  });
+
+  it('auto: gpt-10 (two-digit major, future) → max_completion_tokens', () => {
+    expect(resolveTokenParam('gpt-10')).toBe('max_completion_tokens');
+  });
+
+  // Auto-select: classic models → max_tokens
+  it('auto: gpt-4o → max_tokens', () => {
+    expect(resolveTokenParam('gpt-4o')).toBe('max_tokens');
+  });
+
+  it('auto: gpt-4.1 → max_tokens', () => {
+    expect(resolveTokenParam('gpt-4.1')).toBe('max_tokens');
+  });
+
+  it('auto: gpt-4 → max_tokens', () => {
+    expect(resolveTokenParam('gpt-4')).toBe('max_tokens');
+  });
+
+  it('auto: gpt-3.5-turbo → max_tokens', () => {
+    expect(resolveTokenParam('gpt-3.5-turbo')).toBe('max_tokens');
+  });
+
+  it('auto: default (undefined override) is equivalent to auto', () => {
+    // resolveTokenParam with no second argument defaults to 'auto'
+    expect(resolveTokenParam('gpt-5.4-nano', undefined)).toBe('max_completion_tokens');
+    expect(resolveTokenParam('gpt-4o', undefined)).toBe('max_tokens');
+  });
+
+  // Explicit override bypasses heuristic
+  it('explicit max_tokens override forces max_tokens even for gpt-5.4-nano', () => {
+    expect(resolveTokenParam('gpt-5.4-nano', 'max_tokens')).toBe('max_tokens');
+  });
+
+  it('explicit max_completion_tokens override forces max_completion_tokens even for gpt-4o', () => {
+    expect(resolveTokenParam('gpt-4o', 'max_completion_tokens')).toBe('max_completion_tokens');
+  });
+
+  it('explicit max_tokens override forces max_tokens for o3', () => {
+    expect(resolveTokenParam('o3', 'max_tokens')).toBe('max_tokens');
+  });
+
+  it('explicit max_completion_tokens override forces max_completion_tokens for gpt-3.5-turbo', () => {
+    expect(resolveTokenParam('gpt-3.5-turbo', 'max_completion_tokens')).toBe(
+      'max_completion_tokens',
+    );
+  });
+
+  it('explicit auto behaves identically to omitted override', () => {
+    expect(resolveTokenParam('gpt-5.4-nano', 'auto')).toBe('max_completion_tokens');
+    expect(resolveTokenParam('gpt-4o', 'auto')).toBe('max_tokens');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token-param integration — per-request wiring (D1/D2)
+// ---------------------------------------------------------------------------
+
+describe('OpenAIProvider — token param per-request wiring', () => {
+  // Helper: returns the args passed to chatCompletions
+  function makeCapturingClient(): {
+    client: OpenAIClientLike;
+    getArgs: () => Record<string, unknown>;
+  } {
+    let capturedArgs: Record<string, unknown> = {};
+    const client: OpenAIClientLike = {
+      chatCompletions: vi.fn().mockImplementation((args: unknown) => {
+        capturedArgs = args as Record<string, unknown>;
+        return Promise.resolve(chatCompletionsResponse({ findings: [] }));
+      }),
+    };
+    return { client, getArgs: () => capturedArgs };
+  }
+
+  it('classic model (gpt-4o default) → sends max_tokens, NOT max_completion_tokens', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review(validInput);
+    const args = getArgs();
+    expect('max_tokens' in args).toBe(true);
+    expect('max_completion_tokens' in args).toBe(false);
+  });
+
+  it('gpt-5.4-nano via request_shaping.model → sends max_completion_tokens, NOT max_tokens', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review({ ...validInput, request_shaping: { model: 'gpt-5.4-nano' } });
+    const args = getArgs();
+    expect('max_completion_tokens' in args).toBe(true);
+    expect('max_tokens' in args).toBe(false);
+  });
+
+  it('o3 via request_shaping.model → sends max_completion_tokens, NOT max_tokens', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review({ ...validInput, request_shaping: { model: 'o3' } });
+    const args = getArgs();
+    expect('max_completion_tokens' in args).toBe(true);
+    expect('max_tokens' in args).toBe(false);
+  });
+
+  it('never sends both max_tokens and max_completion_tokens in the same request', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    // gpt-4o default
+    await provider.review(validInput);
+    const args1 = getArgs();
+    expect('max_tokens' in args1 && 'max_completion_tokens' in args1).toBe(false);
+
+    // gpt-5 override
+    await provider.review({ ...validInput, request_shaping: { model: 'gpt-5' } });
+    const args2 = getArgs();
+    expect('max_tokens' in args2 && 'max_completion_tokens' in args2).toBe(false);
+  });
+
+  it('explicit tokenParamStyle=max_tokens forces max_tokens even when gpt-5.4-nano is the model', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      tokenParamStyle: 'max_tokens',
+      model: 'gpt-5.4-nano',
+    });
+    await provider.review(validInput);
+    const args = getArgs();
+    expect('max_tokens' in args).toBe(true);
+    expect('max_completion_tokens' in args).toBe(false);
+  });
+
+  it('explicit tokenParamStyle=max_completion_tokens forces max_completion_tokens even for gpt-4o', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      tokenParamStyle: 'max_completion_tokens',
+    });
+    await provider.review(validInput);
+    const args = getArgs();
+    expect('max_completion_tokens' in args).toBe(true);
+    expect('max_tokens' in args).toBe(false);
+  });
+
+  it('maxOutputTokens flows to the chosen token param field', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-5.4-nano',
+      maxOutputTokens: 8192,
+    });
+    await provider.review(validInput);
+    const args = getArgs();
+    expect(args.max_completion_tokens).toBe(8192);
+    expect('max_tokens' in args).toBe(false);
+  });
+
+  it('maxOutputTokens defaults to 4096 when unset', async () => {
+    const { client, getArgs } = makeCapturingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review(validInput);
+    const args = getArgs();
+    expect(args.max_tokens).toBe(4096);
+  });
+
+  it('truncation guard message is param-agnostic and includes the output token cap', async () => {
+    // Use a newer model so the param is max_completion_tokens
+    const truncatedResponse = {
+      id: 'chatcmpl-truncated',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'submit_review_findings',
+                  arguments: JSON.stringify({ findings: [] }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'length',
+        },
+      ],
+    };
+    const client: OpenAIClientLike = {
+      chatCompletions: vi.fn().mockResolvedValue(truncatedResponse),
+    };
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-5.4-nano',
+      maxOutputTokens: 8192,
+    });
+    await expect(provider.review(validInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'schema_validation',
+    });
+    // Verify the message is generic (doesn't hard-code a param name)
+    // and contains the actual cap value
+    try {
+      await provider.review(validInput);
+    } catch (err) {
+      if (err instanceof ProviderErrorThrowable) {
+        expect(err.value.message).toContain('output token cap');
+        expect(err.value.message).toContain('8192');
+        expect(err.value.message).not.toContain('max_tokens: 4096');
+      }
+    }
   });
 });
