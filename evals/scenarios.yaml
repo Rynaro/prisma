@@ -55,3 +55,7 @@ scenarios:
     name: "generation + provider_options settings thread through to the provider (round-trip)"
     fixture: fixtures/generation-provider-options-roundtrip.yaml
     tags: ["model_settings_threading"]
+  - id: reasoning-model-empty-review
+    name: "Reasoning model (gpt-5.4-nano) returns empty findings — model-aware notice emitted"
+    fixture: fixtures/reasoning-model-empty-review.yaml
+    tags: ["reasoning_model_compatibility", "false_positive_rate"]

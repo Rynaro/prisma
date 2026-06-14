@@ -36,6 +36,7 @@ import {
   type RankedFindings,
   type RejectionLogEntry,
   type RepoConfig,
+  isReasoningModel,
   parseModelSlug,
 } from '@prisma-bot/shared';
 
@@ -237,6 +238,19 @@ export interface ReviewCompleteChunkedDetail {
 }
 
 /**
+ * Detail attached to a no_findings outcome when the provider returned zero
+ * findings on a non-trivial diff and the resolved model is a reasoning family
+ * model (gpt-5+/o-series). Used to emit a model-aware notice and comment reply.
+ * Absent when the prefilter excluded all files (provider not called) or when
+ * a classic model produced a legitimately clean result.
+ */
+export interface NoFindingsReasoningHint {
+  reasoning_model_empty: true;
+  /** The bare model name (no provider prefix) that produced zero findings. */
+  model: string;
+}
+
+/**
  * Discriminated outcome union surfaced by `runPipeline`. Callers use this to
  * compose user-visible messages that reflect what actually happened, rather than
  * treating every succeeded result as a completed review.
@@ -248,8 +262,11 @@ export interface ReviewCompleteChunkedDetail {
  *   files skipped for size.
  * - `'oversized'`                — prefilter short-circuited; `oversized_detail`
  *   carries the specifics (reason, counts, limits). PR was not reviewed.
- * - `'no_findings'`              — provider was called but no analyzable files
- *   remained after prefilter (e.g. pure-delete or all-generated diff).
+ * - `'no_findings'`              — provider returned zero findings. When
+ *   `detail` is present, the provider was called on a non-trivial diff with a
+ *   reasoning-family model — the hint drives a model-aware notice. When
+ *   `detail` is absent, the diff was trivially empty (prefilter excluded all
+ *   files) or the active model is a classic model (zero findings is clean).
  * - `'review_unavailable'`       — non-transient provider error (auth /
  *   capability). `detail` carries the provider_error_kind and the safe message.
  * - `'malformed_provider_output'` — provider output failed schema validation;
@@ -259,7 +276,7 @@ export type PipelineOutcome =
   | { kind: 'review_complete' }
   | { kind: 'review_complete_chunked'; detail: ReviewCompleteChunkedDetail }
   | { kind: 'oversized'; detail: OversizedDetail }
-  | { kind: 'no_findings' }
+  | { kind: 'no_findings'; detail?: NoFindingsReasoningHint }
   | { kind: 'review_unavailable'; detail: ReviewUnavailableDetail }
   | { kind: 'malformed_provider_output' };
 
@@ -1059,6 +1076,67 @@ export const runPipeline = async (
       message: err instanceof Error ? err.message : 'unknown',
     });
     throw err;
+  }
+
+  // ── Reasoning-model empty-review safety net ────────────────────────────────
+  // When the provider was called on a non-trivial diff (we are past the
+  // `prefilter.files.length === 0` short-circuit) but returned ZERO findings,
+  // AND the resolved config model is a reasoning-family model (gpt-5*/o-series),
+  // enrich the `no_findings` outcome with a model-incompatibility hint.
+  //
+  // Classic models returning zero findings on a real diff is a legitimately
+  // clean PR — no hint is emitted in that case.
+  //
+  // The "provider was called" signal is implicit: this code is only reached
+  // when `prefilter.files.length > 0` (files were sent) AND the provider
+  // returned without throwing.
+  if (providerOutput.findings.length === 0) {
+    // Parse the configured model slug to get the bare model name.
+    // We check the bare model name (not the resolved/adapter name) because
+    // the operator configured this model and the hint should tell them about
+    // the model they chose, regardless of which adapter is running.
+    const slug = parseModelSlug(deps.config.model, deps.config.provider);
+    const resolvedModelName = slug.model;
+
+    const isReasoning = resolvedModelName !== undefined && isReasoningModel(resolvedModelName);
+
+    if (isReasoning && resolvedModelName !== undefined) {
+      // Build the reasoning-model notice text.
+      const reasoningNotice = `ℹ️ Review produced no findings. The configured model (\`${resolvedModelName}\`) is a reasoning model and may be under-producing with this review flow. If you expected findings, try \`openai/gpt-4.1\`, or set \`OPENAI_TOOL_CHOICE=required\`. See docs/model-compatibility.md.`;
+
+      const publication = await publishSummaryOnly({
+        payload,
+        identity,
+        octokit,
+        cfg: deps.config,
+        hooks,
+        reason: 'no_findings',
+        reasonMessage: `no findings: reasoning model ${resolvedModelName} returned empty findings`,
+        rejections: [],
+        resolvedHeadSha: deps.resolvedHeadSha,
+        notice: reasoningNotice,
+      });
+      logger.emit('publisher.published', {
+        ...trace,
+        mode: 'summary-only',
+        reason: 'no_findings',
+        reasoning_model_empty: true,
+        model: resolvedModelName,
+        inline_count: publication.published_inline.length,
+        summary_count: publication.published_summary.length,
+      });
+      logger.emit('job.terminal', { ...trace, state: 'succeeded' });
+      return {
+        state: 'succeeded',
+        publication,
+        rejections: publication.rejections,
+        ...(allNotes.length > 0 ? { config_notes: allNotes } : {}),
+        outcome: {
+          kind: 'no_findings',
+          detail: { reasoning_model_empty: true as const, model: resolvedModelName },
+        },
+      };
+    }
   }
 
   // Stage: validator.

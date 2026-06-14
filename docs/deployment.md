@@ -73,6 +73,7 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `OPENAI_BASE_URL` | Optional override for the OpenAI adapter's inference endpoint (defaults to `https://api.openai.com/v1`). Consumed only when `OPENAI_API_KEY` is set; useful for Azure OpenAI or a proxy gateway. | `config` |
 | `OPENAI_TOKEN_PARAM` | Controls which output-token cap parameter the OpenAI adapter sends per request. `auto` (default) applies a heuristic: `max_completion_tokens` for gpt-5*/o-series models, `max_tokens` for classic models (`gpt-4o`, `gpt-4`, `gpt-3.5-turbo`). Set to `max_tokens` or `max_completion_tokens` to override the heuristic — useful for proxy gateways that lag OpenAI's rollout or for misclassified future models. Invalid values are silently ignored and fall back to `auto`. Consumed only when `OPENAI_API_KEY` is set. | `config` |
 | `OPENAI_MAX_OUTPUT_TOKENS` | Optional output token budget for the OpenAI adapter (defaults to `4096`). Raise for reasoning-capable models (o-series, gpt-5) that may need a larger completion window. Non-numeric or non-positive values are silently ignored and fall back to the default. Consumed only when `OPENAI_API_KEY` is set. | `config` |
+| `OPENAI_TOOL_CHOICE` | Controls the `tool_choice` parameter sent to the OpenAI chat completions API. `auto` (default) uses a heuristic: reasoning models (gpt-5+/o-series) receive `"required"` (allows interleaved thinking before calling the tool), classic models (gpt-4o, gpt-4.1) receive the forced-specific function object. Set to `forced` to always send the forced-specific object (useful when a proxy gateway rejects `"required"`), or `required` to always send `"required"`. Invalid values fall back to `auto`. See `docs/model-compatibility.md` for the reasoning-model compatibility matrix. Consumed only when `OPENAI_API_KEY` is set. | `config` |
 | `COPILOT_MODEL` | Optional override for the Copilot adapter's default model (defaults to `gpt-4o`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 | `COPILOT_BASE_URL` | Optional override for the Copilot adapter's inference endpoint (defaults to `https://models.github.ai/inference`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 
@@ -152,6 +153,10 @@ OPENAI_BASE_URL=
 OPENAI_TOKEN_PARAM=
 # OPENAI_MAX_OUTPUT_TOKENS: output token budget (default 4096). Raise for o-series / gpt-5 models.
 OPENAI_MAX_OUTPUT_TOKENS=
+# OPENAI_TOOL_CHOICE: auto (default) | forced | required
+# auto: reasoning models (gpt-5+/o-series) use 'required'; classic models use forced-specific object.
+# Set to 'required' if a reasoning model is under-producing findings. See docs/model-compatibility.md.
+OPENAI_TOOL_CHOICE=
 
 # tunables (starting values; see operational-runbooks.md § Numeric tunables)
 QUEUE_CONCURRENCY=4

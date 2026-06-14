@@ -1,5 +1,6 @@
 export type {
   LogEvent,
+  NoFindingsReasoningHint,
   OrchestratorDeps,
   OrchestratorHooks,
   OrchestratorResult,

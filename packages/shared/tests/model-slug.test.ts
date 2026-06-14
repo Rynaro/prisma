@@ -7,7 +7,7 @@
  * See docs/_planning/config-dx/spec.md § 7.1 and § 4.
  */
 import { describe, expect, it } from 'vitest';
-import { parseModelSlug } from '../src/model-slug.js';
+import { isReasoningModel, parseModelSlug } from '../src/model-slug.js';
 
 describe('parseModelSlug', () => {
   // ── AS-1: bare name → no provider prefix ──────────────────────────────────
@@ -193,5 +193,78 @@ describe('parseModelSlug', () => {
         }
       });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isReasoningModel — unit tests (shared single source of truth)
+// ---------------------------------------------------------------------------
+
+describe('isReasoningModel', () => {
+  // Reasoning-family models: should return true
+  it('gpt-5.4-nano is a reasoning model', () => {
+    expect(isReasoningModel('gpt-5.4-nano')).toBe(true);
+  });
+
+  it('gpt-5-nano is a reasoning model', () => {
+    expect(isReasoningModel('gpt-5-nano')).toBe(true);
+  });
+
+  it('gpt-5 is a reasoning model', () => {
+    expect(isReasoningModel('gpt-5')).toBe(true);
+  });
+
+  it('gpt-6 (future) is a reasoning model', () => {
+    expect(isReasoningModel('gpt-6')).toBe(true);
+  });
+
+  it('gpt-10 (two-digit major) is a reasoning model', () => {
+    expect(isReasoningModel('gpt-10')).toBe(true);
+  });
+
+  it('o1 is a reasoning model', () => {
+    expect(isReasoningModel('o1')).toBe(true);
+  });
+
+  it('o3 is a reasoning model', () => {
+    expect(isReasoningModel('o3')).toBe(true);
+  });
+
+  it('o4-mini is a reasoning model', () => {
+    expect(isReasoningModel('o4-mini')).toBe(true);
+  });
+
+  // Classic-family models: should return false
+  it('gpt-4o is NOT a reasoning model', () => {
+    expect(isReasoningModel('gpt-4o')).toBe(false);
+  });
+
+  it('gpt-4.1 is NOT a reasoning model', () => {
+    expect(isReasoningModel('gpt-4.1')).toBe(false);
+  });
+
+  it('gpt-4 is NOT a reasoning model', () => {
+    expect(isReasoningModel('gpt-4')).toBe(false);
+  });
+
+  it('gpt-3.5-turbo is NOT a reasoning model', () => {
+    expect(isReasoningModel('gpt-3.5-turbo')).toBe(false);
+  });
+
+  it('gpt-4-turbo is NOT a reasoning model', () => {
+    expect(isReasoningModel('gpt-4-turbo')).toBe(false);
+  });
+
+  // Edge cases
+  it('empty string is NOT a reasoning model', () => {
+    expect(isReasoningModel('')).toBe(false);
+  });
+
+  it('case-insensitive: GPT-5 is a reasoning model', () => {
+    expect(isReasoningModel('GPT-5')).toBe(true);
+  });
+
+  it('case-insensitive: O3 is a reasoning model', () => {
+    expect(isReasoningModel('O3')).toBe(true);
   });
 });
