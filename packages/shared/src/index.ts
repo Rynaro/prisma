@@ -4,3 +4,4 @@ export * from './audit-log/index.js';
 export * from './schemas/index.js';
 export * from './prompt/review-prompt.js';
 export * from './commands/parse.js';
+export * from './model-slug.js';

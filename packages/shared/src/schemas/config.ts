@@ -71,6 +71,84 @@ const CategoriesEnabledSchema = z
   .default(['security', 'correctness', 'performance', 'tests', 'style', 'migration', 'dependency']);
 
 /**
+ * `GenerationSchema` — vendor-neutral normalized generation settings.
+ *
+ * These are the ~5 settings that every major LLM API supports under different
+ * names. The adapter translates each key to the vendor's dialect so operators
+ * never need to know which vendor calls it `max_tokens` vs.
+ * `max_completion_tokens` (design.md P2/P6).
+ *
+ * Defaults: all absent → today's behavior preserved byte-for-byte (AS-11).
+ *
+ * Validation ranges (spec OQ-6):
+ *   temperature  [0, 2]  — cross-vendor range; users wanting exotic values use
+ *                          provider_options (the escape hatch).
+ *   top_p        [0, 1]
+ *   seed         integer (no range cap — each vendor limits differently)
+ *   max_output_tokens  positive integer
+ *
+ * Non-strict: uses the default Zod `.strip` behavior (consistent with the
+ * outer RepoConfigSchema warn-and-ignore policy; generation is a
+ * forward-compat surface).  The "warn" half is implemented by the config-
+ * loader's keyset-diff.  This diverges from ChunkingSchema (.strict()) because
+ * chunking has a fully-known, closed key set whereas generation is intended to
+ * grow as new normalized settings are added.
+ *
+ * Spec: docs/_planning/config-dx/spec.md § 5.1 (GenerationSchema).
+ */
+export const GenerationSchema = z
+  .object({
+    /**
+     * Output token budget. Adapter translates to `max_tokens` (classic models)
+     * or `max_completion_tokens` (gpt-5*, o-series) via `resolveTokenParam`.
+     * Overrides `OPENAI_MAX_OUTPUT_TOKENS` env default when set.
+     */
+    max_output_tokens: z.number().int().positive().optional(),
+    /**
+     * Sampling temperature. Cross-vendor range [0, 2]. Values outside this
+     * range reject the file (schema_violation). For vendor-specific exotic
+     * ranges use provider_options.
+     */
+    temperature: z.number().min(0).max(2).optional(),
+    /**
+     * Nucleus sampling probability. Range [0, 1].
+     */
+    top_p: z.number().min(0).max(1).optional(),
+    /**
+     * Reproducibility seed (integer). Threaded into
+     * `request_shaping.deterministic_seed` by the orchestrator (single seed
+     * source — the adapter does not read `generation.seed` directly).
+     */
+    seed: z.number().int().optional(),
+  })
+  .default({});
+
+export type GenerationConfig = z.infer<typeof GenerationSchema>;
+
+/**
+ * `ProviderOptionsSchema` — raw vendor passthrough map keyed by provider slug.
+ *
+ * Each inner bag is forwarded untouched to the active provider's request body,
+ * minus a denylist of Prisma-critical fields (spec § 3.7).  Keys and values
+ * are arbitrary — this is the forward-compat escape hatch for brand-new model
+ * knobs (design.md P3/P5).
+ *
+ * Only the sub-bag keyed by the active provider's slug is applied; other
+ * slugs' bags are silently ignored at apply time (AS-10, G9).  Unknown slug
+ * keys are simply never read — forward-compat by construction.
+ *
+ * G7: `provider_options` values are forwarded into the request body only and
+ * are NEVER logged.  The `configuration` reply echoes keys only (OQ-7).
+ *
+ * Spec: docs/_planning/config-dx/spec.md § 5.1 (ProviderOptionsSchema), § 3.7.
+ */
+export const ProviderOptionsSchema = z
+  .record(z.string().min(1), z.record(z.string().min(1), z.unknown()))
+  .default({});
+
+export type ProviderOptions = z.infer<typeof ProviderOptionsSchema>;
+
+/**
  * `chunking` configures the diff-chunking subsystem introduced in v0.7.0.
  *
  * When a PR is too large for a single provider call but within the chunkable
@@ -128,6 +206,21 @@ const LanguageOverrideSchema = z
     categories_enabled: CategoriesEnabledSchema.optional(),
     severity: SeverityOverridesSchema.optional(),
     repo_heuristics: RepoHeuristicsSchema.optional(),
+    /**
+     * Per-language model override — schema-only; not applied per-language
+     * in this release (OQ-4). Accepted for forward-compat.
+     */
+    model: z.string().min(1).optional(),
+    /**
+     * Per-language generation settings — schema-only; not applied per-language
+     * in this release (OQ-4). Accepted for forward-compat.
+     */
+    generation: GenerationSchema.optional(),
+    /**
+     * Per-language provider_options — schema-only; not applied per-language
+     * in this release (OQ-4). Accepted for forward-compat.
+     */
+    provider_options: ProviderOptionsSchema.optional(),
   })
   .strict();
 
@@ -194,6 +287,28 @@ export const RepoConfigSchema = z
      * Per docs/config-spec.md § chunking.
      */
     chunking: ChunkingSchema,
+    /**
+     * Vendor-neutral normalized generation settings. The adapter translates
+     * each key to the vendor's dialect (e.g. `max_output_tokens` →
+     * `max_tokens` or `max_completion_tokens` via `resolveTokenParam`).
+     * All fields optional; absent → deployment-level env defaults apply.
+     *
+     * Spec: docs/_planning/config-dx/spec.md § 5.1, § 2 Group B.
+     * Design: docs/_planning/config-dx/design.md § generation block.
+     */
+    generation: GenerationSchema,
+    /**
+     * Raw vendor passthrough map keyed by provider slug. Each inner bag is
+     * forwarded untouched to the active provider's request, minus the
+     * denylist (spec § 3.7). Only the active provider's sub-bag is applied;
+     * other slugs' bags are silently ignored (AS-10).
+     *
+     * Precedence: provider_options > generation > Prisma defaults (P5).
+     * G7: values are NEVER logged; `configuration` reply echoes keys only.
+     *
+     * Spec: docs/_planning/config-dx/spec.md § 5.1, § 3.7, § 2 Group C.
+     */
+    provider_options: ProviderOptionsSchema,
   })
   .describe('Repo-local .github/review-bot.yml configuration');
 

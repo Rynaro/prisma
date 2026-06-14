@@ -1,0 +1,93 @@
+id: generation-provider-options-roundtrip
+name: "generation + provider_options settings thread through to the provider (round-trip)"
+description: >-
+  Validates the end-to-end plumbing of the config-dx easy-settings feature
+  (spec § 7.6): when a repo config sets model, generation, and provider_options,
+  those values reach the FakeProvider as request_shaping on the first call.
+  The pipeline must complete with publication_state: succeeded (zero behavior
+  break from the new fields).
+
+  Assertions checked in the pipeline-runner test (evals/runner/tests/pipeline-runner.test.ts):
+    - request_shaping.model === "gpt-5.4-nano"
+    - request_shaping.generation.max_output_tokens === 8192
+    - request_shaping.generation.temperature === 0.2
+    - request_shaping.deterministic_seed === 42  (mapped from generation.seed)
+    - request_shaping.provider_options.reasoning_effort === "low"
+    - publication_state: succeeded
+
+config_overrides:
+  mode: summary-plus-inline
+  model: fake/gpt-5.4-nano
+  generation:
+    max_output_tokens: 8192
+    temperature: 0.2
+    seed: 42
+  provider_options:
+    fake:
+      reasoning_effort: low
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1001
+  repository:
+    id: 2001
+    full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
+  pull_request:
+    number: 101
+    head:
+      sha: cccccccccccccccccccccccccccccccccccccccc
+
+octokit_responses:
+  pulls_get:
+    number: 101
+    head:
+      sha: cccccccccccccccccccccccccccccccccccccccc
+      ref: feature/generation-roundtrip
+    base:
+      sha: dddddddddddddddddddddddddddddddddddddddd
+      ref: main
+  pulls_list_files:
+    - filename: src/app.ts
+      status: modified
+      additions: 2
+      deletions: 0
+      patch: |
+        @@ -1,2 +1,4 @@
+         export function hello() {
+        +  // added a comment
+           return "world";
+         }
+
+provider_script:
+  - kind: output
+    output:
+      findings: []
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains: []
+    expected_categories: []
+    rejection_reasons: []
+
+metrics:
+  - false_positive_rate

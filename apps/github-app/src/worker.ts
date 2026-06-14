@@ -23,6 +23,7 @@ import {
   ProviderErrorThrowable,
   type RepoConfig,
   parseCommand,
+  parseModelSlug,
 } from '@prisma-bot/shared';
 import IORedis from 'ioredis';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
@@ -311,11 +312,29 @@ const buildHelpReply = (botLogin: string, marker = '@'): string =>
  *
  * Includes `max_files` and `max_changed_lines` so operators can identify
  * which limit an oversized PR is hitting without reading the default docs.
+ *
+ * Model display (spec § 5.5, OQ-7):
+ *   - Echoes the RESOLVED model slug (provider/name when a provider is known,
+ *     bare name otherwise) so operators see what actually resolved.
+ *   - If a non-empty `generation` block is configured, prints it.
+ *   - `provider_options` is echoed as KEYS ONLY under each provider slug
+ *     (G7: no values — prevents any chance of surfacing a secret the user
+ *     accidentally placed in the bag).
  */
 const buildConfigReply = (config: RepoConfig): string => {
   const lines: string[] = ['### Effective repo configuration\n', '```yaml'];
   lines.push(`mode: ${config.mode}`);
-  if (config.model !== undefined) lines.push(`model: ${config.model}`);
+
+  // Echo the resolved model slug.  Run parseModelSlug for consistent display.
+  if (config.model !== undefined) {
+    const slug = parseModelSlug(config.model, config.provider);
+    const displayModel =
+      slug.provider !== undefined && slug.model !== undefined
+        ? `${slug.provider}/${slug.model}`
+        : (slug.model ?? config.model);
+    lines.push(`model: ${displayModel}`);
+  }
+
   if (config.nickname !== undefined) lines.push(`nickname: ${config.nickname}`);
   // Always show command_marker so operators can confirm the active value.
   lines.push(`command_marker: "${config.command_marker}"`);
@@ -334,6 +353,35 @@ const buildConfigReply = (config: RepoConfig): string => {
     `  max_provider_calls_per_pr: ${config.chunking.max_provider_calls_per_pr}`,
     `  call_token_budget: ${config.chunking.call_token_budget}`,
   );
+
+  // Generation block: only echo when at least one field is set.
+  const gen = config.generation;
+  if (
+    gen.max_output_tokens !== undefined ||
+    gen.temperature !== undefined ||
+    gen.top_p !== undefined ||
+    gen.seed !== undefined
+  ) {
+    lines.push('generation:');
+    if (gen.max_output_tokens !== undefined)
+      lines.push(`  max_output_tokens: ${gen.max_output_tokens}`);
+    if (gen.temperature !== undefined) lines.push(`  temperature: ${gen.temperature}`);
+    if (gen.top_p !== undefined) lines.push(`  top_p: ${gen.top_p}`);
+    if (gen.seed !== undefined) lines.push(`  seed: ${gen.seed}`);
+  }
+
+  // provider_options: keys ONLY per OQ-7 / G7.
+  const poEntries = Object.entries(config.provider_options);
+  if (poEntries.length > 0) {
+    lines.push('provider_options:');
+    for (const [providerSlug, bag] of poEntries) {
+      if (typeof bag === 'object' && bag !== null) {
+        const keys = Object.keys(bag);
+        lines.push(`  ${providerSlug}: [${keys.join(', ')}]`);
+      }
+    }
+  }
+
   lines.push(
     'repo_heuristics:',
     `  security: ${String(config.repo_heuristics.security)}`,

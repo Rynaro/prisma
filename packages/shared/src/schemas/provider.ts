@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { GenerationSchema } from './config.js';
 import { CategorySchema, SeveritySchema } from './finding.js';
 import { CustomGuidanceSchema } from './guidance.js';
 
@@ -35,6 +36,29 @@ export const ProviderRequestShapingSchema = z
     model: z.string().min(1).optional(),
     deterministic_seed: z.number().int().optional(),
     capability_hints: z.array(z.string().min(1)).optional(),
+    /**
+     * Normalized generation settings forwarded from `config.generation`.
+     * The orchestrator maps `config.generation.seed` → `deterministic_seed`
+     * (single seed source) before building this bag, so `generation.seed`
+     * is NOT re-read by the adapter.
+     *
+     * Spec: docs/_planning/config-dx/spec.md § 5.2, § 5.4.
+     */
+    generation: GenerationSchema.optional(),
+    /**
+     * Already-narrowed raw passthrough bag for the ACTIVE provider only.
+     * The orchestrator selects `config.provider_options[activeProvider]`
+     * and places it here so the adapter never needs to know its own slug
+     * or key into the full provider-options map (prevents cross-vendor
+     * leakage at the boundary).
+     *
+     * Values are arbitrary (`unknown`); the denylist is enforced in the
+     * adapter before the keys reach the wire.
+     *
+     * G7: NEVER log any value from this bag.
+     * Spec: docs/_planning/config-dx/spec.md § 5.2, § 3.7.
+     */
+    provider_options: z.record(z.string().min(1), z.unknown()).optional(),
   })
   .strict();
 export type ProviderRequestShaping = z.infer<typeof ProviderRequestShapingSchema>;

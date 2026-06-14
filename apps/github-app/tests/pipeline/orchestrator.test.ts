@@ -4,6 +4,7 @@ import {
   type JobPayload,
   type PrSnapshot,
   ProviderErrorThrowable,
+  type ProviderReviewInput,
   type ProviderReviewOutput,
   type RepoConfig,
   RepoConfigSchema,
@@ -1182,5 +1183,213 @@ describe('runPipeline — diff chunking', () => {
     await runPipeline(makePayload(), deps);
     expect(capturedNotices[0]).toMatch(/section/i);
     expect(capturedNotices[0]).toMatch(/large PR/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Config DX: buildProviderInput request_shaping threading (spec § 5.4, R1)
+// ---------------------------------------------------------------------------
+
+describe('buildProviderInput: request_shaping threading through the orchestrator', () => {
+  const repoLookupFn: RepoLookup = async () => REPO_ID;
+
+  /** Build an octokit that returns a single changed file. */
+  const buildSimpleOctokit = (): OctokitLike =>
+    ({
+      rest: {
+        pulls: {
+          get: async () => ({
+            data: {
+              number: 7,
+              head: { sha: 'a'.repeat(40), ref: 'feature' },
+              base: { sha: 'b'.repeat(40), ref: 'main' },
+            },
+          }),
+          listFiles: async () => ({
+            data: [
+              {
+                filename: 'src/app.ts',
+                status: 'modified',
+                additions: 5,
+                deletions: 0,
+                patch: '@@ -1,3 +1,8 @@\n+const x = 1;\n',
+              },
+            ],
+          }),
+        },
+        repos: {
+          getContent: async () => ({ data: {} }),
+        },
+        checks: {
+          create: async () => ({ data: { id: 1 } }),
+          update: async () => ({ data: { id: 1 } }),
+          listForRef: async () => ({ data: { check_runs: [] } }),
+        },
+        issues: {
+          listComments: async () => ({ data: [] }),
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: test stub
+      } as any,
+      graphql: async () => ({}),
+      paginate: async <T>(_method: unknown, _params: unknown, mapFn: unknown) => {
+        // For the paginate call used by check runs listing, return empty
+        if (typeof mapFn === 'function') {
+          const result = await (mapFn as (data: unknown) => T)({ check_runs: [] });
+          return result as T[];
+        }
+        return [];
+      },
+    }) as unknown as OctokitLike;
+
+  /** Build a pipeline that captures the first provider call's request_shaping. */
+  const runAndCapture = async (
+    config: RepoConfig,
+    providerName = 'fake',
+  ): Promise<ProviderReviewInput | undefined> => {
+    let captured: ProviderReviewInput | undefined;
+    const provider = new FakeProvider({
+      name: providerName,
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+    // Wrap to capture the input
+    const originalReview = provider.review.bind(provider);
+    provider.review = async (input) => {
+      captured = input;
+      return originalReview(input);
+    };
+
+    const octokit = buildSimpleOctokit();
+    const deps: OrchestratorDeps = {
+      installationAuth: {} as InstallationAuth,
+      provider,
+      config,
+      repoLookup: repoLookupFn,
+      octokit,
+      logger: { emit: () => {} },
+    };
+    await runPipeline(makePayload(), deps);
+    return captured;
+  };
+
+  it('zero-config: request_shaping is absent when no model/generation/provider_options set (AS-11)', async () => {
+    const config = RepoConfigSchema.parse({ mode: 'summary-plus-inline' });
+    const captured = await runAndCapture(config);
+    expect(captured?.request_shaping).toBeUndefined();
+  });
+
+  it('slug model → request_shaping.model is bare name (no provider prefix) (AS-2)', async () => {
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      model: 'fake/gpt-test',
+    });
+    const captured = await runAndCapture(config, 'fake');
+    expect(captured?.request_shaping?.model).toBe('gpt-test');
+  });
+
+  it('generation.seed → request_shaping.deterministic_seed (single seed source, spec § 5.4)', async () => {
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      generation: { seed: 42, max_output_tokens: 8192 },
+    });
+    const captured = await runAndCapture(config, 'fake');
+    expect(captured?.request_shaping?.deterministic_seed).toBe(42);
+    expect(captured?.request_shaping?.generation?.max_output_tokens).toBe(8192);
+  });
+
+  it('provider_options narrowed to active provider (AS-10, G9)', async () => {
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      provider_options: {
+        fake: { custom_knob: 'value_for_fake' },
+        openai: { reasoning_effort: 'low' },
+      },
+    });
+    // Active provider is "fake"
+    const captured = await runAndCapture(config, 'fake');
+    // Only the "fake" bag should be present
+    expect(captured?.request_shaping?.provider_options?.custom_knob).toBe('value_for_fake');
+    // "openai" bag must NOT leak in
+    expect(captured?.request_shaping?.provider_options?.reasoning_effort).toBeUndefined();
+  });
+
+  // R1: slug provider ≠ active provider → mismatch note + model falls back
+  it('R1: slug provider ≠ active provider → config note emitted, model not forwarded', async () => {
+    const capturedNotes: string[][] = [];
+    const provider = new FakeProvider({
+      name: 'fake', // active provider is "fake"
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+
+    let captured: ProviderReviewInput | undefined;
+    const originalReview = provider.review.bind(provider);
+    provider.review = async (input) => {
+      captured = input;
+      return originalReview(input);
+    };
+
+    const octokit = buildSimpleOctokit();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      // slug names "anthropic" but active provider is "fake"
+      model: 'anthropic/claude-sonnet-4.5',
+    });
+
+    const deps: OrchestratorDeps = {
+      installationAuth: {} as InstallationAuth,
+      provider,
+      config,
+      repoLookup: repoLookupFn,
+      octokit,
+      logger: { emit: () => {} },
+    };
+    const result = await runPipeline(makePayload(), deps);
+
+    // Model should NOT be forwarded (it's a foreign provider's model name)
+    expect(captured?.request_shaping?.model).toBeUndefined();
+
+    // A config note should mention the mismatch
+    const notes = result.config_notes ?? [];
+    expect(notes.some((n) => n.includes('anthropic') && n.includes('fake'))).toBe(true);
+  });
+
+  // R1: slug provider matches active → model forwarded normally
+  it('R1: slug provider = active provider → model forwarded (no mismatch note)', async () => {
+    const provider = new FakeProvider({
+      name: 'fake',
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+
+    let captured: ProviderReviewInput | undefined;
+    const originalReview = provider.review.bind(provider);
+    provider.review = async (input) => {
+      captured = input;
+      return originalReview(input);
+    };
+
+    const octokit = buildSimpleOctokit();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      model: 'fake/test-model-v2',
+    });
+
+    const deps: OrchestratorDeps = {
+      installationAuth: {} as InstallationAuth,
+      provider,
+      config,
+      repoLookup: repoLookupFn,
+      octokit,
+      logger: { emit: () => {} },
+    };
+    const result = await runPipeline(makePayload(), deps);
+
+    // Model should be forwarded as bare name
+    expect(captured?.request_shaping?.model).toBe('test-model-v2');
+
+    // No mismatch config note
+    const notes = result.config_notes ?? [];
+    const hasMismatchNote = notes.some(
+      (n) => n.includes('names provider') && n.includes('but this deployment'),
+    );
+    expect(hasMismatchNote).toBe(false);
   });
 });

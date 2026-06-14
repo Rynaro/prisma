@@ -119,6 +119,67 @@ describe('runPipelineForFixture', () => {
     expect(outcome.publication?.summary_artifact).toContain('security');
   });
 
+  /**
+   * Config-DX easy-settings round-trip (spec § 7.6):
+   * Asserts that model/generation/provider_options config fields are correctly
+   * threaded through buildProviderInput and arrive at the FakeProvider's
+   * first call as request_shaping fields.
+   */
+  it('generation + provider_options roundtrip: settings arrive at FakeProvider.calls[0].request_shaping', async () => {
+    const fixture = buildFixture({
+      config_overrides: {
+        mode: 'summary-plus-inline',
+        model: 'fake/gpt-5.4-nano',
+        generation: {
+          max_output_tokens: 8192,
+          temperature: 0.2,
+          seed: 42,
+        },
+        provider_options: {
+          fake: { reasoning_effort: 'low' },
+        },
+      },
+      provider_script: [{ kind: 'output', output: { findings: [] } }],
+      expectations: {
+        prefilter: {
+          outcome: 'accepted',
+          skipped_paths: [],
+          skipped_reasons: [],
+          files_sent_to_provider: 1,
+        },
+        provider: { calls: 1 },
+        validator: { findings: 0, rejection_reasons: [] },
+        ranker: { output_size_eq_input: true },
+        publisher: {
+          inline_count: 0,
+          summary_count: 0,
+          dropped_count: 0,
+          publication_state: 'succeeded',
+          summary_contains: [],
+          expected_categories: [],
+          rejection_reasons: [],
+        },
+      },
+    });
+    const filesPayload = filesPayloadFromFixture(fixture);
+    const outcome = await runPipelineForFixture({ fixture, filesPayload });
+
+    // Pipeline must succeed (zero behavior break)
+    expect(outcome.publisher.publication_state).toBe('succeeded');
+    expect(outcome.provider.calls).toBe(1);
+
+    // request_shaping must be threaded through (spec § 7.6)
+    const rs = outcome.provider.first_call_request_shaping;
+    expect(rs).toBeDefined();
+    expect(rs?.model).toBe('gpt-5.4-nano');
+    expect(rs?.generation?.max_output_tokens).toBe(8192);
+    expect(rs?.generation?.temperature).toBe(0.2);
+    // seed is mapped to deterministic_seed by the orchestrator (single seed source)
+    expect(rs?.deterministic_seed).toBe(42);
+    // provider_options narrowed to the active provider ("fake")
+    expect((rs?.provider_options as Record<string, unknown>)?.reasoning_effort).toBe('low');
+  });
+
   it('schema-validation provider error: validator rejection, summary-only fallback, succeeded state', async () => {
     const fixture = buildFixture({
       provider_script: [

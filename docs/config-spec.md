@@ -39,14 +39,81 @@ Configuration is resolved in this order; each layer overrides the previous on a 
 - **Default.** `anthropic` (per OQ-1 resolution).
 - **Validation rule (plain English).** Must be a known adapter id registered with the App. Unknown adapter ids reject the file.
 - **Example.** `provider: anthropic`
+- **Deprecation note.** Setting `provider:` alongside a bare `model:` name is supported but deprecated. Prefer the `provider/name` slug form on `model:` instead (see below). When both are present and the slug's provider differs from `provider:`, the slug wins and a config note is emitted.
 
 ### model
 
-- **Type.** String.
+- **Type.** String — either a bare model name or a `provider/name` slug.
 - **Required.** Optional.
 - **Default.** Unset; resolved from deployment configuration when absent.
-- **Validation rule (plain English).** Provider-specific opaque identifier. The App does not interpret the string; the provider adapter validates it against its own capability surface.
-- **Example.** `model: claude-4-class-model-id`
+- **Validation rule (plain English).** Two accepted forms:
+  - **`provider/name` slug** (preferred): `openai/gpt-5.4-nano`. The part before the `/` is the provider slug (used for `provider_options` bag keying and config echo); the part after is the bare model name forwarded to the active adapter. The slug never switches the active adapter in this release — adapter selection remains env-key-driven.
+  - **Bare name** (existing form): `gpt-4o`. Resolved using the active adapter's default. When a legacy `provider:` key is also set, a deprecation note is appended to the check-run summary.
+- **Conflict rule.** If `provider: anthropic` and `model: openai/gpt-5.4-nano` are both set, the slug wins (`provider=openai, model=gpt-5.4-nano`) and a warning note is emitted. The file is never rejected on this conflict.
+- **Malformed slugs.** `openai/` (empty name) → warning, no model override; `/gpt-4o` (empty provider) → treated as bare `gpt-4o`; `a/b/c` (multiple slashes) → warning, no model override. None of these reject the file.
+- **Example.** `model: openai/gpt-5.4-nano`  (slug form, preferred)
+- **Migration.** Replace `provider: openai` + `model: gpt-5.4-nano` with `model: openai/gpt-5.4-nano` and remove the `provider:` key.
+
+### generation
+
+- **Type.** Object.
+- **Required.** Optional.
+- **Default.** `{}` (empty — all sub-keys absent, deployment defaults apply).
+- **Validation rule (plain English).** All sub-keys are optional and independently validated:
+  - `max_output_tokens`: positive integer. Overrides the deployment-level `OPENAI_MAX_OUTPUT_TOKENS` for this repo's requests. The token parameter key (`max_tokens` vs `max_completion_tokens`) is chosen by the adapter per model family — the config need not specify which.
+  - `temperature`: number in `[0, 2]`. Values outside this range reject the file.
+  - `top_p`: number in `[0, 1]`. Values outside this range reject the file.
+  - `seed`: integer (any sign). Forwarded to the adapter as a determinism hint.
+  - Unknown sub-keys are warned and ignored (consistent with the outer warn-and-ignore policy).
+- **Precedence.** `provider_options` (raw passthrough) overrides `generation` (normalized) which overrides deployment-level env defaults.
+- **Vendor note.** `generation` fields are normalized and translated by each adapter to its wire dialect. In this release only the OpenAI adapter translates them. Anthropic and Copilot adapters ignore `generation`; use `provider_options` for vendor-specific knobs.
+- **Example.**
+
+  ```yaml
+  generation:
+    max_output_tokens: 8192
+    temperature: 0.2
+    top_p: 0.95
+    seed: 42
+  ```
+
+### provider_options
+
+- **Type.** Object (map of provider slug → open bag).
+- **Required.** Optional.
+- **Default.** `{}` (empty).
+- **Validation rule (plain English).** Keys at the top level are provider slugs (e.g. `openai`, `anthropic`). Values are objects with arbitrary string keys. Only the sub-bag keyed by the **active provider** is applied; all other sub-bags are silently ignored (no cross-provider leakage).
+- **Passthrough semantics.** All keys in the active provider's bag are forwarded verbatim to the provider request, **minus** the Prisma-managed denylist (see § Denylist below). This is the escape hatch for vendor-specific request fields (`reasoning_effort`, `service_tier`, etc.) not covered by `generation`.
+- **Precedence.** `provider_options` wins last — it overrides any normalized field set by `generation`. For example, setting both `generation.max_output_tokens: 4096` and `provider_options.openai.max_tokens: 1000` on a classic model causes `max_tokens: 1000` on the wire.
+- **Secret safety.** The `configuration` check-run reply echoes **keys only** (never values) per provider, e.g. `openai: [reasoning_effort, service_tier]`. Provider option values are never logged.
+- **Example.**
+
+  ```yaml
+  provider_options:
+    openai:
+      reasoning_effort: low
+      service_tier: flex
+    anthropic:
+      thinking:
+        type: enabled
+        budget_tokens: 1024
+  ```
+
+#### Denylist (OpenAI)
+
+The following keys are **dropped** when present in `provider_options.openai`, and a config note is emitted naming each dropped key. They protect the review structured-output contract:
+
+| Dropped key | Reason |
+|---|---|
+| `model` | Resolved from the `model:` slug; passthrough must not silently retarget it. |
+| `messages` | Prisma-owned prompt; overriding it discards review instructions. |
+| `tools` | Must remain the single `submit_review_findings` function tool. |
+| `tool_choice` | Must remain forced to `submit_review_findings`; `"none"` or `"auto"` breaks structured output. |
+| `stream` | Pipeline consumes a single JSON response; streaming breaks extraction. |
+| `n` | Multiple choices break the `choices[0]` extraction contract. |
+| `response_format` | Conflicts with the function-calling structured-output path. |
+
+`max_tokens`, `max_completion_tokens`, `seed`, `temperature`, and `top_p` are **not** denylisted — overriding them via `provider_options` is the intended escape-hatch pattern.
 
 ### thresholds
 
@@ -339,8 +406,9 @@ The following YAML block is a complete, valid `.github/review-bot.yml` that uses
 ```yaml
 enabled: true
 mode: dry-run
-provider: anthropic
-model: claude-4-class-model-id
+# Preferred form: provider/name slug. The 'provider:' key is deprecated when used
+# alongside a slug; remove it and encode the provider in the model slug instead.
+model: openai/gpt-5.4-nano
 thresholds:
   severity_floor:
     inline: medium
@@ -379,6 +447,19 @@ repo_heuristics:
   tests: true
   migrations: true
   layering: true
+# Optional: vendor-neutral generation parameters. All sub-keys are optional.
+# Absent fields fall through to deployment-level env defaults.
+generation:
+  max_output_tokens: 8192
+  temperature: 0.2
+  # top_p: 0.95   # uncomment to set
+  # seed: 42       # uncomment for deterministic sampling
+# Optional: raw passthrough to the active provider's API request.
+# Only the sub-bag keyed by the active provider is forwarded; values are never logged.
+# provider_options:
+#   openai:
+#     reasoning_effort: low
+#     service_tier: flex
 # Optional: set a nickname so both '@prisma-bot' and '@prbot' trigger commands.
 nickname: prbot
 # Optional: use '$' instead of '@' to avoid GitHub's @-autocomplete.
@@ -391,6 +472,21 @@ chunking:
   max_provider_calls_per_pr: 6
   call_token_budget: 60000
 ```
+
+### Migration from legacy `provider:` + `model:` form
+
+**Before (deprecated but still accepted):**
+```yaml
+provider: openai
+model: gpt-5.4-nano
+```
+
+**After (preferred):**
+```yaml
+model: openai/gpt-5.4-nano
+```
+
+Remove the `provider:` key and encode the provider in the `model:` slug. The schema continues to accept the legacy form and emits a deprecation note in the check-run summary. If `provider:` and a conflicting slug are both present, the slug wins.
 
 ## Failure modes
 

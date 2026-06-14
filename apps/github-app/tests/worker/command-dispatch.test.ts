@@ -6,6 +6,7 @@ import {
   RepoConfigSchema,
   parseCommand,
   parseMentionCandidate,
+  parseModelSlug,
   requiresWrite,
 } from '@prisma-bot/shared';
 import { describe, expect, it, vi } from 'vitest';
@@ -722,5 +723,161 @@ describe('chunked review reply text', () => {
     });
     expect(reply).toContain('2 of 4 section(s) could not be analyzed');
     expect(reply).toContain('1 file(s) were too large');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildConfigReply — new generation + provider_options fields (spec § 5.5)
+// ---------------------------------------------------------------------------
+
+describe('buildConfigReply — generation and provider_options (config-dx)', () => {
+  /**
+   * Local mirror of worker.ts buildConfigReply, extended for the easy-settings
+   * feature (spec § 5.5, OQ-7). Tests the contract that:
+   *  - generation block appears when non-empty.
+   *  - provider_options is echoed as KEY LISTS ONLY (G7 — no values).
+   *  - Resolved model slug is echoed (provider/name form when provider is known).
+   *  - Zero-config produces no generation/provider_options sections.
+   */
+  const buildConfigReply = (config: RepoConfig): string => {
+    const lines: string[] = ['### Effective repo configuration\n', '```yaml'];
+    lines.push(`mode: ${config.mode}`);
+
+    if (config.model !== undefined) {
+      const slug = parseModelSlug(config.model, config.provider);
+      const displayModel =
+        slug.provider !== undefined && slug.model !== undefined
+          ? `${slug.provider}/${slug.model}`
+          : (slug.model ?? config.model);
+      lines.push(`model: ${displayModel}`);
+    }
+
+    if (config.nickname !== undefined) lines.push(`nickname: ${config.nickname}`);
+    lines.push(`command_marker: "${config.command_marker}"`);
+    lines.push(`max_files: ${config.max_files}`);
+    lines.push(`max_changed_lines: ${config.max_changed_lines}`);
+    lines.push(
+      'chunking:',
+      `  enabled: ${String(config.chunking.enabled)}`,
+      `  max_files: ${config.chunking.max_files}`,
+      `  max_changed_lines: ${config.chunking.max_changed_lines}`,
+      `  max_provider_calls_per_pr: ${config.chunking.max_provider_calls_per_pr}`,
+      `  call_token_budget: ${config.chunking.call_token_budget}`,
+    );
+
+    const gen = config.generation;
+    if (
+      gen.max_output_tokens !== undefined ||
+      gen.temperature !== undefined ||
+      gen.top_p !== undefined ||
+      gen.seed !== undefined
+    ) {
+      lines.push('generation:');
+      if (gen.max_output_tokens !== undefined)
+        lines.push(`  max_output_tokens: ${gen.max_output_tokens}`);
+      if (gen.temperature !== undefined) lines.push(`  temperature: ${gen.temperature}`);
+      if (gen.top_p !== undefined) lines.push(`  top_p: ${gen.top_p}`);
+      if (gen.seed !== undefined) lines.push(`  seed: ${gen.seed}`);
+    }
+
+    const poEntries = Object.entries(config.provider_options);
+    if (poEntries.length > 0) {
+      lines.push('provider_options:');
+      for (const [providerSlug, bag] of poEntries) {
+        if (typeof bag === 'object' && bag !== null) {
+          const keys = Object.keys(bag);
+          lines.push(`  ${providerSlug}: [${keys.join(', ')}]`);
+        }
+      }
+    }
+
+    lines.push(
+      'repo_heuristics:',
+      `  security: ${String(config.repo_heuristics.security)}`,
+      `  tests: ${String(config.repo_heuristics.tests)}`,
+      `  migrations: ${String(config.repo_heuristics.migrations)}`,
+      `  layering: ${String(config.repo_heuristics.layering)}`,
+    );
+    lines.push('```');
+    return lines.join('\n');
+  };
+
+  const defaultConfig = (): RepoConfig => RepoConfigSchema.parse({});
+
+  it('zero-config: no generation block in output (AS-11)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).not.toContain('generation:');
+  });
+
+  it('zero-config: no provider_options block in output (AS-11)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).not.toContain('provider_options:');
+  });
+
+  it('generation block appears when max_output_tokens set', () => {
+    const config = RepoConfigSchema.parse({ generation: { max_output_tokens: 8192 } });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('generation:');
+    expect(reply).toContain('max_output_tokens: 8192');
+  });
+
+  it('generation block shows temperature and seed when set', () => {
+    const config = RepoConfigSchema.parse({
+      generation: { temperature: 0.2, seed: 42 },
+    });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('temperature: 0.2');
+    expect(reply).toContain('seed: 42');
+  });
+
+  it('provider_options echoes keys only — not values (G7/OQ-7)', () => {
+    const config = RepoConfigSchema.parse({
+      provider_options: {
+        openai: { reasoning_effort: 'low', some_secret: 'THIS_SHOULD_NOT_APPEAR' },
+      },
+    });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('provider_options:');
+    expect(reply).toContain('openai:');
+    // Keys present
+    expect(reply).toContain('reasoning_effort');
+    expect(reply).toContain('some_secret');
+    // Values NOT present (G7)
+    expect(reply).not.toContain('THIS_SHOULD_NOT_APPEAR');
+    expect(reply).not.toContain("'low'");
+    expect(reply).not.toContain('"low"');
+  });
+
+  it('model slug echoed as provider/name form when qualified (spec § 5.5)', () => {
+    const config = RepoConfigSchema.parse({ model: 'openai/gpt-5.4-nano' });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('model: openai/gpt-5.4-nano');
+  });
+
+  it('bare model name + default provider echoed as provider/name (deprecated-but-parsed path)', () => {
+    // When model: 'gpt-4o' is set and provider defaults to 'anthropic',
+    // parseModelSlug returns provider='anthropic', model='gpt-4o'
+    // so the echo is 'anthropic/gpt-4o' (the resolved form).
+    const config = RepoConfigSchema.parse({ model: 'gpt-4o' });
+    const reply = buildConfigReply(config);
+    // The model line must be present (exact form depends on legacy-provider resolution)
+    expect(reply).toMatch(/model: (anthropic\/)?gpt-4o/);
+  });
+
+  it('multiple providers in provider_options: all shown as key lists', () => {
+    const config = RepoConfigSchema.parse({
+      provider_options: {
+        openai: { reasoning_effort: 'low' },
+        anthropic: { thinking: 'enabled' },
+      },
+    });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('openai:');
+    expect(reply).toContain('anthropic:');
+    expect(reply).toContain('reasoning_effort');
+    expect(reply).toContain('thinking');
+    // Values not present
+    expect(reply).not.toContain("'low'");
+    expect(reply).not.toContain("'enabled'");
   });
 });

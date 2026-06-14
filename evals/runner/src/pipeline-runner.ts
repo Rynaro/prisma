@@ -6,6 +6,7 @@ import {
   type CustomGuidance,
   type JobPayload,
   type ProviderError,
+  type ProviderRequestShaping,
   type ProviderReviewOutput,
   type PublicationResult,
   type RejectionLogEntry,
@@ -59,6 +60,12 @@ export interface RunOutcome {
     calls: number;
     /** The custom_guidance from the first provider call, if any. */
     first_call_custom_guidance?: CustomGuidance;
+    /**
+     * The request_shaping from the first provider call, if any.
+     * Used by the generation-provider-options-roundtrip eval scenario
+     * (spec § 7.6) to assert that config settings reach the provider.
+     */
+    first_call_request_shaping?: ProviderRequestShaping;
   };
   validator: {
     findings: number;
@@ -306,9 +313,10 @@ export const runPipelineForFixture = async (
     ? collectPublisherRejectionReasons(publication)
     : [];
 
-  // Capture the custom_guidance from the first provider call for assertion.
+  // Capture the custom_guidance and request_shaping from the first provider call for assertion.
   const firstCall = provider.calls[0];
   const firstCallCustomGuidance = firstCall?.custom_guidance;
+  const firstCallRequestShaping = firstCall?.request_shaping;
 
   const outcome: RunOutcome = {
     prefilter: prefilterMirror,
@@ -316,6 +324,9 @@ export const runPipelineForFixture = async (
       calls: provider.calls.length,
       ...(firstCallCustomGuidance !== undefined
         ? { first_call_custom_guidance: firstCallCustomGuidance }
+        : {}),
+      ...(firstCallRequestShaping !== undefined
+        ? { first_call_request_shaping: firstCallRequestShaping }
         : {}),
     },
     validator: {

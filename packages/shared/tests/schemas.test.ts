@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { parseCommand, parseMentionCandidate, requiresWrite } from '../src/commands/parse.js';
 import {
   DEFAULT_REPO_CONFIG,
+  GenerationSchema,
   JobPayloadSchema,
   MAX_CONTEXT_FILES,
   MAX_INSTRUCTION_BLOCK_BYTES,
   MAX_PATH_INSTRUCTIONS,
   NormalizedFindingSchema,
+  ProviderOptionsSchema,
   ProviderReviewInputSchema,
   ProviderReviewOutputSchema,
   RejectionLogEntrySchema,
@@ -704,6 +706,220 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
       expect(requiresWrite({ kind: 'full_review' })).toBe(false);
       expect(requiresWrite({ kind: 'help', unknown: false })).toBe(false);
       expect(requiresWrite({ kind: 'configuration' })).toBe(false);
+    });
+  });
+
+  // ── Config DX: easy-settings schemas ──────────────────────────────────────
+
+  describe('GenerationSchema', () => {
+    it('defaults to empty object when absent', () => {
+      const result = GenerationSchema.safeParse(undefined);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toEqual({});
+      }
+    });
+
+    it('accepts all four normalized keys', () => {
+      const result = GenerationSchema.safeParse({
+        max_output_tokens: 8192,
+        temperature: 0.2,
+        top_p: 0.9,
+        seed: 42,
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.max_output_tokens).toBe(8192);
+        expect(result.data.temperature).toBe(0.2);
+        expect(result.data.top_p).toBe(0.9);
+        expect(result.data.seed).toBe(42);
+      }
+    });
+
+    it('rejects temperature > 2 (OQ-6)', () => {
+      const result = GenerationSchema.safeParse({ temperature: 3 });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects temperature < 0', () => {
+      const result = GenerationSchema.safeParse({ temperature: -0.1 });
+      expect(result.success).toBe(false);
+    });
+
+    it('accepts temperature = 0 and temperature = 2 (boundary values)', () => {
+      expect(GenerationSchema.safeParse({ temperature: 0 }).success).toBe(true);
+      expect(GenerationSchema.safeParse({ temperature: 2 }).success).toBe(true);
+    });
+
+    it('rejects top_p > 1 (OQ-6)', () => {
+      const result = GenerationSchema.safeParse({ top_p: 1.1 });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects top_p < 0', () => {
+      const result = GenerationSchema.safeParse({ top_p: -0.1 });
+      expect(result.success).toBe(false);
+    });
+
+    it('accepts top_p = 0 and top_p = 1 (boundary values)', () => {
+      expect(GenerationSchema.safeParse({ top_p: 0 }).success).toBe(true);
+      expect(GenerationSchema.safeParse({ top_p: 1 }).success).toBe(true);
+    });
+
+    it('rejects non-positive max_output_tokens', () => {
+      expect(GenerationSchema.safeParse({ max_output_tokens: 0 }).success).toBe(false);
+      expect(GenerationSchema.safeParse({ max_output_tokens: -1 }).success).toBe(false);
+    });
+
+    it('strips unknown keys (warn-and-ignore; AS-12)', () => {
+      // GenerationSchema is non-strict (strips unknown keys like the outer schema)
+      const result = GenerationSchema.safeParse({ frobnicate: 1, temperature: 0.5 });
+      // The unknown key "frobnicate" is stripped (non-strict mode)
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect((result.data as Record<string, unknown>).frobnicate).toBeUndefined();
+        expect(result.data.temperature).toBe(0.5);
+      }
+    });
+
+    it('accepts partial (only temperature set)', () => {
+      const result = GenerationSchema.safeParse({ temperature: 0.7 });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.temperature).toBe(0.7);
+        expect(result.data.max_output_tokens).toBeUndefined();
+      }
+    });
+  });
+
+  describe('ProviderOptionsSchema', () => {
+    it('defaults to empty object', () => {
+      const result = ProviderOptionsSchema.safeParse(undefined);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toEqual({});
+      }
+    });
+
+    it('accepts arbitrary keys in provider sub-bags', () => {
+      const result = ProviderOptionsSchema.safeParse({
+        openai: { reasoning_effort: 'low', verbosity: 'low' },
+        anthropic: { thinking: { type: 'enabled', budget_tokens: 8000 } },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect((result.data.openai as Record<string, unknown>).reasoning_effort).toBe('low');
+      }
+    });
+
+    it('accepts an empty outer bag', () => {
+      expect(ProviderOptionsSchema.safeParse({}).success).toBe(true);
+    });
+  });
+
+  describe('DEFAULT_REPO_CONFIG: generation and provider_options additive keys (G1)', () => {
+    it('DEFAULT_REPO_CONFIG has generation defaulting to empty object', () => {
+      expect(DEFAULT_REPO_CONFIG.generation).toBeDefined();
+      expect(DEFAULT_REPO_CONFIG.generation).toEqual({});
+    });
+
+    it('DEFAULT_REPO_CONFIG has provider_options defaulting to empty object', () => {
+      expect(DEFAULT_REPO_CONFIG.provider_options).toBeDefined();
+      expect(DEFAULT_REPO_CONFIG.provider_options).toEqual({});
+    });
+
+    it('zero-config parse produces generation={} and provider_options={} (AS-11)', () => {
+      const cfg = RepoConfigSchema.parse({});
+      expect(cfg.generation).toEqual({});
+      expect(cfg.provider_options).toEqual({});
+    });
+  });
+
+  describe('RepoConfigSchema: generation and provider_options wired into full schema', () => {
+    it('accepts a full generation block in the schema', () => {
+      const result = RepoConfigSchema.safeParse({
+        generation: {
+          max_output_tokens: 16384,
+          temperature: 0.1,
+          top_p: 0.95,
+          seed: 12345,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.generation.max_output_tokens).toBe(16384);
+        expect(result.data.generation.seed).toBe(12345);
+      }
+    });
+
+    it('rejects generation.temperature out-of-range inside full schema', () => {
+      const result = RepoConfigSchema.safeParse({ generation: { temperature: 5 } });
+      expect(result.success).toBe(false);
+    });
+
+    it('accepts a provider_options block with nested arbitrary keys', () => {
+      const result = RepoConfigSchema.safeParse({
+        provider_options: {
+          openai: { reasoning_effort: 'medium' },
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        const bag = result.data.provider_options.openai as Record<string, unknown>;
+        expect(bag.reasoning_effort).toBe('medium');
+      }
+    });
+
+    it('generation and provider_options absent → zero-config identical to pre-change defaults', () => {
+      const cfg = RepoConfigSchema.parse({});
+      // Pre-existing field defaults must be unchanged
+      expect(cfg.mode).toBe('dry-run');
+      expect(cfg.provider).toBe('anthropic');
+      expect(cfg.comment_cap.per_pr).toBe(5);
+      // New fields default to empty objects (not undefined; G1)
+      expect(cfg.generation).toEqual({});
+      expect(cfg.provider_options).toEqual({});
+    });
+  });
+
+  describe('ProviderReviewInput: request_shaping extended fields (spec § 5.2)', () => {
+    it('accepts request_shaping with generation block', () => {
+      const result = ProviderReviewInputSchema.safeParse({
+        files: [],
+        request_shaping: {
+          model: 'gpt-5.4-nano',
+          generation: { max_output_tokens: 8192, temperature: 0.2 },
+        },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('accepts request_shaping with provider_options bag', () => {
+      const result = ProviderReviewInputSchema.safeParse({
+        files: [],
+        request_shaping: {
+          provider_options: { reasoning_effort: 'low' },
+        },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('accepts request_shaping with all new fields together', () => {
+      const result = ProviderReviewInputSchema.safeParse({
+        files: [],
+        request_shaping: {
+          model: 'gpt-5.4-nano',
+          deterministic_seed: 42,
+          generation: { max_output_tokens: 8192, temperature: 0.2, top_p: 0.9 },
+          provider_options: { reasoning_effort: 'low' },
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.request_shaping?.model).toBe('gpt-5.4-nano');
+        expect(result.data.request_shaping?.generation?.max_output_tokens).toBe(8192);
+        expect(result.data.request_shaping?.provider_options?.reasoning_effort).toBe('low');
+      }
     });
   });
 });
