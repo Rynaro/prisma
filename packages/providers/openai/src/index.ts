@@ -10,6 +10,73 @@ import { type OpenAIChatCompletionsArgs, createOpenAIClient } from './client.js'
 import { mapOpenAIError } from './error-mapping.js';
 import { buildPrompt } from './prompt.js';
 
+// ---------------------------------------------------------------------------
+// Token-param resolution — D1 (per-request token-limit parameter selection)
+// ---------------------------------------------------------------------------
+
+/**
+ * `TokenParamStyle` — the three possible styles for the output-token cap field.
+ *
+ *   - `'auto'`                   : heuristic selects the correct parameter for
+ *                                   the resolved model (default; see
+ *                                   `resolveTokenParam` for the regex).
+ *   - `'max_tokens'`             : force the classic parameter — useful for
+ *                                   proxy gateways that lag OpenAI's rollout or
+ *                                   for models that the heuristic misclassifies.
+ *   - `'max_completion_tokens'`  : force the newer parameter — useful for
+ *                                   custom deployments behind `OPENAI_BASE_URL`
+ *                                   that always require the newer field.
+ *
+ * Operators set this via `OPENAI_TOKEN_PARAM` (deployment.md § Config).
+ */
+export type TokenParamStyle = 'auto' | 'max_tokens' | 'max_completion_tokens';
+
+/**
+ * Regex that matches OpenAI model identifiers which require
+ * `max_completion_tokens` instead of the classic `max_tokens` parameter.
+ *
+ * Pattern rationale:
+ *   - `o[1-9]`        — o-series reasoning models: o1, o3, o4, …
+ *   - `gpt-[5-9]`     — gpt-5, gpt-6, … (gpt-5.4-nano matches on the `5`)
+ *   - `gpt-\d{2,}`    — gpt-10, gpt-11, … (future two-digit major versions)
+ *
+ * Classic models (`gpt-4o`, `gpt-4`, `gpt-4.1`, `gpt-3.5-turbo`) do NOT
+ * match: `gpt-4` has a single-digit major ≤ 4; `gpt-4o` has a letter suffix.
+ *
+ * The regex is anchored at the start to avoid false positives in suffixes
+ * (e.g., a hypothetical `ft:gpt-4-my-o1-finetune` should NOT match).
+ * The `i` flag is defensive for any mixed-case API identifiers.
+ */
+const NEWER_MODEL_RE = /^(o[1-9]|gpt-(?:[5-9]|\d{2,}))/i;
+
+/**
+ * `resolveTokenParam` — pure helper that maps a model identifier + an optional
+ * operator override to the correct token-limit field name.
+ *
+ * @param model    - The model id as it will be sent in the API request
+ *                   (already resolved from per-request shaping or provider
+ *                   default; e.g. `"gpt-5.4-nano"`, `"gpt-4o"`, `"o3"`).
+ * @param override - An explicit `TokenParamStyle` from the operator. When
+ *                   `'max_tokens'` or `'max_completion_tokens'`, the override
+ *                   bypasses the heuristic entirely — the escape hatch for
+ *                   lagging proxies and misclassified future models. Defaults
+ *                   to `'auto'` if omitted, which runs the heuristic.
+ *
+ * @returns `'max_completion_tokens'` or `'max_tokens'` — the field to populate
+ *          on `OpenAIChatCompletionsArgs`. Never both; never neither.
+ *
+ * Exported for direct unit-testing.
+ */
+export function resolveTokenParam(
+  model: string,
+  override: TokenParamStyle = 'auto',
+): 'max_tokens' | 'max_completion_tokens' {
+  if (override === 'max_tokens') return 'max_tokens';
+  if (override === 'max_completion_tokens') return 'max_completion_tokens';
+  // auto: apply the heuristic regex.
+  return NEWER_MODEL_RE.test(model) ? 'max_completion_tokens' : 'max_tokens';
+}
+
 /**
  * `OPENAI_PROVIDER_NAME` — canonical `Provider.name` value for the OpenAI
  * adapter. The instance's `name` field is the source of truth; this
@@ -53,6 +120,11 @@ export const OPENAI_CAPABILITIES: ProviderCapabilities = {
  *
  * Per ADR-002 § Decision and api-contracts.md § Invariants and error semantics
  * (item 1): no OpenAI / fetch / Response type appears in this signature.
+ *
+ * Both `max_tokens` and `max_completion_tokens` are optional here because
+ * exactly one is set per request (selected by `resolveTokenParam`). The
+ * `createOpenAIClient` implementation serialises via `JSON.stringify`, which
+ * elides undefined keys, ensuring only the populated field reaches the wire.
  */
 export interface OpenAIClientLike {
   chatCompletions(args: {
@@ -63,7 +135,8 @@ export interface OpenAIClientLike {
       function: { name: string; description: string; parameters: object };
     }>;
     tool_choice: { type: 'function'; function: { name: string } };
-    max_tokens: number;
+    max_tokens?: number;
+    max_completion_tokens?: number;
     seed?: number;
   }): Promise<unknown>;
 }
@@ -81,6 +154,26 @@ export interface OpenAIProviderOptions {
   timeoutMs?: number;
   capabilities?: ProviderCapabilities;
   client?: OpenAIClientLike;
+  /**
+   * `tokenParamStyle` — controls which token-limit parameter is sent per
+   * request. Defaults to `'auto'`, which uses `resolveTokenParam`'s heuristic
+   * regex to select `max_tokens` (classic families) or `max_completion_tokens`
+   * (gpt-5* and o-series). Set to `'max_tokens'` or `'max_completion_tokens'`
+   * to override the heuristic — useful for proxy gateways that lag OpenAI's
+   * rollout or for misclassified future models.
+   *
+   * Wired from `OPENAI_TOKEN_PARAM` env var (deployment.md § Config).
+   */
+  tokenParamStyle?: TokenParamStyle;
+  /**
+   * `maxOutputTokens` — the output token budget sent per request. Defaults to
+   * `4096`, which is byte-identical to the previous hardcoded value. Raise this
+   * for reasoning-capable models (o-series, gpt-5) that consume more completion
+   * tokens without changing any other behavior.
+   *
+   * Wired from `OPENAI_MAX_OUTPUT_TOKENS` env var (deployment.md § Config).
+   */
+  maxOutputTokens?: number;
 }
 
 interface ToolCall {
@@ -182,6 +275,14 @@ function extractToolCallArguments(response: unknown, toolName: string): unknown 
  *   - Adapter never logs request or response bodies (observability.md §
  *     Event taxonomy: `provider.called` / `provider.error`).
  */
+/**
+ * Default output token budget. Matches the historical hardcoded value so that
+ * deployments that do not set `OPENAI_MAX_OUTPUT_TOKENS` are byte-identical in
+ * behavior. Raise via `OpenAIProviderOptions.maxOutputTokens` (or the env var)
+ * for reasoning-capable models that may need a larger budget.
+ */
+const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
 export class OpenAIProvider implements Provider {
   readonly name = OPENAI_PROVIDER_NAME;
   readonly capabilities: ProviderCapabilities;
@@ -189,11 +290,15 @@ export class OpenAIProvider implements Provider {
   private readonly client: OpenAIClientLike;
   private readonly model: string;
   private readonly maxTokensPerCall: number | undefined;
+  private readonly tokenParamStyle: TokenParamStyle;
+  private readonly maxOutputTokens: number;
 
   constructor(options: OpenAIProviderOptions) {
     this.capabilities = options.capabilities ?? OPENAI_CAPABILITIES;
     this.model = options.model ?? OPENAI_DEFAULT_MODEL;
     this.maxTokensPerCall = options.maxTokensPerCall;
+    this.tokenParamStyle = options.tokenParamStyle ?? 'auto';
+    this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
     if (options.client !== undefined) {
       this.client = options.client;
     } else {
@@ -226,13 +331,22 @@ export class OpenAIProvider implements Provider {
 
     // D3: resolve per-request model and seed from request_shaping (conditional-assign)
     const model = input.request_shaping?.model ?? this.model;
+
+    // D1: select the correct token-limit parameter for the resolved model.
+    // `resolveTokenParam` applies the `tokenParamStyle` override (operator escape
+    // hatch via `OPENAI_TOKEN_PARAM`) or falls back to the heuristic regex that
+    // distinguishes gpt-5*/o-series (`max_completion_tokens`) from classic models
+    // (`max_tokens`). Never send both; JSON.stringify elides undefined keys so
+    // only the set field reaches the wire.
+    const tokenParam = resolveTokenParam(model, this.tokenParamStyle);
     const args: OpenAIChatCompletionsArgs = {
       model,
       messages: prompt.messages,
       tools: [prompt.tool],
       tool_choice: prompt.tool_choice,
-      max_tokens: 4096,
     };
+    args[tokenParam] = this.maxOutputTokens;
+
     const seed = input.request_shaping?.deterministic_seed;
     if (typeof seed === 'number') {
       args.seed = seed;
@@ -249,9 +363,11 @@ export class OpenAIProvider implements Provider {
     }
 
     // Detect response truncation: finish_reason==='length' means the model hit
-    // max_tokens (4096) and the output may be a partial/invalid findings array.
-    // Treat as schema_validation so the orchestrator publishes malformed_provider_output
-    // and does not silently accept a truncated result.
+    // the output token cap and the output may be a partial/invalid findings
+    // array. Treat as schema_validation so the orchestrator publishes
+    // malformed_provider_output and does not silently accept a truncated result.
+    // The message is param- and value-agnostic so it accurately reflects
+    // whatever token field was in play (max_tokens or max_completion_tokens).
     if (
       typeof response === 'object' &&
       response !== null &&
@@ -268,7 +384,7 @@ export class OpenAIProvider implements Provider {
       ) {
         throw new ProviderErrorThrowable({
           kind: 'schema_validation',
-          message: `openai response truncated: finish_reason is 'length' (max_tokens: 4096)`,
+          message: `openai response truncated: finish_reason is 'length' (output token cap: ${this.maxOutputTokens})`,
         });
       }
     }

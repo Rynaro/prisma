@@ -12,7 +12,11 @@ import {
 import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/provider-anthropic';
 import { CopilotProvider, type CopilotProviderOptions } from '@prisma-bot/provider-copilot';
 import { FakeProvider } from '@prisma-bot/provider-fake';
-import { OpenAIProvider, type OpenAIProviderOptions } from '@prisma-bot/provider-openai';
+import {
+  OpenAIProvider,
+  type OpenAIProviderOptions,
+  type TokenParamStyle,
+} from '@prisma-bot/provider-openai';
 import {
   type JobPayload,
   type Provider,
@@ -128,6 +132,31 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     const baseUrl = await tryGetSecret(secretSource, 'OPENAI_BASE_URL');
     if (baseUrl !== undefined) {
       opts.baseUrl = baseUrl;
+    }
+    // OPENAI_TOKEN_PARAM — optional override for the token-limit parameter
+    // selection heuristic. Valid values: 'auto' (default), 'max_tokens',
+    // 'max_completion_tokens'. Invalid values are silently ignored and fall
+    // back to 'auto'. See packages/providers/openai for the heuristic detail
+    // and deployment.md § Config for the env var reference.
+    const tokenParamRaw = await tryGetSecret(secretSource, 'OPENAI_TOKEN_PARAM');
+    if (
+      tokenParamRaw === 'max_tokens' ||
+      tokenParamRaw === 'max_completion_tokens' ||
+      tokenParamRaw === 'auto'
+    ) {
+      opts.tokenParamStyle = tokenParamRaw as TokenParamStyle;
+    }
+    // OPENAI_MAX_OUTPUT_TOKENS — optional output token budget override.
+    // Defaults to 4096. Raise for reasoning-capable models (o-series, gpt-5)
+    // that may need a larger output window. Non-numeric or non-positive values
+    // are silently ignored and fall back to the default.
+    // See deployment.md § Config for the env var reference.
+    const maxOutputTokensRaw = await tryGetSecret(secretSource, 'OPENAI_MAX_OUTPUT_TOKENS');
+    if (maxOutputTokensRaw !== undefined) {
+      const parsed = Number.parseInt(maxOutputTokensRaw, 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        opts.maxOutputTokens = parsed;
+      }
     }
     log('worker.provider.selected', { provider: 'openai' });
     return new OpenAIProvider(opts);

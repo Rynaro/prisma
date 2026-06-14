@@ -71,6 +71,8 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `INSTALLATION_REPLAY_WINDOW_SECONDS` | The replay-protection window for `X-GitHub-Delivery` per installation (per `system-design.md` § Queue and async model § Replay protection). Duplicate deliveries within the window short-circuit to `discarded_idempotent`. | `config` |
 | `OPENAI_MODEL` | Optional override for the OpenAI adapter's default model (defaults to `gpt-4o`). Consumed only when `OPENAI_API_KEY` is set. May also be set per-request via `request_shaping.model`. | `config` |
 | `OPENAI_BASE_URL` | Optional override for the OpenAI adapter's inference endpoint (defaults to `https://api.openai.com/v1`). Consumed only when `OPENAI_API_KEY` is set; useful for Azure OpenAI or a proxy gateway. | `config` |
+| `OPENAI_TOKEN_PARAM` | Controls which output-token cap parameter the OpenAI adapter sends per request. `auto` (default) applies a heuristic: `max_completion_tokens` for gpt-5*/o-series models, `max_tokens` for classic models (`gpt-4o`, `gpt-4`, `gpt-3.5-turbo`). Set to `max_tokens` or `max_completion_tokens` to override the heuristic — useful for proxy gateways that lag OpenAI's rollout or for misclassified future models. Invalid values are silently ignored and fall back to `auto`. Consumed only when `OPENAI_API_KEY` is set. | `config` |
+| `OPENAI_MAX_OUTPUT_TOKENS` | Optional output token budget for the OpenAI adapter (defaults to `4096`). Raise for reasoning-capable models (o-series, gpt-5) that may need a larger completion window. Non-numeric or non-positive values are silently ignored and fall back to the default. Consumed only when `OPENAI_API_KEY` is set. | `config` |
 | `COPILOT_MODEL` | Optional override for the Copilot adapter's default model (defaults to `gpt-4o`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 | `COPILOT_BASE_URL` | Optional override for the Copilot adapter's inference endpoint (defaults to `https://models.github.ai/inference`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 
@@ -145,6 +147,11 @@ COPILOT_BASE_URL=
 # Optional OpenAI overrides; consumed only when OPENAI_API_KEY is set.
 OPENAI_MODEL=
 OPENAI_BASE_URL=
+# OPENAI_TOKEN_PARAM: auto (default) | max_tokens | max_completion_tokens
+# auto applies a heuristic: max_completion_tokens for gpt-5*/o-series, max_tokens for classic models.
+OPENAI_TOKEN_PARAM=
+# OPENAI_MAX_OUTPUT_TOKENS: output token budget (default 4096). Raise for o-series / gpt-5 models.
+OPENAI_MAX_OUTPUT_TOKENS=
 
 # tunables (starting values; see operational-runbooks.md § Numeric tunables)
 QUEUE_CONCURRENCY=4
