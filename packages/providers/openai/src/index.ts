@@ -85,6 +85,85 @@ export function resolveTokenParam(
  */
 export const OPENAI_PROVIDER_NAME = 'openai';
 
+// ---------------------------------------------------------------------------
+// Escape-hatch denylist — spec § 3.7, G8
+// ---------------------------------------------------------------------------
+
+/**
+ * `OPENAI_PASSTHROUGH_DENYLIST` — set of wire-field names that the
+ * `provider_options.openai` raw passthrough bag is NEVER allowed to override.
+ *
+ * These fields are Prisma-managed: overriding them would break the forced-
+ * function-calling structured-output contract (`submit_review_findings`) or
+ * bypass observability invariants.
+ *
+ * | Key              | Why protected |
+ * |------------------|---------------|
+ * | model            | Resolved from slug / request_shaping; passthrough must
+ *                     not silently retarget (breaks resolveTokenParam + obs.) |
+ * | messages         | Prompt is Prisma-owned (buildPrompt); override discards
+ *                     the review instructions. |
+ * | tools            | Must remain the single `submit_review_findings` tool. |
+ * | tool_choice      | Must remain forced to `submit_review_findings`;
+ *                     "none"/"auto" breaks structured output. |
+ * | stream           | Pipeline consumes a single JSON response; streaming
+ *                     breaks extractToolCallArguments. |
+ * | n                | Multiple choices break the choices[0] extraction. |
+ * | response_format  | Conflicts with the function-calling path. |
+ *
+ * `max_tokens` / `max_completion_tokens` / `seed` / `temperature` / `top_p`
+ * are NOT denylisted — overriding them via escape hatch is the intended use
+ * (AS-9, spec § 3.7 last paragraph).
+ *
+ * Exported so unit tests can assert against it directly (spec § 7.2, G8).
+ */
+export const OPENAI_PASSTHROUGH_DENYLIST = new Set<string>([
+  'model',
+  'messages',
+  'tools',
+  'tool_choice',
+  'stream',
+  'n',
+  'response_format',
+]);
+
+/**
+ * `applyProviderOptions` — merge a raw `provider_options.openai` bag into an
+ * existing `OpenAIChatCompletionsArgs` object, enforcing the denylist.
+ *
+ * Returns a new `args` object (spread; no mutation) and an array of config
+ * notes for any dropped denylisted keys so the orchestrator can surface them
+ * in the check-run summary.
+ *
+ * Precedence: passthrough keys WIN over any previously-set normalized value
+ * (design.md P5 "escape hatch wins").
+ *
+ * G7 invariant: this function MUST NOT log any key or value from `bag`.
+ * The returned `droppedNotes` strings only contain the KEY names, not values.
+ *
+ * Exported for direct unit-testing (spec § 7.2, G8).
+ *
+ * @param args - The base args object (already includes model + token param +
+ *               generation fields). Spread-copied; not mutated.
+ * @param bag  - The raw `provider_options[activeProvider]` record.
+ * @returns    `{ args: merged, droppedNotes: string[] }`.
+ */
+export function applyProviderOptions(
+  args: OpenAIChatCompletionsArgs,
+  bag: Record<string, unknown>,
+): { args: OpenAIChatCompletionsArgs; droppedNotes: string[] } {
+  const droppedNotes: string[] = [];
+  const merged: OpenAIChatCompletionsArgs = { ...args };
+  for (const [k, v] of Object.entries(bag)) {
+    if (OPENAI_PASSTHROUGH_DENYLIST.has(k)) {
+      droppedNotes.push(`provider_options.openai.${k} ignored (Prisma-managed field)`);
+      continue;
+    }
+    merged[k] = v;
+  }
+  return { args: merged, droppedNotes };
+}
+
 /**
  * Default model identifier. Centralized so it can be swapped in one place.
  * Model selection is treated as configuration, not as a vendor type.
@@ -339,7 +418,11 @@ export class OpenAIProvider implements Provider {
     // (`max_tokens`). Never send both; JSON.stringify elides undefined keys so
     // only the set field reaches the wire.
     const tokenParam = resolveTokenParam(model, this.tokenParamStyle);
-    const args: OpenAIChatCompletionsArgs = {
+
+    // Step 1: base args — model, prompt structure, and the deployment-level
+    // output token budget (`this.maxOutputTokens`, from OPENAI_MAX_OUTPUT_TOKENS
+    // or the 4096 default).
+    let args: OpenAIChatCompletionsArgs = {
       model,
       messages: prompt.messages,
       tools: [prompt.tool],
@@ -350,6 +433,42 @@ export class OpenAIProvider implements Provider {
     const seed = input.request_shaping?.deterministic_seed;
     if (typeof seed === 'number') {
       args.seed = seed;
+    }
+
+    // Step 2: apply normalized generation settings from request_shaping.generation.
+    // Spec § 5.3 (AS-5, AS-7): generation fields override the deployment default.
+    // Order is defaults → generation → provider_options (last wins, P5).
+    // NOTE: `generation.seed` is NOT re-read here — the orchestrator maps it into
+    // `request_shaping.deterministic_seed` (single seed source, spec § 5.3/5.4).
+    const generation = input.request_shaping?.generation;
+    if (generation !== undefined) {
+      if (typeof generation.max_output_tokens === 'number') {
+        // Overwrite the default token budget with the repo-config value (AS-5).
+        // The token-param KEY is still chosen by resolveTokenParam so the right
+        // field name is used for the resolved model family.
+        args[tokenParam] = generation.max_output_tokens;
+      }
+      if (typeof generation.temperature === 'number') {
+        args.temperature = generation.temperature;
+      }
+      if (typeof generation.top_p === 'number') {
+        args.top_p = generation.top_p;
+      }
+      // generation.seed is intentionally skipped here; it arrives via
+      // deterministic_seed above (spec § 5.4 "single seed source").
+    }
+
+    // Step 3: apply raw provider_options passthrough (escape hatch, P5 — wins last).
+    // The orchestrator places only the active-provider's sub-bag here (AS-10, G9).
+    // Denylisted keys are dropped and a note is returned (spec § 3.7, G8).
+    // G7: we do NOT log any key or value from providerOptionsBag.
+    const providerOptionsBag = input.request_shaping?.provider_options;
+    if (providerOptionsBag !== undefined && typeof providerOptionsBag === 'object') {
+      const { args: merged } = applyProviderOptions(
+        args,
+        providerOptionsBag as Record<string, unknown>,
+      );
+      args = merged;
     }
 
     let response: unknown;

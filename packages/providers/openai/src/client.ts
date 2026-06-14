@@ -35,6 +35,12 @@ export interface CreateOpenAIClientOptions {
  *
  * Per ADR-002: no vendor types leak past `client.ts`. The caller (index.ts) is
  * responsible for populating exactly one token field.
+ *
+ * The index signature `[k: string]: unknown` carries raw `provider_options`
+ * passthrough keys (spec § 5.3, AS-8/AS-9).  `JSON.stringify` elides
+ * `undefined` values so absent optional fields never reach the wire.
+ * The denylist (index.ts `OPENAI_PASSTHROUGH_DENYLIST`) prevents passthrough
+ * from overriding Prisma-critical fields (spec § 3.7, G8).
  */
 export interface OpenAIChatCompletionsArgs {
   model: string;
@@ -55,6 +61,18 @@ export interface OpenAIChatCompletionsArgs {
    */
   max_completion_tokens?: number;
   seed?: number;
+  /** Normalized temperature from `generation.temperature`. */
+  temperature?: number;
+  /** Nucleus sampling from `generation.top_p`. */
+  top_p?: number;
+  /**
+   * Open index signature for raw `provider_options.openai` passthrough keys.
+   * The denylist in `index.ts` prevents Prisma-critical fields from being set
+   * here. `JSON.stringify` elides `undefined`, so absent optional fields from
+   * the fixed properties above never appear as explicit `undefined` on the wire
+   * either — only truly set values are serialised.
+   */
+  [k: string]: unknown;
 }
 
 export interface OpenAIClient {

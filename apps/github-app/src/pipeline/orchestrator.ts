@@ -36,6 +36,7 @@ import {
   type RankedFindings,
   type RejectionLogEntry,
   type RepoConfig,
+  parseModelSlug,
 } from '@prisma-bot/shared';
 
 /**
@@ -300,9 +301,26 @@ const traceFields = (payload: JobPayload): Record<string, unknown> => {
   return fields;
 };
 
+/**
+ * `buildProviderInput` — construct the `ProviderReviewInput` for a single
+ * provider call, threading all config-driven shaping fields.
+ *
+ * Spec: docs/_planning/config-dx/spec.md § 5.4.
+ *
+ * @param files          - Prefiltered files for this call (single-call or one batch).
+ * @param cfg            - The effective repo config.
+ * @param activeProvider - The active provider's `name` (e.g. "openai"). Used to
+ *                         select the correct sub-bag from `cfg.provider_options`
+ *                         (AS-10, G9) and for the R1 mismatch check.
+ * @param allNotes       - Mutable notes array; slug-parse warnings are pushed here
+ *                         so they flow into the check-run summary via the caller.
+ * @param guidance       - Resolved custom guidance (optional).
+ */
 const buildProviderInput = (
   files: PrefilteredFile[],
   cfg: RepoConfig,
+  activeProvider: string,
+  allNotes: string[],
   guidance?: CustomGuidance,
 ): ProviderReviewInput => {
   const heuristics: Record<string, boolean> = {
@@ -331,9 +349,67 @@ const buildProviderInput = (
     files: sanitizedFiles,
     repo_heuristics: heuristics,
   };
-  if (cfg.model !== undefined) {
-    input.request_shaping = { model: cfg.model };
+
+  // ── Model slug resolution (spec § 5.4 steps 1–2) ───────────────────────────
+  // Parse `cfg.model` as a `provider/name` slug (or bare name).  Any parse
+  // warnings are pushed into `allNotes` so they surface in the check-run
+  // summary and the `configuration` reply.
+  const slug = parseModelSlug(cfg.model, cfg.provider);
+  allNotes.push(...slug.notes);
+
+  // R1 mismatch check (design-review refinement R1):
+  // When the slug names a provider DIFFERENT from the active adapter, the
+  // model name from the slug would 404 on the active provider.  Emit a clear
+  // config note and fall back to the active provider's default model (do NOT
+  // pass the foreign model name through).
+  let resolvedModel: string | undefined = slug.model;
+  if (slug.provider !== undefined && slug.provider !== activeProvider) {
+    allNotes.push(
+      `model "${cfg.model}" names provider "${slug.provider}", but this deployment runs "${activeProvider}" — using the active provider's default model. Set an "${activeProvider}/…" model or configure the correct API key to use ${slug.provider}.`,
+    );
+    resolvedModel = undefined; // fall back to the adapter's default
   }
+
+  // Build request_shaping if there is anything to shape.
+  const hasModel = resolvedModel !== undefined;
+  const generationConfig = cfg.generation;
+  const hasGeneration =
+    generationConfig.max_output_tokens !== undefined ||
+    generationConfig.temperature !== undefined ||
+    generationConfig.top_p !== undefined ||
+    generationConfig.seed !== undefined;
+
+  // Narrow provider_options to the active provider's sub-bag (AS-10, G9).
+  // Key by `activeProvider` (the actually-running adapter) — not the slug's
+  // provider — because adapter selection is env-driven this release (OQ-1).
+  const activeProviderOptions = cfg.provider_options[activeProvider];
+  const hasProviderOptions =
+    activeProviderOptions !== undefined && Object.keys(activeProviderOptions).length > 0;
+
+  if (hasModel || hasGeneration || hasProviderOptions) {
+    input.request_shaping = {};
+
+    // Step 2 (spec § 5.4): set resolved bare model name.
+    if (hasModel && resolvedModel !== undefined) {
+      input.request_shaping.model = resolvedModel;
+    }
+
+    // Steps 3–4 (spec § 5.4): forward generation block and map seed →
+    // deterministic_seed (single seed source; the OpenAI adapter does NOT
+    // re-read generation.seed directly).
+    if (hasGeneration) {
+      input.request_shaping.generation = generationConfig;
+      if (typeof generationConfig.seed === 'number') {
+        input.request_shaping.deterministic_seed = generationConfig.seed;
+      }
+    }
+
+    // Step 5 (spec § 5.4): narrow to the active provider's bag.
+    if (hasProviderOptions) {
+      input.request_shaping.provider_options = activeProviderOptions;
+    }
+  }
+
   if (guidance !== undefined) {
     input.custom_guidance = guidance;
   }
@@ -710,7 +786,13 @@ export const runPipeline = async (
       const batch = batchPlan.batches[batchIdx];
       if (batch === undefined) continue;
 
-      const batchInput = buildProviderInput(batch, deps.config, resolvedGuidance);
+      const batchInput = buildProviderInput(
+        batch,
+        deps.config,
+        deps.provider.name,
+        allNotes,
+        resolvedGuidance,
+      );
       logger.emit('provider.batch.called', {
         ...trace,
         batch_index: batchIdx,
@@ -894,7 +976,13 @@ export const runPipeline = async (
   // -------------------------------------------------------------------------
 
   // Stage: provider.
-  const providerInput = buildProviderInput(prefilter.files, deps.config, resolvedGuidance);
+  const providerInput = buildProviderInput(
+    prefilter.files,
+    deps.config,
+    deps.provider.name,
+    allNotes,
+    resolvedGuidance,
+  );
   logger.emit('provider.called', { ...trace, provider: deps.provider.name });
   let providerOutput: ProviderReviewOutput;
   try {

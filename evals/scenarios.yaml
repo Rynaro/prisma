@@ -51,3 +51,7 @@ scenarios:
     name: "PR above single-call limit splits into multiple batches (chunked review)"
     fixture: fixtures/chunked-pr.yaml
     tags: ["large_diff_degradation"]
+  - id: generation-provider-options-roundtrip
+    name: "generation + provider_options settings thread through to the provider (round-trip)"
+    fixture: fixtures/generation-provider-options-roundtrip.yaml
+    tags: ["model_settings_threading"]
