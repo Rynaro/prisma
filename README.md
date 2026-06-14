@@ -66,7 +66,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.8.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.9.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 ## Operate the Deployment
 
@@ -182,9 +182,9 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.8.0** — diff chunking: large PRs are reviewed across multiple provider calls (findings merged + deduped before publishing), with a per-PR call cap and partial-on-failure. Provider rejections (auth/capability) now report distinctly instead of looking like an oversized PR.
+**v0.9.0** — vendor-neutral model settings: a `provider/name` model slug for one-line swaps, a normalized `generation` block (`max_output_tokens` maps to each vendor's dialect), and a `provider_options` escape hatch for not-yet-normalized knobs. Fully back-compatible.
 
-- 585 tests across 48 files, all passing · 13/13 deterministic eval scenarios PASS
+- 688 tests across 49 files, all passing · 14/14 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
