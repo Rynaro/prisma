@@ -66,7 +66,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.10.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.11.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 ## Operate the Deployment
 
@@ -182,9 +182,9 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.10.0** — reasoning-model support: gpt-5 / o-series models now use `tool_choice: "required"` so they actually emit findings (overridable via `OPENAI_TOOL_CHOICE`), plus an empty-review safety net that explains an under-producing model instead of failing silently. Classic models unchanged.
+**v0.11.0** — grounded reviews: the provider now receives the actual diff content with per-line numbers, so findings are verified against real code (not inferred from file paths) and anchor to the exact line instead of defaulting to line 1. Plus a structural dedupe key (path + category) that collapses duplicate comments about the same issue regardless of how the model words them.
 
-- 733 tests across 49 files, all passing · 15/15 deterministic eval scenarios PASS
+- 735 tests across 49 files, all passing · 15/15 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
