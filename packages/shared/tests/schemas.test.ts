@@ -308,7 +308,18 @@ describe('@prisma-bot/shared schemas', () => {
       expect(DEFAULT_REPO_CONFIG.chunking.max_files).toBe(200);
       expect(DEFAULT_REPO_CONFIG.chunking.max_changed_lines).toBe(12000);
       expect(DEFAULT_REPO_CONFIG.chunking.max_provider_calls_per_pr).toBe(6);
-      expect(DEFAULT_REPO_CONFIG.chunking.call_token_budget).toBe(60000);
+      // Phase 2: call_token_budget default raised to 1_000_000 sentinel so
+      // hard_cap_in (derived from provider window) dominates. Back-compat:
+      // operators who set a lower value still get that as a ceiling.
+      expect(DEFAULT_REPO_CONFIG.chunking.call_token_budget).toBe(1_000_000);
+      // Phase 2: new knobs
+      expect(DEFAULT_REPO_CONFIG.chunking.reserved_output_tokens).toBe(4096);
+      expect(DEFAULT_REPO_CONFIG.chunking.prompt_overhead_tokens).toBe(9000);
+      expect(DEFAULT_REPO_CONFIG.chunking.safety_fraction).toBe(0.07);
+      expect(DEFAULT_REPO_CONFIG.chunking.max_truncation_retries).toBe(2);
+      // Phase 3: hunk-level splitting knobs
+      expect(DEFAULT_REPO_CONFIG.chunking.hunk_context_lines).toBe(10);
+      expect(DEFAULT_REPO_CONFIG.chunking.min_hunk_split_tokens).toBe(0);
     });
 
     it('accepts a chunking block with all fields set', () => {

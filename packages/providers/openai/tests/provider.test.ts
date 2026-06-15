@@ -158,8 +158,11 @@ describe('OpenAIProvider', () => {
     }
   });
 
-  // T6: cost-ceiling
-  it('cost-ceiling: oversized input throws before client.chatCompletions is called', async () => {
+  // T6: over_budget guard (Phase 4: was capability/cost_ceiling, now over_budget)
+  // Phase 4: guard throws `over_budget` (not `capability/cost_ceiling`) so the
+  // orchestrator can degrade (split/skip) instead of aborting the PR.
+  // Per chunking-stability-spec.md § Phase 4 "New degradable error kind".
+  it('over_budget (Phase 4): oversized input throws over_budget before client.chatCompletions is called', async () => {
     const chatCompletions = vi.fn();
     const provider = new OpenAIProvider({
       apiKey: 'k',
@@ -172,23 +175,28 @@ describe('OpenAIProvider', () => {
     } catch (err) {
       expect(err).toBeInstanceOf(ProviderErrorThrowable);
       const thrown = err as ProviderErrorThrowable;
-      expect(thrown.cause_kind).toBe('capability');
-      if (thrown.value.kind === 'capability') {
-        expect(thrown.value.missing_capability).toBe('cost_ceiling');
+      // Phase 4: guard throws over_budget, not capability/cost_ceiling.
+      expect(thrown.cause_kind).toBe('over_budget');
+      if (thrown.value.kind === 'over_budget') {
+        expect(thrown.value.estimated_tokens).toBeGreaterThan(0);
+        expect(thrown.value.hard_cap_in).toBe(1);
       }
     }
     expect(chatCompletions).not.toHaveBeenCalled();
   });
 
-  it('cost-ceiling: a full chunker batch (~60k content tokens) passes the default guard', async () => {
-    // Regression (v0.11.0): the chunker packs each call to
-    // chunking.call_token_budget (default 60000 content tokens). The adapter
-    // guard (default MAX_TOKENS_PER_PR = 120000) must clear a full batch —
-    // including the serialization overhead the guard measures — or it rejects
-    // what the chunker deliberately built. A prior MAX_TOKENS_PER_PR/2 = 30000
-    // guard rejected such batches once real diff content filled the request.
+  it('cost-ceiling: a full chunker batch passes the guard when maxTokensPerCall is large enough', async () => {
+    // Phase 2: the guard now uses the UNIFIED estimator (estimatePromptTokens over
+    // the serialized prompt: system + line-numbered diff + tool schema). The
+    // serialized prompt for a 12000-line file with line numbers is ~143k tokens
+    // (o200k_base, the default for gpt-4o). The guard threshold must be above
+    // the unified estimate to avoid rejecting a legitimately-sized batch.
+    //
+    // The production `MAX_TOKENS_PER_PR` should be set above the provider's
+    // hard_cap_in (172904 for Anthropic; similar for OpenAI). Using 200_000
+    // (above any realistic hard_cap_in) here ensures the guard clears.
     const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
-    // ~60k content tokens: 12000 lines × 20 chars = 240k chars; /4 = 60k.
+    // ~12000-line file: 12000 lines x 20 chars = 240k chars raw content.
     const bigContent = 'export const x = 1;\n'.repeat(12000);
     const bigInput: ProviderReviewInput = {
       files: [
@@ -200,7 +208,7 @@ describe('OpenAIProvider', () => {
     };
     const provider = new OpenAIProvider({
       apiKey: 'k',
-      maxTokensPerCall: 120000, // production default after the v0.11.x fix
+      maxTokensPerCall: 200_000, // must be above the unified estimate (~143k for this input)
       client: { chatCompletions },
     });
     await expect(provider.review(bigInput)).resolves.toBeDefined();
@@ -251,8 +259,8 @@ describe('OpenAIProvider', () => {
     expect((capturedArgs as Record<string, unknown>).model).toBe(OPENAI_DEFAULT_MODEL);
   });
 
-  // T10: finish_reason==='length' → schema_validation (truncation guard)
-  it('throws schema_validation when finish_reason is "length" (response truncated at max_tokens)', async () => {
+  // T10: finish_reason==='length' → output_truncated (Phase 1: split-and-retry)
+  it('throws output_truncated when finish_reason is "length" (response truncated at max_tokens)', async () => {
     // Simulate a response where the model hit max_tokens: tool_call arguments
     // may be a partially-written JSON array that would parse but silently drop findings.
     const chatCompletions = vi.fn().mockResolvedValue({
@@ -281,7 +289,7 @@ describe('OpenAIProvider', () => {
     const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
-      cause_kind: 'schema_validation',
+      cause_kind: 'output_truncated',
     });
   });
 
@@ -291,6 +299,42 @@ describe('OpenAIProvider', () => {
     const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
     const out = await provider.review(validInput);
     expect(out.findings).toHaveLength(0);
+  });
+
+  // AC1.2: configurable maxOutputTokens flows to the provider call
+  it('AC1.2: maxOutputTokens option sets the token-limit param on the wire request', async () => {
+    let capturedArgs: Record<string, unknown> | undefined;
+    const chatCompletions = vi.fn().mockImplementation((args: unknown) => {
+      capturedArgs = args as Record<string, unknown>;
+      return Promise.resolve(chatCompletionsResponse({ findings: [] }));
+    });
+    // Use a classic model (max_tokens param) with non-default maxOutputTokens.
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions },
+      model: 'gpt-4o',
+      maxOutputTokens: 8192,
+    });
+    await provider.review(validInput);
+    expect(chatCompletions).toHaveBeenCalledTimes(1);
+    expect(capturedArgs?.max_tokens).toBe(8192);
+  });
+
+  // AC1.5 regression: default maxOutputTokens is 4096 (byte-identical to pre-Phase-1)
+  it('AC1.5: default maxOutputTokens is 4096 (happy-path regression)', async () => {
+    let capturedArgs: Record<string, unknown> | undefined;
+    const chatCompletions = vi.fn().mockImplementation((args: unknown) => {
+      capturedArgs = args as Record<string, unknown>;
+      return Promise.resolve(chatCompletionsResponse({ findings: [] }));
+    });
+    // No maxOutputTokens option, classic model → defaults to 4096 via max_tokens.
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions },
+      model: 'gpt-4o',
+    });
+    await provider.review(validInput);
+    expect(capturedArgs?.max_tokens).toBe(4096);
   });
 });
 
@@ -490,7 +534,7 @@ describe('OpenAIProvider — token param per-request wiring', () => {
     expect(args.max_tokens).toBe(4096);
   });
 
-  it('truncation guard message is param-agnostic and includes the output token cap', async () => {
+  it('output_truncated: error is kind output_truncated and message is param-agnostic with the token cap', async () => {
     // Use a newer model so the param is max_completion_tokens
     const truncatedResponse = {
       id: 'chatcmpl-truncated',
@@ -524,12 +568,13 @@ describe('OpenAIProvider — token param per-request wiring', () => {
       model: 'gpt-5.4-nano',
       maxOutputTokens: 8192,
     });
+    // Phase 1: truncation now throws output_truncated, not schema_validation.
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
-      cause_kind: 'schema_validation',
+      cause_kind: 'output_truncated',
     });
     // Verify the message is generic (doesn't hard-code a param name)
-    // and contains the actual cap value
+    // and contains the actual cap value; also check requested_max_tokens field.
     try {
       await provider.review(validInput);
     } catch (err) {
@@ -537,6 +582,9 @@ describe('OpenAIProvider — token param per-request wiring', () => {
         expect(err.value.message).toContain('output token cap');
         expect(err.value.message).toContain('8192');
         expect(err.value.message).not.toContain('max_tokens: 4096');
+        if (err.value.kind === 'output_truncated') {
+          expect(err.value.requested_max_tokens).toBe(8192);
+        }
       }
     }
   });

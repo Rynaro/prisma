@@ -8,6 +8,7 @@ import {
   runPrefilter,
   runRanker,
   runValidator,
+  splitFileByHunks,
 } from '@prisma-bot/core';
 import {
   type ContentFetcher,
@@ -39,6 +40,7 @@ import {
   isReasoningModel,
   parseModelSlug,
 } from '@prisma-bot/shared';
+import type { TokenizerFamily } from '@prisma-bot/shared';
 
 /**
  * `runPipeline` — single-function orchestrator that wires the Phase 5.1–5.5
@@ -99,7 +101,15 @@ export type LogEvent =
   | 'chunking.planned'
   | 'provider.batch.called'
   | 'provider.batch.output'
-  | 'provider.batch.error';
+  | 'provider.batch.error'
+  | 'provider.batch.truncation_exhausted'
+  | 'provider.batch.split'
+  | 'provider.batch.truncation_unsplittable'
+  // Phase 4: new log events for over_budget degrade path and subset-and-note.
+  | 'chunking.subset_selected'
+  | 'provider.batch.budget_exhausted'
+  | 'provider.batch.hunk_split'
+  | 'provider.batch.budget_unsplittable';
 
 export interface PipelineLogger {
   emit(event: LogEvent, fields: Record<string, unknown>): void;
@@ -235,6 +245,28 @@ export interface ReviewCompleteChunkedDetail {
    * exceeded the hard safety cap (≈110,000 tokens).
    */
   skipped_files: BatcherSkippedFile[];
+  /**
+   * Paths of files that could not be fully reviewed because output truncation
+   * persisted after all retry attempts were exhausted. These files are noted
+   * in the check-run notice with a "not fully reviewed (output truncated)"
+   * prefix. The PR is NOT aborted; surviving batches' findings are published.
+   *
+   * Per chunking-stability-spec.md § Phase 1 "Data-flow change".
+   */
+  truncated_files: string[];
+  /**
+   * Files that were not reviewed because the PR's plan exceeded the
+   * `max_provider_calls_per_pr` budget (call-budget drops from the batcher's
+   * subset-and-note logic) OR because a guard `over_budget` trip exhausted all
+   * retries. Surfaced in the check-run notice as "Not reviewed (PR exceeds the
+   * per-PR call budget of N)".
+   *
+   * Empty for happy-path PRs where every batch fits within both `hard_cap_in`
+   * and `maxCalls` (AC4.5 no-regression).
+   *
+   * Per chunking-stability-spec.md § Phase 4 "Subset-and-note behavior".
+   */
+  not_reviewed_files: BatcherSkippedFile[];
 }
 
 /**
@@ -776,74 +808,141 @@ export const runPipeline = async (
   // -------------------------------------------------------------------------
   if (isChunkable) {
     const chunking = deps.config.chunking;
+
+    // Phase 2: compute `hard_cap_in` from the provider's context window using
+    // the reservation formula (chunking-stability-spec.md § Phase 2):
+    //   window          = provider.capabilities.max_context_tokens
+    //   reserved_output = chunking.reserved_output_tokens   (default 4096)
+    //   prompt_overhead = chunking.prompt_overhead_tokens   (default 9000)
+    //   safety          = ceil(safety_fraction × window)    (default 0.07)
+    //   hard_cap_in     = window − reserved_output − prompt_overhead − safety
+    //
+    // Backward compat: effective budget = min(call_token_budget, hard_cap_in).
+    // When `call_token_budget` is at its default sentinel (1_000_000) the
+    // derived `hard_cap_in` dominates. When operators set a lower value, that
+    // lower value is still respected.
+    const window = deps.provider.capabilities.max_context_tokens;
+    const reservedOutput = chunking.reserved_output_tokens;
+    const promptOverhead = chunking.prompt_overhead_tokens;
+    const safety = Math.ceil(chunking.safety_fraction * window);
+    const hard_cap_in = window - reservedOutput - promptOverhead - safety;
+    const effectiveBudget = Math.min(chunking.call_token_budget, hard_cap_in);
+
+    // The tokenizer family comes from the provider's capabilities (set by each
+    // adapter: anthropic→'anthropic-approx', openai→'o200k'/'cl100k', copilot→'cl100k').
+    const tokenizerFamily: TokenizerFamily = deps.provider.capabilities.tokenizer_family;
+
+    // `buildInputForBatch` is the thin callback the batcher uses to build a
+    // `ProviderReviewInput` for any candidate file set. It delegates to
+    // `buildProviderInput` (which carries guidance, model-slug, generation
+    // settings) so the batcher's estimate includes the same guidance and tool
+    // schema that the adapter will send on the wire.
+    const buildInputForBatch = (files: PrefilteredFile[]): ProviderReviewInput =>
+      buildProviderInput(files, deps.config, deps.provider.name, allNotes, resolvedGuidance);
+
+    // `absoluteCapTokens`: the true-overflow threshold (replaces HARD_SAFETY_CAP_TOKENS).
+    // A file whose single-file estimate exceeds this value CANNOT fit even alone
+    // (the context window minus required non-content overhead). Files over
+    // `effectiveBudget` but under `absoluteCapTokens` get their own batch;
+    // only files over `absoluteCapTokens` go to `skippedFiles`.
+    // Per chunking-stability-spec.md § Phase 2 "HARD_SAFETY_CAP_TOKENS replaced".
+    const absoluteCapTokens = window - reservedOutput - promptOverhead;
+
     const batchPlan = planBatches(prefilter.files, {
-      callTokenBudget: chunking.call_token_budget,
+      callTokenBudget: effectiveBudget,
+      absoluteCapTokens,
       maxCalls: chunking.max_provider_calls_per_pr,
+      tokenizerFamily,
+      buildInputForBatch,
     });
 
+    // Phase 4: subset-and-note (D3, AC4.1). The batcher already applied
+    // priority ordering and populated `notReviewed` with any files in batches
+    // that were dropped to honor `max_provider_calls_per_pr`. We collect those
+    // here and will add any guard-trip-exhausted files later.
+    //
+    // The old `overCap` cliff (skip the whole PR) is GONE. Even when
+    // `batchPlan.overCap` is true, we still proceed with the KEPT batches.
+    // The dropped files surface in the check-run notice (AC4.1).
     if (batchPlan.overCap) {
-      // More batches would be needed than `max_provider_calls_per_pr` allows.
-      // Treat as oversized so the operator sees a clear remediation hint.
-      logger.emit('prefilter.skipped', {
+      logger.emit('chunking.subset_selected', {
         ...trace,
-        reason: 'too_many_batches',
-        batch_count_needed: batchPlan.batches.length,
+        kept_batches: batchPlan.batches.length,
         max_calls: chunking.max_provider_calls_per_pr,
+        not_reviewed_count: batchPlan.notReviewed.length,
       });
-      const oversizedNotice = `⚠️ Review skipped — this PR is too large to review even in sections (would need ${batchPlan.batches.length} provider calls; cap is \`chunking.max_provider_calls_per_pr=${chunking.max_provider_calls_per_pr}\`). Split the PR or raise \`chunking.max_provider_calls_per_pr\` in \`.github/review-bot.yml\`.`;
-      const oversizedDetail: OversizedDetail = {
-        prefilter_reason:
-          prefilter.lines_considered > deps.config.max_changed_lines
-            ? 'too_many_changed_lines'
-            : 'too_many_files',
-        files_considered: prefilter.files_considered,
-        lines_considered: prefilter.lines_considered,
-        max_files: deps.config.max_files,
-        max_changed_lines: deps.config.max_changed_lines,
-      };
-      const publication = await publishSummaryOnly({
-        payload,
-        identity,
-        octokit,
-        cfg: deps.config,
-        hooks,
-        reason: 'oversized',
-        reasonMessage: `chunking overCap: would need ${batchPlan.batches.length} calls`,
-        rejections: [],
-        resolvedHeadSha: deps.resolvedHeadSha,
-        notice: oversizedNotice,
-      });
-      logger.emit('publisher.published', {
-        ...trace,
-        mode: 'summary-only',
-        reason: 'oversized',
-        inline_count: publication.published_inline.length,
-        summary_count: publication.published_summary.length,
-      });
-      logger.emit('job.terminal', { ...trace, state: 'succeeded' });
-      return {
-        state: 'succeeded',
-        publication,
-        rejections: publication.rejections,
-        outcome: { kind: 'oversized', detail: oversizedDetail },
-      };
     }
 
-    // Plan is within the cap. Emit an observability event before starting.
+    // Plan is within the cap (or we're reviewing the highest-risk subset).
+    // Emit an observability event before starting.
     logger.emit('chunking.planned', {
       ...trace,
       batch_count: batchPlan.batches.length,
       est_total_tokens: batchPlan.estTotalTokens,
       skipped_files: batchPlan.skippedFiles.length,
+      not_reviewed_files: batchPlan.notReviewed.length,
     });
 
     // Loop over batches, accumulating findings and recording which failed.
+    // Uses a work-queue (instead of a simple index loop) so output_truncated
+    // batches can be split into two halves and re-enqueued without an extra
+    // outer loop (chunking-stability-spec.md § Phase 1 "Data-flow change").
     const allFindings: ProviderReviewOutput['findings'] = [];
     const failedBatches: number[] = [];
+    const truncatedFiles: string[] = [];
 
-    for (let batchIdx = 0; batchIdx < batchPlan.batches.length; batchIdx++) {
-      const batch = batchPlan.batches[batchIdx];
-      if (batch === undefined) continue;
+    // Phase 4: files that could not be reviewed because of call-budget drops
+    // (from batchPlan.notReviewed) or guard-trip exhaustion. Both surfaces
+    // contribute to the "not reviewed" notice section (AC4.1).
+    const notReviewedFiles: BatcherSkippedFile[] = [...batchPlan.notReviewed];
+
+    // Config for split-and-retry:
+    //   maxRetries  — per-batch retry depth cap (default 2).
+    //   globalCap   — total provider calls never exceed
+    //                 max_provider_calls_per_pr × (max_truncation_retries + 1).
+    const maxRetries = chunking.max_truncation_retries;
+    const globalCallCap = chunking.max_provider_calls_per_pr * (maxRetries + 1);
+
+    // Each queue entry: { batch, batchIdx, retryDepth }
+    // retryDepth 0 = original batch, 1 = first split, 2 = second split, …
+    interface WorkItem {
+      batch: PrefilteredFile[];
+      batchIdx: number;
+      retryDepth: number;
+    }
+
+    const workQueue: WorkItem[] = batchPlan.batches.map((batch, idx) => ({
+      batch,
+      batchIdx: idx,
+      retryDepth: 0,
+    }));
+
+    // Global counter: counts ACTUAL provider calls (not queue items).
+    let globalCallCount = 0;
+
+    while (workQueue.length > 0) {
+      const item = workQueue.shift();
+      if (item === undefined) break;
+      const { batch, batchIdx, retryDepth } = item;
+
+      // Global call cap guard: if we have already hit the cap, record the
+      // batch's files as truncated and continue without calling the provider.
+      if (globalCallCount >= globalCallCap) {
+        logger.emit('provider.batch.error', {
+          ...trace,
+          batch_index: batchIdx,
+          batch_count: batchPlan.batches.length,
+          kind: 'output_truncated',
+          provider: deps.provider.name,
+          message: 'global call cap exhausted; batch not retried',
+          retry_depth: retryDepth,
+        });
+        for (const f of batch) {
+          if (!truncatedFiles.includes(f.path)) truncatedFiles.push(f.path);
+        }
+        failedBatches.push(batchIdx);
+        continue;
+      }
 
       const batchInput = buildProviderInput(
         batch,
@@ -858,7 +957,9 @@ export const runPipeline = async (
         batch_count: batchPlan.batches.length,
         files_in_batch: batch.length,
         provider: deps.provider.name,
+        retry_depth: retryDepth,
       });
+      globalCallCount += 1;
 
       try {
         const batchOutput = await deps.provider.review(batchInput);
@@ -879,7 +980,190 @@ export const runPipeline = async (
             kind,
             provider: deps.provider.name,
             message: batchErr.value.message,
+            retry_depth: retryDepth,
           });
+
+          if (kind === 'output_truncated') {
+            // Split-and-retry logic per chunking-stability-spec.md § Phase 1.
+            if (retryDepth >= maxRetries) {
+              // Retry depth exhausted → record as truncated/failed, do NOT abort.
+              logger.emit('provider.batch.truncation_exhausted', {
+                ...trace,
+                batch_index: batchIdx,
+                files_in_batch: batch.length,
+                retry_depth: retryDepth,
+              });
+              for (const f of batch) {
+                if (!truncatedFiles.includes(f.path)) truncatedFiles.push(f.path);
+              }
+              failedBatches.push(batchIdx);
+              continue;
+            }
+
+            if (batch.length > 1) {
+              // Case 1: batch has >1 file → split into two ~equal halves.
+              // Split by estimated tokens: use content length as a proxy (same
+              // estimator as the batcher) so the two halves are roughly balanced.
+              // Phase 1 splits by file count (floor/ceil) to stay simple and
+              // input-budget-agnostic (the real estimator is Phase 2).
+              const mid = Math.ceil(batch.length / 2);
+              const leftHalf = batch.slice(0, mid);
+              const rightHalf = batch.slice(mid);
+              logger.emit('provider.batch.split', {
+                ...trace,
+                batch_index: batchIdx,
+                original_files: batch.length,
+                left_files: leftHalf.length,
+                right_files: rightHalf.length,
+                retry_depth: retryDepth + 1,
+              });
+              // Prepend both halves so they're processed next (depth-first).
+              workQueue.unshift(
+                { batch: leftHalf, batchIdx, retryDepth: retryDepth + 1 },
+                { batch: rightHalf, batchIdx, retryDepth: retryDepth + 1 },
+              );
+              continue;
+            }
+
+            // batch.length === 1 (single file):
+            const singleFile = batch[0];
+            if (singleFile !== undefined && singleFile.hunks.length > 1) {
+              // Case 2: single file with >1 hunk → Phase 1 cannot split hunks
+              // (that is Phase 3). Record as failed/truncated with a note.
+              logger.emit('provider.batch.truncation_unsplittable', {
+                ...trace,
+                batch_index: batchIdx,
+                path: singleFile.path,
+                hunk_count: singleFile.hunks.length,
+                note: 'single-file multi-hunk truncation: hunk-level split deferred to Phase 3',
+              });
+            } else {
+              // Case 3: single file / single hunk → cannot split at all.
+              logger.emit('provider.batch.truncation_unsplittable', {
+                ...trace,
+                batch_index: batchIdx,
+                path: singleFile?.path ?? 'unknown',
+                hunk_count: singleFile?.hunks.length ?? 0,
+                note: 'single-file single-hunk truncation: cannot split further',
+              });
+            }
+            // Both unsplittable cases: record as truncated, continue.
+            for (const f of batch) {
+              if (!truncatedFiles.includes(f.path)) truncatedFiles.push(f.path);
+            }
+            failedBatches.push(batchIdx);
+            continue;
+          }
+
+          if (kind === 'over_budget') {
+            // Phase 4: the per-call guard tripped (batch estimated over the
+            // hard_cap_in). DEGRADE, not abort: split and retry via the same
+            // work-queue logic as output_truncated.
+            //
+            // AC4.3: on exhaustion, files go to notReviewedFiles; PR continues.
+            // AC4.4: genuine auth/capability STILL aborts (handled below).
+            if (retryDepth >= maxRetries) {
+              logger.emit('provider.batch.budget_exhausted', {
+                ...trace,
+                batch_index: batchIdx,
+                files_in_batch: batch.length,
+                retry_depth: retryDepth,
+                estimated_tokens:
+                  batchErr.value.kind === 'over_budget'
+                    ? batchErr.value.estimated_tokens
+                    : undefined,
+              });
+              for (const f of batch) {
+                notReviewedFiles.push({
+                  path: f.path,
+                  est_tokens:
+                    batchErr.value.kind === 'over_budget' ? batchErr.value.estimated_tokens : 0,
+                  note: 'guard trip exhausted: batch over token budget after max retries',
+                });
+              }
+              failedBatches.push(batchIdx);
+              continue;
+            }
+
+            if (batch.length > 1) {
+              // Multi-file batch: split into two halves (Phase 1 strategy).
+              const mid = Math.ceil(batch.length / 2);
+              const leftHalf = batch.slice(0, mid);
+              const rightHalf = batch.slice(mid);
+              logger.emit('provider.batch.split', {
+                ...trace,
+                batch_index: batchIdx,
+                split_reason: 'over_budget',
+                original_files: batch.length,
+                left_files: leftHalf.length,
+                right_files: rightHalf.length,
+                retry_depth: retryDepth + 1,
+              });
+              workQueue.unshift(
+                { batch: leftHalf, batchIdx, retryDepth: retryDepth + 1 },
+                { batch: rightHalf, batchIdx, retryDepth: retryDepth + 1 },
+              );
+              continue;
+            }
+
+            // Single-file batch: attempt hunk-level split (Phase 3 strategy).
+            const singleFileOb = batch[0];
+            if (singleFileOb !== undefined && singleFileOb.hunks.length > 1) {
+              // Phase 3: split at hunk boundaries and re-enqueue each sub-file.
+              const { subFiles, overflowHunks } = splitFileByHunks(
+                singleFileOb,
+                effectiveBudget,
+                absoluteCapTokens,
+                tokenizerFamily,
+                buildInputForBatch,
+              );
+              // Overflow hunks: truly unsplittable → notReviewedFiles.
+              for (const { hunkId, estTokens } of overflowHunks) {
+                notReviewedFiles.push({
+                  path: singleFileOb.path,
+                  est_tokens: estTokens,
+                  note: `hunk ${hunkId} exceeds the absolute token cap; cannot be reviewed`,
+                });
+              }
+              if (subFiles.length > 0) {
+                logger.emit('provider.batch.hunk_split', {
+                  ...trace,
+                  batch_index: batchIdx,
+                  split_reason: 'over_budget',
+                  path: singleFileOb.path,
+                  sub_file_count: subFiles.length,
+                  retry_depth: retryDepth + 1,
+                });
+                workQueue.unshift(
+                  ...subFiles.map((sf) => ({
+                    batch: [sf],
+                    batchIdx,
+                    retryDepth: retryDepth + 1,
+                  })),
+                );
+                continue;
+              }
+            }
+
+            // Single-file / single-hunk or all hunks overflowed: cannot split further.
+            logger.emit('provider.batch.budget_unsplittable', {
+              ...trace,
+              batch_index: batchIdx,
+              path: singleFileOb?.path ?? 'unknown',
+              hunk_count: singleFileOb?.hunks.length ?? 0,
+            });
+            for (const f of batch) {
+              notReviewedFiles.push({
+                path: f.path,
+                est_tokens:
+                  batchErr.value.kind === 'over_budget' ? batchErr.value.estimated_tokens : 0,
+                note: 'over_budget: cannot split further (single hunk or all hunks overflow)',
+              });
+            }
+            failedBatches.push(batchIdx);
+            continue;
+          }
+
           if (kind === 'schema_validation') {
             // Partial failure: drop this batch's findings, continue.
             // The merged output will be marked partial in the notice.
@@ -889,6 +1173,7 @@ export const runPipeline = async (
           if (kind === 'auth' || kind === 'capability') {
             // Non-transient: abort and publish review_unavailable (same as
             // single-call path). Re-throws — does not return.
+            // AC4.4: genuine auth / model-unavailable capability STILL aborts.
             await handleAuthCapabilityError(batchErr);
           }
           // transport / rate_limit / retryable: abort and re-throw so
@@ -962,7 +1247,28 @@ export const runPipeline = async (
       batchPlan.skippedFiles.length > 0
         ? ` ${batchPlan.skippedFiles.length} file(s) skipped (too large to analyze): ${batchPlan.skippedFiles.map((f) => f.path).join(', ')}.`
         : '';
-    const chunkedNotice = `Reviewed in ${batchPlan.batches.length} section(s) (large PR).${partialNote}${skippedFileNote}`;
+    // Per chunking-stability-spec.md § Phase 1 AC1.3: truncated files that
+    // could not be split further are listed as "not fully reviewed" so
+    // operators can see which paths need attention.
+    const truncatedFileNote =
+      truncatedFiles.length > 0
+        ? ` not fully reviewed (output truncated): ${truncatedFiles.join(', ')}.`
+        : '';
+    // Phase 4: "not reviewed" section for files dropped by the call-budget
+    // subset-and-note logic OR exhausted guard-trip retries.
+    // Spec § Phase 4 "Subset-and-note behavior (D3)" notice format:
+    //   "Reviewed the N highest-risk sections. Not reviewed (PR exceeds the
+    //    per-PR call budget of M): <files>. Raise chunking.max_provider_calls_per_pr
+    //    or split the PR."
+    const notReviewedNote =
+      notReviewedFiles.length > 0
+        ? ` Not reviewed (PR exceeds the per-PR call budget of ${chunking.max_provider_calls_per_pr}): ${notReviewedFiles.map((f) => f.path).join(', ')}. Raise \`chunking.max_provider_calls_per_pr\` or split the PR.`
+        : '';
+    const reviewedSectionsPrefix =
+      notReviewedFiles.length > 0
+        ? `Reviewed the ${batchPlan.batches.length} highest-risk section(s) (large PR).`
+        : `Reviewed in ${batchPlan.batches.length} section(s) (large PR).`;
+    const chunkedNotice = `${reviewedSectionsPrefix}${partialNote}${skippedFileNote}${truncatedFileNote}${notReviewedNote}`;
 
     // Feed the merged output into the EXISTING validator → ranker → publisher
     // tail. This is unchanged — dedupe and caps apply to the whole PR.
@@ -1029,6 +1335,9 @@ export const runPipeline = async (
       batch_count: batchPlan.batches.length,
       failed_batches: failedBatches,
       skipped_files: batchPlan.skippedFiles,
+      truncated_files: truncatedFiles,
+      // Phase 4: files dropped by call-budget subset-and-note or guard-trip exhaustion.
+      not_reviewed_files: notReviewedFiles,
     };
 
     return {

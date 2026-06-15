@@ -18,6 +18,13 @@ const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   function_calling: true,
   deterministic_seed: true,
   max_context_tokens: 200000,
+  /**
+   * Phase 2: tokenizer family for the fake provider.
+   * Uses `anthropic-approx` as a safe default (no BPE needed, just the
+   * chars/4 × SAFETY_MARGIN heuristic). Tests that care about exact counts
+   * can override this via `FakeProviderOptions.capabilities`.
+   */
+  tokenizer_family: 'anthropic-approx',
 };
 
 export type FakeStep =

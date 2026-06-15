@@ -177,7 +177,13 @@ describe('runPrefilter', () => {
         max_files: 3,
         max_changed_lines: 12000,
         max_provider_calls_per_pr: 6,
-        call_token_budget: 60000,
+        call_token_budget: 1_000_000,
+        reserved_output_tokens: 16000,
+        max_truncation_retries: 2,
+        prompt_overhead_tokens: 9000,
+        safety_fraction: 0.07,
+        hunk_context_lines: 10,
+        min_hunk_split_tokens: 0,
       },
     });
     const result = runPrefilter({ snapshot, config });
@@ -222,7 +228,13 @@ describe('runPrefilter', () => {
         max_files: 200,
         max_changed_lines: 12000,
         max_provider_calls_per_pr: 6,
-        call_token_budget: 60000,
+        call_token_budget: 1_000_000,
+        reserved_output_tokens: 16000,
+        max_truncation_retries: 2,
+        prompt_overhead_tokens: 9000,
+        safety_fraction: 0.07,
+        hunk_context_lines: 10,
+        min_hunk_split_tokens: 0,
       },
     });
     const result = runPrefilter({ snapshot, config });

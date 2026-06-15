@@ -92,18 +92,25 @@ When the prefilter detects that the PR exceeds `max_files` or `max_changed_lines
 
 The publisher emits **summary-only output regardless of the configured `mode`**. The summary states which limit was hit (`max_files` or `max_changed_lines` or both) and lists the affected paths in aggregate (no per-finding inline comments, no per-finding rendering — there are no findings). No inline comments are created even if the configured `mode` is `summary-plus-inline`.
 
-The same oversized path applies when greedy bin-packing would need more provider calls than `chunking.max_provider_calls_per_pr`. The Checks summary states the required call count and the current cap value.
+In v0.12.0+, when the PR requires more provider calls than `chunking.max_provider_calls_per_pr`,
+the publisher applies **subset-and-note**: the highest-risk files (sorted by security/migration
+heuristics, then by size) within the call budget are reviewed, and a visible "not reviewed"
+list is posted in the Checks summary instead of skipping the entire PR.
 
 ### Diff too large — chunked review
 
 When the prefilter detects that the PR exceeds `max_files` / `max_changed_lines` but fits within the chunkable ceiling (`chunking.max_files` / `chunking.max_changed_lines`) and `chunking.enabled = true`, the pipeline performs a chunked review:
 
-1. Files are sorted by path (deterministic order) and packed into batches using a greedy algorithm bounded by `chunking.call_token_budget` per batch.
-2. Each batch is sent as an independent provider call.
-3. All batch findings are merged into a single `ProviderReviewOutput` **before** the validator runs.
-4. The existing validator → ranker → publisher chain runs once on the merged findings.
+1. Files are sorted by a deterministic risk proxy: security/migration path heuristics > change size > path (alphabetic). This ensures high-risk files are reviewed first.
+2. Files are packed into batches using a greedy bin-packing algorithm. Each batch's token estimate must fit within the **derived** input budget (the provider's context window minus reserves for output, overhead, and safety; see `config-spec.md` § The Token Budget Derivation Formula).
+3. A single file larger than the budget is split at hunk boundaries into sub-file chunks (same path, hunk subset), preserving line numbering and deduplication.
+4. Each batch is sent as an independent provider call. When output is truncated, the batch is split and retried (bounded by `chunking.max_truncation_retries`).
+5. All batch findings are merged into a single `ProviderReviewOutput` **before** the validator runs.
+6. The existing validator → ranker → publisher chain runs once on the merged findings.
 
-The result is a `review_complete_chunked` pipeline outcome. The Checks summary includes a preamble notice: "Reviewed in N section(s) (large PR)." Dedupe, ranking, and per-PR caps apply to the full merged finding set — not per batch.
+If the total number of batches exceeds `chunking.max_provider_calls_per_pr`, the pipeline reviews the highest-risk batches (in priority order) up to the limit, and posts a visible "not reviewed: <files>" notice for the remainder.
+
+The result is a `review_complete_chunked` pipeline outcome. The Checks summary includes a preamble notice: "Reviewed in N section(s) (large PR)." If any files were not reviewed due to the call budget, the notice includes: "Not reviewed (PR exceeds per-PR call budget): <file list>." Dedupe, ranking, and per-PR caps apply to the full merged finding set — not per batch.
 
 ### Partial review
 
@@ -111,9 +118,13 @@ When some (but not all) batches in a chunked review return a `schema_validation`
 
 If all batches fail `schema_validation`, the pipeline routes to the existing `malformed_provider_output` path — no partial summary is published.
 
-Files whose individual token estimate exceeds the hard safety cap (≈110,000 tokens) are excluded from all batches. If any files are skipped for this reason, the Checks summary preamble includes: "K file(s) were too large to analyze individually and were skipped."
+When output truncation occurs (v0.12.0+), the batch is automatically split and retried up to `chunking.max_truncation_retries` times. If a batch's hunk cannot be split further (single file, single hunk) and still truncates after retries, it is recorded as "not fully reviewed (output truncated)" in the check-run notice; the PR continues with surviving batches' findings.
 
-`auth` and `capability` errors in any batch abort the entire chunked review and route to `review_unavailable`. `transport` and `rate_limit` errors abort the loop and re-throw so the BullMQ job is retried from scratch (partial-publish-then-retry would cause double-publication).
+When a batch trips the per-call input guard (`over_budget` error, v0.12.0+), the batch is split and retried. On exhaustion, its files are added to the "not reviewed" list rather than aborting the PR.
+
+Single hunks whose estimate exceeds the provider's true context window minus reserves are excluded from all batches and recorded as "not reviewed (too large for individual analysis)". These are genuine overflows that no model can accept.
+
+`auth` and capability errors (other than `over_budget`) in any batch abort the entire chunked review and route to `review_unavailable`. `transport` and `rate_limit` errors abort the loop and re-throw so the BullMQ job is retried from scratch (partial-publish-then-retry would cause double-publication).
 
 ### Provider error (non-transient)
 

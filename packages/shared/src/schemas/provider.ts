@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { TokenizerFamily } from '../tokens/estimator.js';
 import { GenerationSchema } from './config.js';
 import { CategorySchema, SeveritySchema } from './finding.js';
 import { CustomGuidanceSchema } from './guidance.js';
@@ -154,6 +155,37 @@ export const ProviderErrorSchema = z.discriminatedUnion('kind', [
       ...ProviderErrorBase,
     })
     .strict(),
+  z
+    .object({
+      kind: z.literal('output_truncated'),
+      /**
+       * The `max_tokens` value that was in effect when the output was truncated.
+       * Carried from the adapter so the orchestrator can log/display it and the
+       * split-and-retry path can make informed decisions.
+       */
+      requested_max_tokens: z.number().int().positive(),
+      ...ProviderErrorBase,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('over_budget'),
+      /**
+       * The estimated prompt token count that triggered the guard.
+       * Carried from the adapter so the orchestrator can log/display it and
+       * make informed split decisions (Phase 4: degrade-not-abort).
+       *
+       * Per chunking-stability-spec.md § Phase 4 "New degradable error kind".
+       */
+      estimated_tokens: z.number().int().positive(),
+      /**
+       * The hard_cap_in value that was in effect when the guard fired.
+       * Allows the orchestrator to diagnose and possibly split the batch.
+       */
+      hard_cap_in: z.number().int().positive(),
+      ...ProviderErrorBase,
+    })
+    .strict(),
 ]);
 export type ProviderError = z.infer<typeof ProviderErrorSchema>;
 
@@ -161,6 +193,15 @@ export type ProviderError = z.infer<typeof ProviderErrorSchema>;
  * `ProviderCapabilities` per ADR-002 § Interface contract: a typed bag describing
  * per-adapter capability presence (structured-output mode, function calling,
  * deterministic seed, max context).
+ *
+ * `tokenizer_family` (Phase 2): the tokenizer family to use when estimating
+ * prompt tokens for this adapter's model. The orchestrator reads this to pick
+ * the correct `TokenizerFamily` for `estimatePromptTokens` and `planBatches`.
+ *   - anthropic adapters → `'anthropic-approx'`
+ *   - openai adapters → `'o200k'` or `'cl100k'` per model family
+ *   - copilot adapters → `'cl100k'`
+ *
+ * Per chunking-stability-spec.md § Phase 2 "Provider capabilities".
  */
 export const ProviderCapabilitiesSchema = z
   .object({
@@ -168,9 +209,17 @@ export const ProviderCapabilitiesSchema = z
     function_calling: z.boolean(),
     deterministic_seed: z.boolean(),
     max_context_tokens: z.number().int().positive(),
+    /**
+     * Tokenizer family for accurate prompt-token estimation (Phase 2).
+     * Used by `estimatePromptTokens` in `@prisma-bot/shared/tokens/estimator`.
+     */
+    tokenizer_family: z.enum(['cl100k', 'o200k', 'anthropic-approx']),
   })
   .strict();
 export type ProviderCapabilities = z.infer<typeof ProviderCapabilitiesSchema>;
+
+// Re-export TokenizerFamily so it's available via the schemas barrel.
+export type { TokenizerFamily };
 
 /**
  * `ProviderErrorThrowable` is the concrete `Error` subclass adapters throw.

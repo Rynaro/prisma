@@ -1131,14 +1131,35 @@ describe('runPipeline — diff chunking', () => {
     expect(spy.reviewCommentsCreate).toHaveLength(0);
   });
 
-  it('overCap → oversized outcome with notice describing batch count', async () => {
+  /**
+   * Phase 4 AC4.1: GIVEN 3 batches with max_provider_calls_per_pr=2,
+   * THEN exactly 2 batches are called, their findings publish, and the
+   * notice lists the dropped file under "not reviewed" — the PR is NOT
+   * skipped wholesale (contrast: pre-Phase-4 this produced outcome.kind==='oversized').
+   */
+  it('AC4.1: overCap → subset reviewed (not skipped); not-reviewed files in notice', async () => {
     const snap = buildChunkableSnapshot(3);
-    const provider = new FakeProvider({ script: [] });
+    // budget=1 → 3 batches; maxCalls=2 → overCap; kept = first 2 batches
+    const provider = new FakeProvider({
+      script: [
+        // Call 1: first kept batch → success with finding for file0
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file0.ts', line: 11 })] },
+        },
+        // Call 2: second kept batch → success with finding for file1
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file1.ts', line: 11 })] },
+        },
+        // (third batch is dropped — file2 goes to notReviewed, no call made)
+      ],
+    });
     const capturedNotices: Array<string | undefined> = [];
     const spy = buildOctokitSpy();
-    // budget=1 → 3 batches; maxCalls=2 → overCap
     const config = RepoConfigSchema.parse({
       mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
       chunking: {
         enabled: true,
         max_files: 200,
@@ -1159,12 +1180,245 @@ describe('runPipeline — diff chunking', () => {
 
     const result = await runPipeline(makePayload(), deps);
 
+    // PR is NOT aborted or skipped — outcome is review_complete_chunked.
     expect(result.state).toBe('succeeded');
-    expect(result.outcome?.kind).toBe('oversized');
-    expect(provider.calls).toHaveLength(0);
-    // Notice explains that too many batches would be needed.
-    expect(capturedNotices[0]).toMatch(/provider calls/i);
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    // Exactly 2 provider calls (the 2 kept batches).
+    expect(provider.calls).toHaveLength(2);
+    // Findings from both kept batches were published.
+    expect(spy.reviewCommentsCreate).toHaveLength(2);
+    // Notice lists the "not reviewed" file (src/file2.ts is in the dropped batch).
+    expect(capturedNotices[0]).toMatch(/not reviewed/i);
     expect(capturedNotices[0]).toMatch(/max_provider_calls_per_pr/i);
+    expect(capturedNotices[0]).toContain('src/file2.ts');
+    // Outcome detail contains the not_reviewed_files.
+    if (result.outcome?.kind !== 'review_complete_chunked') return;
+    expect(result.outcome.detail.not_reviewed_files).toHaveLength(1);
+    expect(result.outcome.detail.not_reviewed_files[0]?.path).toBe('src/file2.ts');
+  });
+
+  /**
+   * Phase 4 AC4.2: priority ordering is deterministic — same input always
+   * produces the same kept set.
+   */
+  it('AC4.2: subset selection is deterministic — same input → same kept set', async () => {
+    // Run the same overCap scenario twice and verify the same files are reviewed.
+    const snap = buildChunkableSnapshot(3);
+    const makeScript = () => [
+      {
+        kind: 'output' as const,
+        output: { findings: [makeFindingFixture({ path: 'src/file0.ts', line: 11 })] },
+      },
+      {
+        kind: 'output' as const,
+        output: { findings: [makeFindingFixture({ path: 'src/file1.ts', line: 11 })] },
+      },
+    ];
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 2,
+        call_token_budget: 1,
+      },
+    });
+
+    const spy1 = buildOctokitSpy();
+    const r1 = await runPipeline(
+      makePayload(),
+      buildDeps({
+        provider: new FakeProvider({ script: makeScript() }),
+        octokitSpy: spy1,
+        snapshot: snap,
+        config,
+      }),
+    );
+
+    const spy2 = buildOctokitSpy();
+    const r2 = await runPipeline(
+      makePayload(),
+      buildDeps({
+        provider: new FakeProvider({ script: makeScript() }),
+        octokitSpy: spy2,
+        snapshot: snap,
+        config,
+      }),
+    );
+
+    expect(r1.outcome?.kind).toBe('review_complete_chunked');
+    expect(r2.outcome?.kind).toBe('review_complete_chunked');
+    if (r1.outcome?.kind !== 'review_complete_chunked') return;
+    if (r2.outcome?.kind !== 'review_complete_chunked') return;
+    // Same not_reviewed_files in both runs.
+    const nr1 = r1.outcome.detail.not_reviewed_files.map((f) => f.path).sort();
+    const nr2 = r2.outcome.detail.not_reviewed_files.map((f) => f.path).sort();
+    expect(nr1).toEqual(nr2);
+  });
+
+  /**
+   * Phase 4 AC4.3: over_budget guard trip mid-loop → batch split+retried;
+   * on exhaustion its files go to notReviewedFiles; PR publishes other
+   * findings and does NOT abort.
+   *
+   * Setup: 2-file snapshot (2 batches with budget=1 so each file gets its own
+   * batch). The provider for batch 0 throws over_budget every time;
+   * batch 1 succeeds with a finding for file1.
+   * After max_truncation_retries=2 exhausted for batch 0 (single-file/single-hunk
+   * cannot split further), file0 goes to notReviewedFiles and the PR still
+   * publishes file1's finding.
+   */
+  it('AC4.3: over_budget guard trip mid-loop → degrade not abort; PR publishes surviving findings', async () => {
+    const snap = buildChunkableSnapshot(2);
+    // The over_budget error is thrown directly as if the per-call guard fired.
+    // Since the batch has 1 file/1 hunk, it cannot split → after 1 attempt
+    // (depth 0 >= maxRetries? No, retryDepth=0 < maxRetries=2 but single-file
+    // single-hunk means no split is possible, so it goes to notReviewedFiles).
+    // For a 1-file/1-hunk batch: the first over_budget → no split → record immediately.
+    const provider = new FakeProvider({
+      script: [
+        // Call 1: file0 → over_budget (single file/hunk → cannot split → notReviewed)
+        {
+          kind: 'error',
+          error: {
+            kind: 'over_budget',
+            estimated_tokens: 200000,
+            hard_cap_in: 100000,
+            message: 'request exceeds per-call token budget',
+          },
+        },
+        // Call 2: file1 → success
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file1.ts', line: 11 })] },
+        },
+      ],
+    });
+    const capturedNotices: Array<string | undefined> = [];
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+        max_truncation_retries: 2,
+      },
+    });
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: snap, config });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+
+    const result = await runPipeline(makePayload(), deps);
+
+    // PR is NOT aborted.
+    expect(result.state).toBe('succeeded');
+    // file1's finding was published.
+    expect(spy.reviewCommentsCreate).toHaveLength(1);
+    expect(spy.reviewCommentsCreate[0]?.path).toBe('src/file1.ts');
+    // outcome is review_complete_chunked, not aborted
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    if (result.outcome?.kind !== 'review_complete_chunked') return;
+    // file0 went to not_reviewed_files.
+    expect(result.outcome.detail.not_reviewed_files.some((f) => f.path === 'src/file0.ts')).toBe(
+      true,
+    );
+    // Notice mentions the not-reviewed file.
+    expect(capturedNotices[0]).toMatch(/not reviewed/i);
+    expect(capturedNotices[0]).toContain('src/file0.ts');
+  });
+
+  /**
+   * Phase 4 AC4.4: genuine auth error STILL aborts with review_unavailable.
+   * This test is separate from the existing auth mid-loop test but explicitly
+   * verifies that auth is not over-broadened by the over_budget degrade path.
+   */
+  it('AC4.4: genuine auth error still aborts with review_unavailable (not over-broadened)', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        { kind: 'output', output: { findings: [] } },
+        { kind: 'error', error: { kind: 'auth', message: 'invalid api key' } },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+      },
+    });
+
+    // Must reject (auth aborts the PR).
+    await expect(
+      runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, snapshot: snap, config })),
+    ).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    // review_unavailable summary was published before re-throw.
+    expect(spy.checksCreate).toHaveLength(1);
+  });
+
+  /**
+   * Phase 4 AC4.5: a PR where every batch fits under both hard_cap_in and
+   * maxCalls → notReviewedFiles is empty and the notice omits the "not reviewed" line.
+   */
+  it('AC4.5: happy-path PR → not_reviewed_files empty; notice omits "not reviewed" line', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file0.ts', line: 11 })] },
+        },
+        { kind: 'output', output: { findings: [] } },
+      ],
+    });
+    const capturedNotices: Array<string | undefined> = [];
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6, // well above the 2-batch plan
+        call_token_budget: 1,
+      },
+    });
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: snap, config });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+
+    const result = await runPipeline(makePayload(), deps);
+
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    if (result.outcome?.kind !== 'review_complete_chunked') return;
+    // No not-reviewed files (all batches fit within cap).
+    expect(result.outcome.detail.not_reviewed_files).toHaveLength(0);
+    // Notice does NOT contain the "not reviewed" section.
+    expect(capturedNotices[0]).not.toMatch(/not reviewed \(PR exceeds/i);
   });
 
   it('cross-batch deduplication: same finding from 2 batches → dedupe to 1 inline comment', async () => {
@@ -1246,6 +1500,252 @@ describe('runPipeline — diff chunking', () => {
     await runPipeline(makePayload(), deps);
     expect(capturedNotices[0]).toMatch(/section/i);
     expect(capturedNotices[0]).toMatch(/large PR/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 1: output_truncated split-and-retry (chunking-stability-spec.md)
+  // -------------------------------------------------------------------------
+
+  /**
+   * AC1.1: GIVEN a 3-file batch, WHEN the provider returns output_truncated,
+   * THEN the orchestrator splits into retry-batches, re-calls, and merges
+   * findings from both — zero findings dropped if the halves succeed.
+   *
+   * Setup: call_token_budget=60000 so all 3 files land in ONE initial batch.
+   */
+  it('AC1.1: 3-file batch truncates → splits into halves → merges findings, none dropped', async () => {
+    const snap = buildChunkableSnapshot(3);
+    // Batch 0 (all 3 files): truncates → splits into [file0,file1] and [file2].
+    // Retry [file0,file1]: succeeds with finding for file0.
+    // Retry [file2]: succeeds with finding for file2.
+    // Total provider calls: 3 (1 initial + 2 retry halves).
+    const provider = new FakeProvider({
+      script: [
+        // Call 1: initial 3-file batch → output_truncated
+        {
+          kind: 'error',
+          error: { kind: 'output_truncated', message: 'truncated', requested_max_tokens: 4096 },
+        },
+        // Call 2: left half [file0, file1] → success with file0 finding
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file0.ts', line: 11 })] },
+        },
+        // Call 3: right half [file2] → success with file2 finding
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file2.ts', line: 11 })] },
+        },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    // Use a large token budget so all 3 files land in ONE batch initially.
+    // Each file has 1100 lines × ~4 chars/token ≈ 4400 tokens; all 3 fit in 60000.
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 60000,
+        max_truncation_retries: 2,
+      },
+    });
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({ provider, octokitSpy: spy, snapshot: snap, config }),
+    );
+
+    expect(result.state).toBe('succeeded');
+    // Provider was called 3 times: once for the initial batch, twice for the halves.
+    expect(provider.calls).toHaveLength(3);
+    // 2 findings published (one per file).
+    expect(spy.reviewCommentsCreate).toHaveLength(2);
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    if (result.outcome?.kind !== 'review_complete_chunked') return;
+    // No truncated files in the detail (halves succeeded).
+    expect(result.outcome.detail.truncated_files).toHaveLength(0);
+  });
+
+  /**
+   * AC1.3: GIVEN a single 1-file/1-hunk batch that truncates, WHEN retries
+   * are exhausted, THEN the PR still publishes with surviving findings and
+   * the check-run notice contains "not fully reviewed (output truncated): <path>".
+   * The PR is NOT aborted.
+   */
+  it('AC1.3: single 1-file/1-hunk truncation exhausted → PR publishes surviving findings + truncated notice', async () => {
+    // 2-file snapshot: file0 succeeds, file1 truncates all retries.
+    // With max_truncation_retries=2, file1's batch is tried once and
+    // cannot split (1 file / 1 hunk) → recorded as truncated.
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        // Call 1: file0 batch → success
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file0.ts', line: 11 })] },
+        },
+        // Call 2: file1 batch → output_truncated (1 file, 1 hunk → cannot split)
+        {
+          kind: 'error',
+          error: { kind: 'output_truncated', message: 'truncated', requested_max_tokens: 4096 },
+        },
+      ],
+    });
+    const capturedNotices: Array<string | undefined> = [];
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+        max_truncation_retries: 2,
+      },
+    });
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: snap, config });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+
+    const result = await runPipeline(makePayload(), deps);
+
+    // PR is NOT aborted — state is still succeeded.
+    expect(result.state).toBe('succeeded');
+    // File0's finding was published.
+    expect(spy.reviewCommentsCreate).toHaveLength(1);
+    expect(spy.reviewCommentsCreate[0]?.path).toBe('src/file0.ts');
+    // The check-run notice mentions the truncated file.
+    expect(capturedNotices[0]).toMatch(/not fully reviewed \(output truncated\)/i);
+    expect(capturedNotices[0]).toContain('src/file1.ts');
+    // Outcome detail records the truncated file.
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    if (result.outcome?.kind !== 'review_complete_chunked') return;
+    expect(result.outcome.detail.truncated_files).toContain('src/file1.ts');
+  });
+
+  /**
+   * AC1.4: GIVEN `max_truncation_retries=2`, WHEN a 2-file batch truncates,
+   * splits, and each half also truncates (depth=1 < 2), THEN the halves are
+   * called once each (depth=1 has not exhausted the cap), each 1-file half
+   * records as truncated since it cannot be split further.
+   * Total: 3 calls. Both files truncated. PR does NOT abort. Global cap respected.
+   *
+   * Setup: call_token_budget=60000 → both files land in ONE initial batch.
+   *   Call 1: initial [file0, file1] (depth=0) → truncated → splits
+   *   Call 2: [file0] (depth=1 < maxRetries=2) → truncated → 1-file → recorded
+   *   Call 3: [file1] (depth=1 < maxRetries=2) → truncated → 1-file → recorded
+   * Total: 3 calls, both files truncated.
+   */
+  it('AC1.4: max_truncation_retries=2, 2-file batch truncates + halves truncate → 3 calls, both files truncated, no abort', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        // Call 1: initial 2-file batch → truncated → splits into [file0] and [file1]
+        {
+          kind: 'error',
+          error: { kind: 'output_truncated', message: 'truncated', requested_max_tokens: 4096 },
+        },
+        // Call 2: [file0] half (depth=1 < max_truncation_retries=2) → truncated → 1-file → recorded
+        {
+          kind: 'error',
+          error: { kind: 'output_truncated', message: 'truncated', requested_max_tokens: 4096 },
+        },
+        // Call 3: [file1] half (depth=1 < max_truncation_retries=2) → truncated → 1-file → recorded
+        {
+          kind: 'error',
+          error: { kind: 'output_truncated', message: 'truncated', requested_max_tokens: 4096 },
+        },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        // Large budget so 2 files land in one initial batch.
+        call_token_budget: 60000,
+        max_truncation_retries: 2,
+      },
+    });
+
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({ provider, octokitSpy: spy, snapshot: snap, config }),
+    );
+
+    // PR is NOT aborted.
+    expect(result.state).toBe('succeeded');
+    // 3 provider calls: 1 initial + 2 retry halves.
+    expect(provider.calls).toHaveLength(3);
+    // Both files end up truncated.
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    if (result.outcome?.kind !== 'review_complete_chunked') return;
+    expect(result.outcome.detail.truncated_files).toContain('src/file0.ts');
+    expect(result.outcome.detail.truncated_files).toContain('src/file1.ts');
+    // Global cap: 6 * (2+1) = 18; we used only 3 — well within cap.
+    expect(provider.calls.length).toBeLessThanOrEqual(
+      6 * (2 + 1), // max_provider_calls_per_pr * (max_truncation_retries + 1)
+    );
+  });
+
+  /**
+   * AC1.5 (regression): GIVEN a happy-path PR with default config, WHEN
+   * reviewed, THEN no split occurs, no truncated files, and
+   * the PR publishes normally (byte-identical behavior for non-truncating PRs).
+   */
+  it('AC1.5: happy-path PR (no truncation) produces normal review_complete_chunked without truncated files', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file0.ts', line: 11 })] },
+        },
+        { kind: 'output', output: { findings: [] } },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+        // Default max_truncation_retries=2, reserved_output_tokens=4096
+      },
+    });
+
+    const result = await runPipeline(
+      makePayload(),
+      buildDeps({ provider, octokitSpy: spy, snapshot: snap, config }),
+    );
+
+    expect(result.state).toBe('succeeded');
+    // Exactly 2 provider calls (no retries).
+    expect(provider.calls).toHaveLength(2);
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    if (result.outcome?.kind !== 'review_complete_chunked') return;
+    // No truncated files.
+    expect(result.outcome.detail.truncated_files).toHaveLength(0);
+    // Finding published normally.
+    expect(spy.reviewCommentsCreate).toHaveLength(1);
   });
 });
 

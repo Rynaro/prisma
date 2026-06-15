@@ -5,6 +5,8 @@ import {
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputSchema,
+  estimatePromptTokens,
+  serializeForEstimate,
 } from '@prisma-bot/shared';
 import { createCopilotClient } from './client.js';
 import { mapCopilotError } from './error-mapping.js';
@@ -39,6 +41,15 @@ const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   function_calling: true,
   deterministic_seed: false,
   max_context_tokens: 128000,
+  /**
+   * Copilot uses GPT-4o-class models via the GitHub Models endpoint.
+   * The endpoint is OpenAI-compatible; default tokenizer is `cl100k` (GPT-4
+   * family). Operators targeting gpt-4o or newer models should note that those
+   * use `o200k_base`, but `cl100k` over-counts for those (safe direction).
+   *
+   * Per chunking-stability-spec.md § Phase 2 "Provider capabilities".
+   */
+  tokenizer_family: 'cl100k',
 };
 
 /**
@@ -62,6 +73,16 @@ export interface CopilotClientLike {
   }): Promise<unknown>;
 }
 
+/**
+ * Default output token budget. Matches the historical hardcoded value so that
+ * deployments that do not set `COPILOT_MAX_OUTPUT_TOKENS` are byte-identical
+ * in behavior. Raise via `CopilotProviderOptions.maxOutputTokens` (or the
+ * env var) for finding-dense repos where the output truncates.
+ *
+ * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+ */
+const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
 export interface CopilotProviderOptions {
   apiKey: string;
   model?: string;
@@ -72,6 +93,14 @@ export interface CopilotProviderOptions {
    * `missing_capability: 'cost_ceiling'` for parity with the Anthropic adapter.
    */
   maxTokensPerCall?: number;
+  /**
+   * Output token budget sent per request as `max_tokens`. Defaults to 4096.
+   * Raise via `COPILOT_MAX_OUTPUT_TOKENS` env var or
+   * `chunking.reserved_output_tokens` config for finding-dense repos.
+   *
+   * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+   */
+  maxOutputTokens?: number;
   timeoutMs?: number;
   capabilities?: ProviderCapabilities;
   client?: CopilotClientLike;
@@ -179,11 +208,13 @@ export class CopilotProvider implements Provider {
   private readonly client: CopilotClientLike;
   private readonly model: string;
   private readonly maxTokensPerCall: number | undefined;
+  private readonly maxOutputTokens: number;
 
   constructor(options: CopilotProviderOptions) {
     this.capabilities = options.capabilities ?? DEFAULT_CAPABILITIES;
     this.model = options.model ?? COPILOT_DEFAULT_MODEL;
     this.maxTokensPerCall = options.maxTokensPerCall;
+    this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
     if (options.client !== undefined) {
       this.client = options.client;
     } else {
@@ -202,12 +233,21 @@ export class CopilotProvider implements Provider {
 
   async review(input: ProviderReviewInput): Promise<ProviderReviewOutput> {
     if (this.maxTokensPerCall !== undefined) {
-      const estimate = Math.ceil(JSON.stringify(input).length / 4);
+      // Phase 2: unified estimator — counts the SAME serialized prompt the
+      // batcher counts, eliminating the HOTSPOT-2/HOTSPOT-6 divergence.
+      // Phase 4: throws `over_budget` (not `capability/cost_ceiling`) so the
+      // orchestrator's discriminator is a single `kind === 'over_budget'` check
+      // and the batch degrades (split/skip) instead of aborting the PR.
+      const estimate = estimatePromptTokens(
+        serializeForEstimate(input),
+        this.capabilities.tokenizer_family,
+      );
       if (estimate > this.maxTokensPerCall) {
         throw new ProviderErrorThrowable({
-          kind: 'capability',
-          missing_capability: 'cost_ceiling',
-          message: 'request exceeds maxTokensPerCall',
+          kind: 'over_budget',
+          estimated_tokens: estimate,
+          hard_cap_in: this.maxTokensPerCall,
+          message: `request exceeds per-call token budget: estimated ${estimate} tokens, cap ${this.maxTokensPerCall}`,
         });
       }
     }
@@ -221,7 +261,7 @@ export class CopilotProvider implements Provider {
         messages: prompt.messages,
         tools: [prompt.tool],
         tool_choice: prompt.tool_choice,
-        max_tokens: 4096,
+        max_tokens: this.maxOutputTokens,
       });
     } catch (err) {
       if (err instanceof ProviderErrorThrowable) {
@@ -231,9 +271,9 @@ export class CopilotProvider implements Provider {
     }
 
     // Detect response truncation: finish_reason==='length' means the model hit
-    // max_tokens (4096) and the output may be a partial/invalid findings array.
-    // Treat as schema_validation so the orchestrator publishes malformed_provider_output
-    // and does not silently accept a truncated result.
+    // the output token cap and the output may be a partial/invalid findings array.
+    // Throw output_truncated so the orchestrator can split-and-retry instead of
+    // dropping the batch's findings (chunking-stability-spec.md § Phase 1).
     if (
       typeof response === 'object' &&
       response !== null &&
@@ -249,8 +289,9 @@ export class CopilotProvider implements Provider {
         (firstChoice as Record<string, unknown>).finish_reason === 'length'
       ) {
         throw new ProviderErrorThrowable({
-          kind: 'schema_validation',
-          message: `copilot response truncated: finish_reason is 'length' (max_tokens: 4096)`,
+          kind: 'output_truncated',
+          message: `copilot response truncated: finish_reason is 'length' (max_tokens: ${this.maxOutputTokens})`,
+          requested_max_tokens: this.maxOutputTokens,
         });
       }
     }

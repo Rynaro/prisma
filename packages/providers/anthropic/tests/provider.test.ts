@@ -118,7 +118,10 @@ describe('AnthropicProvider', () => {
     }
   });
 
-  it('cost-ceiling: oversized input throws before client.messages.create is called', async () => {
+  // Phase 4: guard now throws `over_budget` (not `capability/cost_ceiling`)
+  // so the orchestrator can degrade (split/skip) instead of aborting the PR.
+  // Per chunking-stability-spec.md § Phase 4 "New degradable error kind".
+  it('over_budget (Phase 4): oversized input throws over_budget before client.messages.create is called', async () => {
     const create = vi.fn();
     const provider = new AnthropicProvider({
       apiKey: 'k',
@@ -131,16 +134,18 @@ describe('AnthropicProvider', () => {
     } catch (err) {
       expect(err).toBeInstanceOf(ProviderErrorThrowable);
       const thrown = err as ProviderErrorThrowable;
-      expect(thrown.cause_kind).toBe('capability');
-      if (thrown.value.kind === 'capability') {
-        expect(thrown.value.missing_capability).toBe('cost_ceiling');
+      // Phase 4: guard throws over_budget, not capability/cost_ceiling.
+      expect(thrown.cause_kind).toBe('over_budget');
+      if (thrown.value.kind === 'over_budget') {
+        expect(thrown.value.estimated_tokens).toBeGreaterThan(0);
+        expect(thrown.value.hard_cap_in).toBe(1);
       }
     }
     expect(create).not.toHaveBeenCalled();
   });
 
-  // T10: stop_reason==='max_tokens' → schema_validation (truncation guard)
-  it('throws schema_validation when stop_reason is "max_tokens" (response truncated)', async () => {
+  // T10: stop_reason==='max_tokens' → output_truncated (Phase 1: split-and-retry)
+  it('throws output_truncated when stop_reason is "max_tokens" (response truncated)', async () => {
     // Simulate a response where the model hit max_tokens: tool_use input
     // may be a partially-written object that would pass schema but silently drop findings.
     const create = vi.fn().mockResolvedValue({
@@ -156,8 +161,38 @@ describe('AnthropicProvider', () => {
     const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
-      cause_kind: 'schema_validation',
+      cause_kind: 'output_truncated',
     });
+  });
+
+  // T10b: output_truncated carries requested_max_tokens
+  it('output_truncated error carries requested_max_tokens matching what was sent', async () => {
+    const create = vi.fn().mockResolvedValue({
+      stop_reason: 'max_tokens',
+      content: [
+        {
+          type: 'tool_use',
+          name: 'submit_review_findings',
+          input: { findings: [] },
+        },
+      ],
+    });
+    // Use a non-default maxOutputTokens so we can distinguish it.
+    const provider = new AnthropicProvider({
+      apiKey: 'k',
+      client: { messages: { create } },
+      maxOutputTokens: 8192,
+    });
+    try {
+      await provider.review(validInput);
+      expect.fail('expected throw');
+    } catch (err) {
+      const thrown = err as ProviderErrorThrowable;
+      expect(thrown.cause_kind).toBe('output_truncated');
+      if (thrown.value.kind === 'output_truncated') {
+        expect(thrown.value.requested_max_tokens).toBe(8192);
+      }
+    }
   });
 
   // T11: stop_reason==='tool_use' (normal) → does NOT throw truncation error
@@ -169,5 +204,30 @@ describe('AnthropicProvider', () => {
     const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
     const out = await provider.review(validInput);
     expect(out.findings).toHaveLength(0);
+  });
+
+  // AC1.2: configurable maxOutputTokens flows to the provider call
+  it('AC1.2: maxOutputTokens option sets max_tokens on the wire request', async () => {
+    const create = vi.fn().mockResolvedValue(toolUseResponse({ findings: [] }));
+    // Provide non-default value to verify it flows through.
+    const provider = new AnthropicProvider({
+      apiKey: 'k',
+      client: { messages: { create } },
+      maxOutputTokens: 8192,
+    });
+    await provider.review(validInput);
+    expect(create).toHaveBeenCalledTimes(1);
+    const callArgs = create.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.max_tokens).toBe(8192);
+  });
+
+  // AC1.5 regression: default maxOutputTokens is 4096 (byte-identical to pre-Phase-1)
+  it('AC1.5: default maxOutputTokens is 4096 (happy-path regression)', async () => {
+    const create = vi.fn().mockResolvedValue(toolUseResponse({ findings: [] }));
+    // No maxOutputTokens option → defaults to 4096.
+    const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+    await provider.review(validInput);
+    const callArgs = create.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.max_tokens).toBe(4096);
   });
 });

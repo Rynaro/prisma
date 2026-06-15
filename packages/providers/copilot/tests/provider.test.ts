@@ -139,7 +139,10 @@ describe('CopilotProvider', () => {
     }
   });
 
-  it('cost-ceiling: oversized input throws before client.chatCompletions is called', async () => {
+  // Phase 4: guard now throws `over_budget` (not `capability/cost_ceiling`)
+  // so the orchestrator can degrade (split/skip) instead of aborting the PR.
+  // Per chunking-stability-spec.md § Phase 4 "New degradable error kind".
+  it('over_budget (Phase 4): oversized input throws over_budget before client.chatCompletions is called', async () => {
     const chatCompletions = vi.fn();
     const provider = new CopilotProvider({
       apiKey: 'k',
@@ -152,16 +155,18 @@ describe('CopilotProvider', () => {
     } catch (err) {
       expect(err).toBeInstanceOf(ProviderErrorThrowable);
       const thrown = err as ProviderErrorThrowable;
-      expect(thrown.cause_kind).toBe('capability');
-      if (thrown.value.kind === 'capability') {
-        expect(thrown.value.missing_capability).toBe('cost_ceiling');
+      // Phase 4: guard throws over_budget, not capability/cost_ceiling.
+      expect(thrown.cause_kind).toBe('over_budget');
+      if (thrown.value.kind === 'over_budget') {
+        expect(thrown.value.estimated_tokens).toBeGreaterThan(0);
+        expect(thrown.value.hard_cap_in).toBe(1);
       }
     }
     expect(chatCompletions).not.toHaveBeenCalled();
   });
 
-  // T10: finish_reason==='length' → schema_validation (truncation guard)
-  it('throws schema_validation when finish_reason is "length" (response truncated at max_tokens)', async () => {
+  // T10: finish_reason==='length' → output_truncated (Phase 1: split-and-retry)
+  it('throws output_truncated when finish_reason is "length" (response truncated at max_tokens)', async () => {
     // Simulate a response where the model hit max_tokens: tool_call arguments
     // may be a partially-written JSON array that would parse but silently drop findings.
     const chatCompletions = vi.fn().mockResolvedValue({
@@ -190,8 +195,51 @@ describe('CopilotProvider', () => {
     const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
-      cause_kind: 'schema_validation',
+      cause_kind: 'output_truncated',
     });
+  });
+
+  // T10b: output_truncated carries requested_max_tokens
+  it('output_truncated error carries requested_max_tokens matching what was sent', async () => {
+    const chatCompletions = vi.fn().mockResolvedValue({
+      id: 'chatcmpl-truncated',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'submit_review_findings',
+                  arguments: JSON.stringify({ findings: [] }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'length',
+        },
+      ],
+    });
+    // Use a non-default maxOutputTokens so we can distinguish it.
+    const provider = new CopilotProvider({
+      apiKey: 'k',
+      client: { chatCompletions },
+      maxOutputTokens: 8192,
+    });
+    try {
+      await provider.review(validInput);
+      expect.fail('expected throw');
+    } catch (err) {
+      const thrown = err as ProviderErrorThrowable;
+      expect(thrown.cause_kind).toBe('output_truncated');
+      if (thrown.value.kind === 'output_truncated') {
+        expect(thrown.value.requested_max_tokens).toBe(8192);
+      }
+    }
   });
 
   // T11: finish_reason==='tool_calls' (normal) → does NOT throw truncation error
@@ -200,5 +248,30 @@ describe('CopilotProvider', () => {
     const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
     const out = await provider.review(validInput);
     expect(out.findings).toHaveLength(0);
+  });
+
+  // AC1.2: configurable maxOutputTokens flows to the provider call
+  it('AC1.2: maxOutputTokens option sets max_tokens on the wire request', async () => {
+    const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
+    // Provide non-default value to verify it flows through.
+    const provider = new CopilotProvider({
+      apiKey: 'k',
+      client: { chatCompletions },
+      maxOutputTokens: 8192,
+    });
+    await provider.review(validInput);
+    expect(chatCompletions).toHaveBeenCalledTimes(1);
+    const callArgs = chatCompletions.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.max_tokens).toBe(8192);
+  });
+
+  // AC1.5 regression: default maxOutputTokens is 4096 (byte-identical to pre-Phase-1)
+  it('AC1.5: default maxOutputTokens is 4096 (happy-path regression)', async () => {
+    const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
+    // No maxOutputTokens option → defaults to 4096.
+    const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
+    await provider.review(validInput);
+    const callArgs = chatCompletions.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.max_tokens).toBe(4096);
   });
 });
