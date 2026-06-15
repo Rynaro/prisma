@@ -129,7 +129,7 @@ Identifiers reused verbatim from Phase 1: `ProviderReviewInput`, `ProviderReview
 - **Type.** String.
 - **Allowed values / range.** Non-empty deterministic string.
 - **Required.** Required.
-- **Validation rule (plain English).** Deterministic hash derived from `path`, `line_start`, `line_end`, `category`, and a normalized form of `title` (or a content fingerprint). Equal across runs for findings the publisher should consider "the same".
+- **Validation rule (plain English).** Deterministic hash derived from `path` and `category` only — deliberately independent of `line_start`/`line_end` and of the free-text `title`/message. This collapses the same logical concern when the model rewords it (same issue, different prose) and when it recurs at several lines of a file (same issue, multiple sites), yielding one inline comment per (file, category). Equal across runs for findings the publisher should consider "the same".
 - **Audit purpose.** The key the publisher consults to suppress duplicates within a run, across runs, and across webhook redeliveries (per `publication-policy.md` § Dedupe behavior).
 
 ### validator_notes

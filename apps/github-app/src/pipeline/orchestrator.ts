@@ -534,8 +534,14 @@ export const runPipeline = async (
     pull_request_number: payload.pull_request_number,
   });
 
-  // Stage: prefilter.
-  const prefilter = runPrefilter({ snapshot, config: deps.config });
+  // Stage: prefilter. Thread each hunk's diff body through to the provider
+  // input so the model reviews actual code (and can cite real line numbers)
+  // rather than path + heuristics alone.
+  const prefilter = runPrefilter({
+    snapshot,
+    config: deps.config,
+    hunkContent: (_path, hunk) => hunk.content ?? '',
+  });
   if (prefilter.kind === 'oversized') {
     logger.emit('prefilter.skipped', {
       ...trace,
@@ -905,9 +911,8 @@ export const runPipeline = async (
 
     // Merge all successful batch findings → ONE ProviderReviewOutput before
     // the validator so dedupe, ranking, and caps apply to the full PR.
-    // Per scout-report Seam 4: the dedupe key is (path, normalized-message)
-    // and is batch-agnostic — merging before the validator gives cross-batch
-    // dedup for free.
+    // The dedupe key is (path, category) — batch-, line- and wording-agnostic —
+    // so merging before the validator gives cross-batch dedup for free.
     const mergedProviderOutput: ProviderReviewOutput = { findings: allFindings };
 
     // Build a notice describing the chunked run. Prepended to the check-run

@@ -1278,6 +1278,18 @@ describe('buildProviderInput: request_shaping threading through the orchestrator
     expect(captured?.request_shaping).toBeUndefined();
   });
 
+  it('threads each hunk diff body into the provider input so the model reviews real code', async () => {
+    // Regression guard: the orchestrator must pass a `hunkContent` resolver to
+    // the prefilter. Without it the provider receives empty hunk bodies and
+    // reviews on path + heuristics alone (anchoring everything to line 1).
+    const config = RepoConfigSchema.parse({ mode: 'summary-plus-inline' });
+    const captured = await runAndCapture(config);
+    const hunk = captured?.files[0]?.hunks[0];
+    // buildSimpleOctokit feeds patch `@@ -1,3 +1,8 @@\n+const x = 1;\n`.
+    expect(hunk?.line_start).toBe(1);
+    expect(hunk?.content).toContain('+const x = 1;');
+  });
+
   it('slug model → request_shaping.model is bare name (no provider prefix) (AS-2)', async () => {
     const config = RepoConfigSchema.parse({
       mode: 'summary-plus-inline',

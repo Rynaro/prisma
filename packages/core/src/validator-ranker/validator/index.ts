@@ -73,26 +73,29 @@ const findHunkForLine = (file: AnalyzableFile, line: number): { id: string } | u
 };
 
 /**
- * Canonicalize a provider message for dedupe-key derivation.
+ * Derive the `dedupe_key` from a finding's stable structural identity:
+ * `path` + `category`.
  *
- * Lowercases, strips ASCII punctuation, and collapses whitespace so that
- * cosmetic differences in the model's wording do not produce distinct
- * `dedupe_key` values. The publisher (Phase 5.5) consults the resulting key
- * to suppress duplicates within a run and across webhook redeliveries.
+ * The key is deliberately independent of both the model's free-text message
+ * and the exact line number, because the previous message-derived key let two
+ * failure modes through:
+ *   - Same issue, reworded. The model phrases one concern (e.g. "missing
+ *     authorization") differently across findings or rounds; a message hash
+ *     gave each phrasing a distinct key, so the duplicates were never
+ *     collapsed and were posted as separate inline comments.
+ *   - Same issue, multiple sites. The model flags the same concern at several
+ *     lines of a file; the cross-hunk dedupe contract requires these to
+ *     collapse to one comment, so the key cannot depend on the line.
+ *
+ * Keying on (path, category) is the coarsest identity that satisfies both: it
+ * yields one inline comment per (file, category). The publisher's planner keeps
+ * the highest-confidence survivor inline and surfaces the collapsed siblings in
+ * the Checks summary (`reason_code: dedupe_collapsed`), so no finding is lost —
+ * only de-duplicated. The publisher consults the key to suppress duplicates
+ * within a run and across webhook redeliveries.
  */
-const PUNCTUATION_CHARS = '!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~';
-const PUNCTUATION_SET = new Set(PUNCTUATION_CHARS.split(''));
-
-const canonicalizeMessage = (msg: string): string => {
-  let stripped = '';
-  for (const ch of msg.toLowerCase()) {
-    stripped += PUNCTUATION_SET.has(ch) ? ' ' : ch;
-  }
-  return stripped.replace(/\s+/g, ' ').trim();
-};
-
-const computeDedupeKey = (path: string, message: string): string => {
-  const canonical = `${path}:${canonicalizeMessage(message)}`;
+const computeDedupeKey = (path: string, category: string): string => {
+  const canonical = `${path}:${category}`;
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
 };
 
@@ -190,7 +193,7 @@ export const runValidator = (
 
     const id = ctx.generateId ? ctx.generateId() : `${ctx.run_id}:${index}`;
     const evidence = buildEvidence(providerFinding.path, hunk.id, providerFinding.line);
-    const dedupe_key = computeDedupeKey(providerFinding.path, providerFinding.message);
+    const dedupe_key = computeDedupeKey(providerFinding.path, providerFinding.category);
     const finding: NormalizedFinding = {
       id,
       path: providerFinding.path,

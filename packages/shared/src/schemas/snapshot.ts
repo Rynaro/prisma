@@ -28,6 +28,14 @@ export const ChangedHunkSchema = z
     old_start: z.number().int().nonnegative(),
     /** number of lines in the old file covered by this hunk */
     old_lines: z.number().int().nonnegative(),
+    /**
+     * Raw unified-diff body for this hunk (the lines after the `@@` header,
+     * with their leading `+`/`-`/space markers preserved) so the provider can
+     * review the actual code. Optional: binary/oversize-skipped files and
+     * hand-built fixtures may omit it, in which case the provider receives an
+     * empty hunk body. The snapshotter populates it from the GitHub patch.
+     */
+    content: z.string().optional(),
   })
   .strict();
 export type ChangedHunk = z.infer<typeof ChangedHunkSchema>;

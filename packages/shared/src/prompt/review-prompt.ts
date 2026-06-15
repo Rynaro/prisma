@@ -87,6 +87,31 @@ export const FINDING_JSON_SCHEMA: object = {
  * `ProviderReviewInput`. Byte-identical to the existing three adapter
  * `renderUserMessage` functions (golden-tested in `review-prompt.test.ts`).
  */
+/**
+ * Render one hunk body with explicit new-file line numbers so the model can
+ * cite an accurate `line`. Each diff line keeps its original `+`/`-`/space
+ * marker. Added (`+`) and context (` `) lines exist in the new file and are
+ * prefixed `<n>: ` with their new-file line number; removed (`-`) lines and
+ * diff metadata (`\ No newline…`) have no new-file line and are left unnumbered.
+ * An empty body (binary/oversize-skipped, or a fixture without content) renders
+ * nothing.
+ */
+function renderHunkBody(content: string, lineStart: number): string[] {
+  if (content.length === 0) return [];
+  const out: string[] = [];
+  let lineNo = lineStart;
+  for (const raw of content.split('\n')) {
+    const marker = raw.charAt(0);
+    if (marker === '-' || marker === '\\') {
+      out.push(`         ${raw}`);
+    } else {
+      out.push(`      ${lineNo}: ${raw}`);
+      lineNo += 1;
+    }
+  }
+  return out;
+}
+
 export function renderUserMessage(input: ProviderReviewInput): string {
   const lines: string[] = [];
   lines.push('## Files');
@@ -95,11 +120,9 @@ export function renderUserMessage(input: ProviderReviewInput): string {
     lines.push(`- ${file.path}${lang}`);
     for (const hunk of file.hunks) {
       lines.push(`  - hunk ${hunk.id} L${hunk.line_start}-L${hunk.line_end}:`);
-      const indented = hunk.content
-        .split('\n')
-        .map((line) => `      ${line}`)
-        .join('\n');
-      lines.push(indented);
+      for (const bodyLine of renderHunkBody(hunk.content, hunk.line_start)) {
+        lines.push(bodyLine);
+      }
     }
   }
   const heuristics = input.repo_heuristics ?? {};
@@ -113,6 +136,10 @@ export function renderUserMessage(input: ProviderReviewInput): string {
       lines.push(`- ${key}: ${heuristics[key] ? 'true' : 'false'}`);
     }
   }
+  lines.push('');
+  lines.push(
+    'Each changed line is prefixed `<n>: ` where <n> is its line number in the new file (lines starting with `-` were removed and have no number). Set each finding’s `line` to the <n> of the exact line the issue is on.',
+  );
   lines.push('');
   lines.push('Review the diff and call `submit_review_findings` with your findings.');
   return lines.join('\n');

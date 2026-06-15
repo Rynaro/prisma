@@ -2,11 +2,12 @@ id: duplicate-issue-across-hunks
 name: "Two findings share a dedupe_key"
 description: >-
   One source file with two hunks that both express the same logical issue.
-  The provider returns two findings sharing the same canonicalised message
-  and path, so the validator computes identical `dedupe_key` values for
-  both. The publisher's planner collapses the duplicate within-run; one
-  survives as an inline comment, one lands in the dropped bucket with
-  reason_code `dedupe_collapsed`.
+  The provider returns two findings on the same path and category (at
+  different lines), so the validator computes identical `dedupe_key` values
+  for both — the key is derived from (path, category) and is line- and
+  wording-independent. The publisher's planner collapses the duplicate
+  within-run; one survives as an inline comment, one lands in the dropped
+  bucket with reason_code `dedupe_collapsed`.
 
 config_overrides:
   mode: summary-plus-inline

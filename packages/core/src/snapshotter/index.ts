@@ -167,9 +167,26 @@ const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
 const parseHunks = (patch: string): ChangedHunk[] => {
   const hunks: ChangedHunk[] = [];
+  // The hunk currently being accumulated, plus the body lines seen since its
+  // `@@` header. `null` between a dropped/absent header and the next valid one,
+  // so stray body lines are never attached to the wrong hunk.
+  let current: { meta: Omit<ChangedHunk, 'content'>; body: string[] } | null = null;
+
+  const flush = (): void => {
+    if (current === null) return;
+    hunks.push({ ...current.meta, content: current.body.join('\n') });
+    current = null;
+  };
+
   for (const line of patch.split('\n')) {
     const match = HUNK_HEADER.exec(line);
-    if (match === null) continue;
+    if (match === null) {
+      // Body line of the current hunk (preserve the +/-/space marker verbatim).
+      if (current !== null) current.body.push(line);
+      continue;
+    }
+    // A new hunk header: close out the previous hunk first.
+    flush();
     const [, oldStartStr, oldLinesStr, newStartStr, newLinesStr] = match;
     if (oldStartStr === undefined || newStartStr === undefined) continue;
     const old_start = Number.parseInt(oldStartStr, 10);
@@ -189,8 +206,9 @@ const parseHunks = (patch: string): ChangedHunk[] => {
     // surfaced via `status === 'removed'` and the prefilter skips it before
     // any provider call).
     if (new_start <= 0) continue;
-    hunks.push({ old_start, old_lines, new_start, new_lines });
+    current = { meta: { old_start, old_lines, new_start, new_lines }, body: [] };
   }
+  flush();
   return hunks;
 };
 

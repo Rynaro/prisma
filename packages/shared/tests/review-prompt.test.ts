@@ -51,15 +51,17 @@ const minimalInput: ProviderReviewInput = {
   ],
 };
 
-/** The exact legacy user-message output for `minimalInput`. */
-const LEGACY_USER_MESSAGE_FOR_MINIMAL_INPUT = [
+/** The exact user-message output for `minimalInput` (line-numbered hunk body). */
+const EXPECTED_USER_MESSAGE_FOR_MINIMAL_INPUT = [
   '## Files',
   '- src/index.ts (lang: typescript)',
   '  - hunk src/index.ts#1-5 L1-L5:',
-  '      +const x = 1;',
+  '      1: +const x = 1;',
   '',
   '## Repo heuristics',
   '(none)',
+  '',
+  'Each changed line is prefixed `<n>: ` where <n> is its line number in the new file (lines starting with `-` were removed and have no number). Set each finding’s `line` to the <n> of the exact line the issue is on.',
   '',
   'Review the diff and call `submit_review_findings` with your findings.',
 ].join('\n');
@@ -87,9 +89,9 @@ describe('TOOL_DESCRIPTION', () => {
 });
 
 describe('renderUserMessage', () => {
-  it('produces byte-identical output to the legacy adapter renderer', () => {
+  it('renders hunk bodies with new-file line numbers and the line-citation note', () => {
     const rendered = renderUserMessage(minimalInput);
-    expect(rendered).toBe(LEGACY_USER_MESSAGE_FOR_MINIMAL_INPUT);
+    expect(rendered).toBe(EXPECTED_USER_MESSAGE_FOR_MINIMAL_INPUT);
   });
 
   it('renders multiple files and hunks correctly', () => {
@@ -111,6 +113,9 @@ describe('renderUserMessage', () => {
     expect(rendered).toContain('## Files');
     expect(rendered).toContain('- src/a.ts');
     expect(rendered).toContain('- src/b.ts (lang: typescript)');
+    // Hunk body rendered with new-file line numbers (line_start 1 → 1, 2).
+    expect(rendered).toContain('      1: +line1');
+    expect(rendered).toContain('      2: +line2');
     expect(rendered).toContain('## Repo heuristics');
     expect(rendered).toContain('- security: true');
     expect(rendered).toContain('- tests: false');
