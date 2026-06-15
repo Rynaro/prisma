@@ -307,6 +307,42 @@ const buildSyntheticEmptyOutput = (): {
   empty_findings: NormalizedFinding[];
 } => ({ empty_findings: [] });
 
+/**
+ * Build a notice explaining why a review surfaced zero publishable findings, so
+ * the check-run summary never shows a bare "_No findings._" with no context.
+ *
+ * Returns '' when findings survived validation (the summary already lists them
+ * or their drop reasons). Otherwise distinguishes the two zero-finding causes,
+ * which are indistinguishable from the summary alone:
+ *   - `providerFindingCount === 0` — the model reported nothing above the floors
+ *     (a clean PR, or an under-producing model). Appends the reasoning-model
+ *     hint when the configured model is a reasoning family.
+ *   - `providerFindingCount > 0` — the model reported findings but all fell
+ *     outside the changed lines (wrong path/line) and were dropped in
+ *     validation; surfaced so lost comments don't read as "nothing found".
+ *
+ * Applied on both the single-call and chunked paths (the chunked path
+ * previously had no empty-review diagnostic at all).
+ */
+const buildEmptyReviewNotice = (
+  config: RepoConfig,
+  providerFindingCount: number,
+  validatedFindingCount: number,
+): string => {
+  if (validatedFindingCount > 0) return '';
+  const sevFloor = config.thresholds.severity_floor.inline;
+  const confFloor = config.thresholds.confidence_floor.inline;
+  if (providerFindingCount > 0) {
+    return `ℹ️ The model reported ${providerFindingCount} finding(s), but none could be anchored to the changed lines (they referenced a path or line outside the diff) and were dropped.`;
+  }
+  let notice = `ℹ️ No issues were reported at or above your configured inline floors (severity ≥ ${sevFloor}, confidence ≥ ${confFloor.toFixed(2)}). The PR looks clean to the model, or the bar is set high for it — lower \`confidence_floor.inline\` / \`severity_floor.inline\` if you expected more.`;
+  const slug = parseModelSlug(config.model, config.provider);
+  if (slug.model !== undefined && isReasoningModel(slug.model)) {
+    notice += ` Note: \`${slug.model}\` is a reasoning model and may be under-producing with this review flow — try \`openai/gpt-4.1\` or set \`OPENAI_TOOL_CHOICE=required\` (see docs/model-compatibility.md).`;
+  }
+  return notice;
+};
+
 const traceFields = (payload: JobPayload): Record<string, unknown> => {
   const fields: Record<string, unknown> = {
     installation_id: payload.installation_id,
@@ -953,6 +989,17 @@ export const runPipeline = async (
     }
 
     const rankedChunked = runRanker(validatorResultChunked.findings);
+
+    // Explain a zero-finding chunked review instead of a bare "_No findings._"
+    // (this path previously had no empty-review diagnostic at all).
+    const emptyNoticeChunked = buildEmptyReviewNotice(
+      deps.config,
+      allFindings.length,
+      validatorResultChunked.findings.length,
+    );
+    const chunkedNoticeFull =
+      emptyNoticeChunked.length > 0 ? `${chunkedNotice} ${emptyNoticeChunked}` : chunkedNotice;
+
     const publishFnChunked = hooks.runPublish ?? defaultPublish;
     const ctxChunked = buildPublishContext(payload, identity, deps.resolvedHeadSha);
     const publisherDepsChunked = publisherDepsFor(octokit);
@@ -962,7 +1009,7 @@ export const runPipeline = async (
       ctxChunked,
       publisherDepsChunked,
       deps.roundIntent ?? 'incremental',
-      chunkedNotice,
+      chunkedNoticeFull,
     );
 
     if (publicationChunked.dropped.length > 0) {
@@ -1174,12 +1221,21 @@ export const runPipeline = async (
   const publishFn = hooks.runPublish ?? defaultPublish;
   const ctx = buildPublishContext(payload, identity, deps.resolvedHeadSha);
   const publisherDeps = publisherDepsFor(octokit);
+  // Explain a zero-finding review instead of a bare "_No findings._". The
+  // reasoning-model empty case already returned early above; this covers a
+  // classic model that simply found nothing, plus the all-dropped case.
+  const emptyNotice = buildEmptyReviewNotice(
+    deps.config,
+    providerOutput.findings.length,
+    validatorResult.findings.length,
+  );
   const publication = await publishFn(
     ranked,
     deps.config,
     ctx,
     publisherDeps,
     deps.roundIntent ?? 'incremental',
+    emptyNotice.length > 0 ? emptyNotice : undefined,
   );
 
   if (publication.dropped.length > 0) {

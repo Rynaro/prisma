@@ -350,6 +350,68 @@ describe('runPipeline', () => {
     expect(capturedSummaries[0]).toMatch(/review-bot\.yml/);
   });
 
+  it('single-call empty review: notice explains zero findings (not a bare "_No findings._")', async () => {
+    // A classic model that returns zero findings on a real diff must explain
+    // itself in the check-run summary rather than render a bare "_No findings._".
+    const provider = new FakeProvider({ script: [{ kind: 'output', output: { findings: [] } }] });
+    const capturedNotices: (string | undefined)[] = [];
+    const spy = buildOctokitSpy();
+    const deps = buildDeps({ provider, octokitSpy: spy });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice);
+      },
+    };
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('review_complete');
+    expect(capturedNotices[0]).toMatch(
+      /No issues were reported at or above your configured inline floors/,
+    );
+  });
+
+  it('chunked empty review: notice explains zero findings (chunked path was silent)', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        { kind: 'output', output: { findings: [] } },
+        { kind: 'output', output: { findings: [] } },
+      ],
+    });
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1, // tiny budget → one batch per file → 2 sections
+      },
+    });
+    const capturedNotices: (string | undefined)[] = [];
+    const spy = buildOctokitSpy();
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: snap, config });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice);
+      },
+    };
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    // The chunked prefix AND the empty-review explanation are both present.
+    expect(capturedNotices[0]).toMatch(/Reviewed in 2 section\(s\)/);
+    expect(capturedNotices[0]).toMatch(
+      /No issues were reported at or above your configured inline floors/,
+    );
+  });
+
   it('normal review (review_complete): outcome.kind === review_complete', async () => {
     const provider = new FakeProvider({
       script: [{ kind: 'output', output: validOutputForExampleFile() }],
