@@ -5,6 +5,8 @@ import {
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputSchema,
+  estimatePromptTokens,
+  serializeForEstimate,
 } from '@prisma-bot/shared';
 import { createAnthropicClient } from './client.js';
 import { mapAnthropicError } from './error-mapping.js';
@@ -28,6 +30,12 @@ const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   function_calling: true,
   deterministic_seed: false,
   max_context_tokens: 200000,
+  /**
+   * Anthropic does not provide a local BPE tokenizer. The estimator uses a
+   * fast chars/4 × SAFETY_MARGIN heuristic (never under-counts).
+   * Per chunking-stability-spec.md § Phase 2 "Provider capabilities".
+   */
+  tokenizer_family: 'anthropic-approx',
 };
 
 /**
@@ -44,6 +52,16 @@ export interface AnthropicClientLike {
   };
 }
 
+/**
+ * Default output token budget. Matches the historical hardcoded value so that
+ * deployments that do not set `ANTHROPIC_MAX_OUTPUT_TOKENS` are byte-identical
+ * in behavior. Raise via `AnthropicProviderOptions.maxOutputTokens` (or the
+ * env var) for finding-dense repos where the output truncates.
+ *
+ * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+ */
+const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
 export interface AnthropicProviderOptions {
   apiKey: string;
   model?: string;
@@ -53,6 +71,14 @@ export interface AnthropicProviderOptions {
    * `missing_capability: 'cost_ceiling'` per the Phase 5.3 spec.
    */
   maxTokensPerCall?: number;
+  /**
+   * Output token budget sent per request as `max_tokens`. Defaults to 4096.
+   * Raise via `ANTHROPIC_MAX_OUTPUT_TOKENS` env var or
+   * `chunking.reserved_output_tokens` config for finding-dense repos.
+   *
+   * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+   */
+  maxOutputTokens?: number;
   timeoutMs?: number;
   capabilities?: ProviderCapabilities;
   client?: AnthropicClientLike;
@@ -118,11 +144,13 @@ export class AnthropicProvider implements Provider {
   private readonly client: AnthropicClientLike;
   private readonly model: string;
   private readonly maxTokensPerCall: number | undefined;
+  private readonly maxOutputTokens: number;
 
   constructor(options: AnthropicProviderOptions) {
     this.capabilities = options.capabilities ?? DEFAULT_CAPABILITIES;
     this.model = options.model ?? ANTHROPIC_DEFAULT_MODEL;
     this.maxTokensPerCall = options.maxTokensPerCall;
+    this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
     if (options.client !== undefined) {
       this.client = options.client;
     } else {
@@ -138,12 +166,21 @@ export class AnthropicProvider implements Provider {
 
   async review(input: ProviderReviewInput): Promise<ProviderReviewOutput> {
     if (this.maxTokensPerCall !== undefined) {
-      const estimate = Math.ceil(JSON.stringify(input).length / 4);
+      // Phase 2: unified estimator — counts the SAME serialized prompt the
+      // batcher counts, eliminating the HOTSPOT-2/HOTSPOT-6 divergence.
+      // Phase 4: throws `over_budget` (not `capability/cost_ceiling`) so the
+      // orchestrator's discriminator is a single `kind === 'over_budget'` check
+      // and the batch degrades (split/skip) instead of aborting the PR.
+      const estimate = estimatePromptTokens(
+        serializeForEstimate(input),
+        this.capabilities.tokenizer_family,
+      );
       if (estimate > this.maxTokensPerCall) {
         throw new ProviderErrorThrowable({
-          kind: 'capability',
-          missing_capability: 'cost_ceiling',
-          message: 'request exceeds maxTokensPerCall',
+          kind: 'over_budget',
+          estimated_tokens: estimate,
+          hard_cap_in: this.maxTokensPerCall,
+          message: `request exceeds per-call token budget: estimated ${estimate} tokens, cap ${this.maxTokensPerCall}`,
         });
       }
     }
@@ -154,7 +191,7 @@ export class AnthropicProvider implements Provider {
     try {
       response = await this.client.messages.create({
         model: this.model,
-        max_tokens: 4096,
+        max_tokens: this.maxOutputTokens,
         system: prompt.system,
         messages: prompt.messages,
         tools: [
@@ -174,17 +211,18 @@ export class AnthropicProvider implements Provider {
     }
 
     // Detect response truncation: stop_reason==='max_tokens' means the model hit
-    // max_tokens (4096) and the output may be a partial/invalid findings array.
-    // Treat as schema_validation so the orchestrator publishes malformed_provider_output
-    // and does not silently accept a truncated result.
+    // the output token cap and the output may be a partial/invalid findings array.
+    // Throw output_truncated so the orchestrator can split-and-retry instead of
+    // dropping the batch's findings (chunking-stability-spec.md § Phase 1).
     if (
       typeof response === 'object' &&
       response !== null &&
       (response as Record<string, unknown>).stop_reason === 'max_tokens'
     ) {
       throw new ProviderErrorThrowable({
-        kind: 'schema_validation',
-        message: `anthropic response truncated: stop_reason is 'max_tokens' (max_tokens: 4096)`,
+        kind: 'output_truncated',
+        message: `anthropic response truncated: stop_reason is 'max_tokens' (max_tokens: ${this.maxOutputTokens})`,
+        requested_max_tokens: this.maxOutputTokens,
       });
     }
 

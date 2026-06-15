@@ -161,11 +161,18 @@ export type ProviderOptions = z.infer<typeof ProviderOptionsSchema>;
  *   max_files                 200   (chunkable ceiling; above → oversized skip)
  *   max_changed_lines        12000  (chunkable ceiling; above → oversized skip)
  *   max_provider_calls_per_pr    6  (cost guard; exceeding → oversized skip)
- *   call_token_budget        60000  (per-call input token budget; greedy bin-pack)
+ *   call_token_budget        1_000_000  (sentinel; hard_cap_in derived from window)
  *
  * The existing top-level `max_files` (default 50) / `max_changed_lines`
  * (default 2000) remain the SINGLE-CALL threshold. Between the two sets of
  * limits → chunked review. Above `chunking.max_*` → oversized skip.
+ *
+ * Phase 2 budget derivation (chunking-stability-spec.md § Phase 2):
+ *   hard_cap_in = window − reserved_output_tokens − prompt_overhead_tokens − safety
+ *   safety      = ceil(safety_fraction × window)
+ * The `call_token_budget` default is raised to a high sentinel (1_000_000) so
+ * the derived `hard_cap_in` always dominates. Operators who set a lower value
+ * still get that value as an effective ceiling: effective = min(call_token_budget, hard_cap_in).
  */
 export const ChunkingSchema = z
   .object({
@@ -173,7 +180,83 @@ export const ChunkingSchema = z
     max_files: z.number().int().positive().default(200),
     max_changed_lines: z.number().int().positive().default(12000),
     max_provider_calls_per_pr: z.number().int().positive().default(6),
-    call_token_budget: z.number().int().positive().default(60000),
+    /**
+     * Optional per-call input token ceiling (back-compat knob).
+     * Phase 2 semantics: effective budget = min(call_token_budget, hard_cap_in).
+     * Default raised to 1_000_000 so the derived `hard_cap_in` dominates.
+     * Existing configs that set a lower value still cap correctly.
+     *
+     * Per chunking-stability-spec.md § 7 backward-compat.
+     */
+    call_token_budget: z.number().int().positive().default(1_000_000),
+    /**
+     * Output token budget reserved per provider call.
+     * Adapters use this as `max_tokens` / `max_completion_tokens` on the wire.
+     * Also used in the `hard_cap_in` reservation formula.
+     * Default 4096 keeps happy-path PRs byte-identical to pre-Phase-1 behavior.
+     * Operators raise this for finding-dense repos where responses truncate.
+     *
+     * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+     */
+    reserved_output_tokens: z.number().int().positive().default(4096),
+    /**
+     * Maximum number of split-and-retry attempts when a batch is truncated.
+     * Each truncated batch is split in half (by estimated tokens) and retried.
+     * At exhaustion, the files are recorded as "not fully reviewed" in the
+     * check-run notice; the PR is never aborted.
+     *
+     * Default 2 means an initial truncation plus 2 retry generations (the
+     * initial batch and up to 2 halving rounds).
+     *
+     * Per chunking-stability-spec.md § Phase 1 "Data-flow change" retry cap.
+     */
+    max_truncation_retries: z.number().int().nonnegative().default(2),
+    /**
+     * Token reserve for the prompt's fixed overhead: IMMUTABLE_SYSTEM_PROMPT
+     * (~250 tokens) + tool/JSON-schema (~500) + guidance ceiling
+     * (MAX_AUGMENTATION_TOKENS=7500) + render scaffolding (~750) = ~9000.
+     * Operators should keep prompt_overhead_tokens ≥ 1000 + MAX_AUGMENTATION_TOKENS.
+     *
+     * Used in the `hard_cap_in` reservation formula:
+     *   hard_cap_in = window − reserved_output_tokens − prompt_overhead_tokens − safety
+     *
+     * Per chunking-stability-spec.md § Phase 2 reservation formula.
+     */
+    prompt_overhead_tokens: z.number().int().positive().default(9000),
+    /**
+     * Fraction of the provider context window reserved as a safety margin.
+     * Default 0.07 = 7% (within the documented 5–10% band).
+     * safety = ceil(safety_fraction × window)
+     *
+     * Per chunking-stability-spec.md § Phase 2 reservation formula.
+     */
+    safety_fraction: z.number().min(0).max(1).default(0.07),
+    /**
+     * Context lines surrounding a hunk boundary.
+     * Phase 3 FORWARD-COMPAT KNOB ONLY — the splitter operates on existing hunk
+     * boundaries produced by the prefilter and does NOT re-diff or re-trim hunk
+     * content (core lacks the raw patch; re-diffing belongs to a future prefilter
+     * change). This value is recorded and documented so a future prefilter change
+     * can use it without a breaking schema bump.
+     * Default 10 matches the Qodo-style "~10 lines surrounding context" guidance.
+     *
+     * Per chunking-stability-spec.md § Phase 3 step 3.
+     */
+    hunk_context_lines: z.number().int().nonnegative().default(10),
+    /**
+     * Minimum serialized token estimate for a file to be split by hunks.
+     * A file whose estimate is BELOW this threshold is never split — the splitter
+     * only fires when the file's estimate exceeds `hard_cap_in`. The effective
+     * default is therefore `hard_cap_in` (only split when over budget). This knob
+     * allows operators to suppress pathological 1-line sub-file splits for files
+     * that are only marginally over budget.
+     *
+     * Default 0: always split when over budget (conservative — any over-budget
+     * file is a candidate; the batcher's skip/own-batch branches handle the rest).
+     *
+     * Per chunking-stability-spec.md § Phase 3 config.
+     */
+    min_hunk_split_tokens: z.number().int().nonnegative().default(0),
   })
   .strict()
   .default({
@@ -181,7 +264,13 @@ export const ChunkingSchema = z
     max_files: 200,
     max_changed_lines: 12000,
     max_provider_calls_per_pr: 6,
-    call_token_budget: 60000,
+    call_token_budget: 1_000_000,
+    reserved_output_tokens: 4096,
+    max_truncation_retries: 2,
+    prompt_overhead_tokens: 9000,
+    safety_fraction: 0.07,
+    hunk_context_lines: 10,
+    min_hunk_split_tokens: 0,
   });
 
 export type ChunkingConfig = z.infer<typeof ChunkingSchema>;

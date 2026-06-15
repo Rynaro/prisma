@@ -97,6 +97,16 @@ export const classifyRetry = (err: unknown): RetryClass => {
       case 'capability':
       case 'schema_validation':
         return 'non_transient';
+      // over_budget: the orchestrator degrades mid-loop (split/skip) and NEVER
+      // re-throws this kind to the consumer — it is caught inside runPipeline and
+      // turned into a notReviewed entry. If it somehow escapes, treat it as
+      // non-transient (it will not resolve by retrying without a config change).
+      case 'over_budget':
+        return 'non_transient';
+      // output_truncated: same — orchestrator handles it internally; if it
+      // escapes, non-transient (no retry will resolve a sizing error).
+      case 'output_truncated':
+        return 'non_transient';
     }
   }
   return 'transient';

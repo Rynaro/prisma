@@ -53,15 +53,14 @@ import { resolveRepoIdentity } from './repo-identity.js';
  *
  * All adapters use `maxTokensPerCall = MAX_TOKENS_PER_PR` as a per-call input
  * backstop (a soft cost-ceiling proxy per `docs/operational-runbooks.md`
- * § Numeric tunables). It is a backstop, NOT the primary control: the chunker
- * (`chunking.call_token_budget`, default 60k) is what sizes each provider
- * call, so this guard MUST stay above that budget plus serialization overhead —
- * otherwise it rejects batches the chunker deliberately built. (The adapter
- * pre-flight estimates the whole serialized request, which runs ~15-25% larger
- * than the chunker's content-only estimate, so the default 120k leaves ample
- * headroom over the 60k batch budget. A prior `/ 2` here set the guard to 30k —
- * below the 60k chunker budget — which only surfaced once v0.11.0 put real diff
- * content into the request.)
+ * § Numeric tunables). Phase 2 semantics: the guard now calls the UNIFIED
+ * estimator (`estimatePromptTokens(serializeForEstimate(input), family)`) over
+ * the EXACT serialized prompt — the same function the batcher uses. The primary
+ * budget control is `hard_cap_in`, derived from the provider's context window
+ * (reservation formula: window − reserved_output − prompt_overhead − safety).
+ * `MAX_TOKENS_PER_PR` is an optional override ceiling: if set, the effective
+ * guard threshold = min(MAX_TOKENS_PER_PR, hard_cap_in). The guard still throws
+ * `capability/cost_ceiling` on overage (Phase 4 reclassifies to `over_budget`).
  * If both `ANTHROPIC_API_KEY` and `COPILOT_API_KEY` are set, Anthropic wins;
  * the operator must explicitly unset it to switch vendors. The chosen vendor
  * is observable via the `worker.provider.selected` log event.
@@ -74,6 +73,27 @@ import { resolveRepoIdentity } from './repo-identity.js';
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379';
 const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? 'prisma-review-bot';
 const MAX_TOKENS_PER_PR = Number.parseInt(process.env.MAX_TOKENS_PER_PR ?? '120000', 10);
+
+/**
+ * Resolve the output token budget for a given provider from env.
+ *
+ * Priority: provider-specific env var > `chunking.reserved_output_tokens`
+ * config > fallback value (4096). The fallback is a last-resort default for
+ * the static `buildProvider` call, before the per-job config is loaded; the
+ * per-job config value is used when the provider is wired with config.
+ *
+ * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+ */
+function resolveMaxOutputTokens(envVarName: string, fallback: number): number {
+  const raw = process.env[envVarName];
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
 
 const log = (event: string, payload: Record<string, unknown> = {}): void => {
   process.stdout.write(
@@ -109,6 +129,11 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     const opts: AnthropicProviderOptions = {
       apiKey: anthropicKey,
       maxTokensPerCall: MAX_TOKENS_PER_PR,
+      // ANTHROPIC_MAX_OUTPUT_TOKENS — optional output token budget override.
+      // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
+      // finding-dense repos where the response truncates.
+      // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+      maxOutputTokens: resolveMaxOutputTokens('ANTHROPIC_MAX_OUTPUT_TOKENS', 4096),
     };
     log('worker.provider.selected', { provider: 'anthropic' });
     return new AnthropicProvider(opts);
@@ -118,6 +143,11 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     const opts: CopilotProviderOptions = {
       apiKey: copilotKey,
       maxTokensPerCall: MAX_TOKENS_PER_PR,
+      // COPILOT_MAX_OUTPUT_TOKENS — optional output token budget override.
+      // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
+      // finding-dense repos where the response truncates.
+      // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+      maxOutputTokens: resolveMaxOutputTokens('COPILOT_MAX_OUTPUT_TOKENS', 4096),
     };
     const model = await tryGetSecret(secretSource, 'COPILOT_MODEL');
     if (model !== undefined) {
@@ -158,17 +188,12 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
       opts.tokenParamStyle = tokenParamRaw as TokenParamStyle;
     }
     // OPENAI_MAX_OUTPUT_TOKENS — optional output token budget override.
-    // Defaults to 4096. Raise for reasoning-capable models (o-series, gpt-5)
-    // that may need a larger output window. Non-numeric or non-positive values
-    // are silently ignored and fall back to the default.
+    // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
+    // reasoning-capable models (o-series, gpt-5) that may need a larger output
+    // window, or for finding-dense repos where the response truncates.
     // See deployment.md § Config for the env var reference.
-    const maxOutputTokensRaw = await tryGetSecret(secretSource, 'OPENAI_MAX_OUTPUT_TOKENS');
-    if (maxOutputTokensRaw !== undefined) {
-      const parsed = Number.parseInt(maxOutputTokensRaw, 10);
-      if (Number.isFinite(parsed) && parsed > 0) {
-        opts.maxOutputTokens = parsed;
-      }
-    }
+    // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+    opts.maxOutputTokens = resolveMaxOutputTokens('OPENAI_MAX_OUTPUT_TOKENS', 4096);
     // OPENAI_TOOL_CHOICE — optional override for the tool_choice parameter.
     // `auto` (default) applies the heuristic: `'required'` for reasoning models
     // (gpt-5*/o-series), forced-specific function object for classic models.

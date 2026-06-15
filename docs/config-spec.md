@@ -374,16 +374,149 @@ value to bound cost; raise it to enable review of very large PRs.
 
 - **Type.** Integer, positive.
 - **Required.** Optional.
-- **Default.** `60000`.
+- **Default.** `1000000` (high sentinel; effectively unused by default).
 - **Validation rule.** Must be a positive integer.
-- **Example.** `call_token_budget: 40000`
+- **Example.** `call_token_budget: 100000`
 
-Per-call input token budget for greedy bin-packing. Files are accumulated into
-a batch until the next file would push the batch's estimated token count over
-this value, then a new batch is opened. A single file whose estimate exceeds
-this value is sent in its own batch (the model's real context window may still
-accept it). A file whose estimate exceeds the hard safety cap (≈110,000 tokens)
-is excluded from all batches and surfaced in a notice.
+Per-call input token budget ceiling (back-compat knob). In v0.12.0+, the effective
+input budget is **derived** from the provider's context window using the reservation
+formula: `hard_cap_in = window − reserved_output_tokens − prompt_overhead_tokens − ceil(safety_fraction × window)`.
+
+The `call_token_budget` acts as an optional ceiling layered on top: 
+`effective_budget = min(call_token_budget, hard_cap_in)`. To make the derived `hard_cap_in`
+dominate by default (v0.12.0+ behavior), the default is raised to a high sentinel
+(`1000000`). Operators who set a lower value preserve the old behavior: that value
+caps the budget regardless of the provider's window. See § Phase 2 reservation formula
+below for details.
+
+#### chunking.reserved_output_tokens
+
+- **Type.** Integer, positive.
+- **Required.** Optional.
+- **Default.** `4096`.
+- **Validation rule.** Must be a positive integer.
+- **Example.** `reserved_output_tokens: 8192`
+
+Output token budget reserved per provider call. The adapter sets `max_tokens` /
+`max_completion_tokens` on the wire to this value. When the model's output reaches
+this limit, the batch is split and retried (never dropped). Also used in the
+`hard_cap_in` reservation formula.
+
+Operators raise this for finding-dense repositories where the review findings
+exceed the default output window and cause truncation. See § Phase 1 output truncation
+fix below.
+
+#### chunking.max_truncation_retries
+
+- **Type.** Integer, non-negative.
+- **Required.** Optional.
+- **Default.** `2`.
+- **Validation rule.** Must be a non-negative integer.
+- **Example.** `max_truncation_retries: 1`
+
+Maximum number of split-and-retry attempts when a batch's output is truncated. Each
+truncated batch is split in half (by estimated token count) and retried. After this
+many retries are exhausted, the files are recorded as "not fully reviewed" in the
+check-run notice; the PR is never aborted.
+
+Default `2` means an initial batch plus up to 2 retry generations (3 total attempts).
+Set to `0` to disable retries and fall back to the old behavior (record and skip).
+
+#### chunking.prompt_overhead_tokens
+
+- **Type.** Integer, positive.
+- **Required.** Optional.
+- **Default.** `9000`.
+- **Validation rule.** Must be a positive integer.
+- **Example.** `prompt_overhead_tokens: 10000`
+
+Token reserve for the prompt's fixed overhead: system prompt (~250 tokens) + tool/JSON
+schema (~500) + guidance ceiling (`MAX_AUGMENTATION_TOKENS=7500`) + render scaffolding
+(~750) = ~9000 total. Used in the `hard_cap_in` reservation formula.
+
+Operators should keep `prompt_overhead_tokens >= 1000 + MAX_AUGMENTATION_TOKENS`
+(i.e., >= 8500) to ensure the guidance budget is not evicted.
+
+#### chunking.safety_fraction
+
+- **Type.** Number, in range [0, 1].
+- **Required.** Optional.
+- **Default.** `0.07`.
+- **Validation rule.** Must be a number in [0, 1].
+- **Example.** `safety_fraction: 0.1`
+
+Fraction of the provider's context window reserved as a safety margin. The reservation
+formula computes `safety = ceil(safety_fraction × window)` and deducts it from the
+input budget. Default `0.07` = 7% (within the consensus 5–10% band from research
+literature on token estimator accuracy).
+
+Operators raise this if tokenizer estimates consistently under-count and cause
+actual overflow; lower it if the budget feels artificially constrained.
+
+#### chunking.hunk_context_lines
+
+- **Type.** Integer, non-negative.
+- **Required.** Optional.
+- **Default.** `10`.
+- **Validation rule.** Must be a non-negative integer.
+- **Example.** `hunk_context_lines: 15`
+
+Context lines surrounding a hunk boundary (forward-compat knob). In v0.12.0 this is
+recorded but **not used** — the splitter operates on existing hunk boundaries produced
+by the prefilter and does not re-diff or re-trim hunk content (the core lacks the raw
+patch; re-diffing belongs to a future prefilter change). This value is kept so a
+future prefilter change can use it without a breaking schema bump.
+
+Default `10` matches the Qodo-style "~10 lines surrounding context" guidance.
+
+#### chunking.min_hunk_split_tokens
+
+- **Type.** Integer, non-negative.
+- **Required.** Optional.
+- **Default.** `0`.
+- **Validation rule.** Must be a non-negative integer.
+- **Example.** `min_hunk_split_tokens: 50000`
+
+Minimum estimated token count for a file to be eligible for hunk-level splitting.
+A file whose estimate is below this threshold is never split — the splitter only
+fires when the file's estimate exceeds `hard_cap_in`. Default `0` (always split
+when over budget) is conservative; operators can raise this to suppress pathological
+1-line splits for files that are only marginally over budget.
+
+#### The Token Budget Derivation Formula (v0.12.0+)
+
+In v0.12.0 the per-call input token budget is **derived** from the provider's
+context window. The batcher and per-call guard both use the same unified token
+estimator to count the exact serialized prompt (system + diff + tool schema +
+guidance), and the budget is computed as:
+
+```
+window                 = provider.capabilities.max_context_tokens      # e.g., 200_000 (Anthropic), 128_000 (OpenAI)
+reserved_output        = chunking.reserved_output_tokens               # default 4096
+prompt_overhead        = chunking.prompt_overhead_tokens               # default 9000
+safety                 = ceil(chunking.safety_fraction × window)       # default: ceil(0.07 × window)
+
+hard_cap_in            = window − reserved_output − prompt_overhead − safety
+
+effective_budget       = min(chunking.call_token_budget, hard_cap_in)
+```
+
+**Plain-English summary:** The provider's context window is split into four reserves:
+(1) the output budget (`reserved_output_tokens`), (2) a fixed overhead for the prompt
+template and tool schema (`prompt_overhead_tokens`), (3) a safety margin as a
+percentage of the window, and (4) the remaining space is available for input (diff
+hunks + guidance). The derived `hard_cap_in` is the effective per-call input budget
+unless `call_token_budget` is set lower.
+
+**Why derive it?** Token estimators (even the best) have a small error margin (5–10%).
+Deriving the budget from the provider's *actual* context window ensures the input
+stays well under the window's ceiling, leaving headroom for estimator error.
+
+**Back-compat:** The `call_token_budget` key is kept for existing configurations.
+If you set it explicitly, it acts as a ceiling: `effective_budget = min(call_token_budget, hard_cap_in)`.
+To restore pre-v0.12.0 behavior (e.g., `call_token_budget: 60000` was the old default),
+set it in your config — the effective budget will cap at that value regardless of
+the provider's window.
 
 ## Precedence matrix
 
@@ -466,12 +599,21 @@ nickname: prbot
 # Optional: use '$' instead of '@' to avoid GitHub's @-autocomplete.
 command_marker: "@"
 # Optional: diff-chunking controls (see § chunking for cost implications).
+# In v0.12.0+, the per-call input budget is derived from the provider's context
+# window using the reservation formula. The knobs below are optional; absent =
+# defaults apply.
 chunking:
   enabled: true
   max_files: 200
   max_changed_lines: 12000
   max_provider_calls_per_pr: 6
-  call_token_budget: 60000
+  # call_token_budget: 1000000        # optional ceiling on derived budget (default: high sentinel)
+  # reserved_output_tokens: 4096      # output reserve (default: 4096)
+  # max_truncation_retries: 2         # split-and-retry cap on output truncation (default: 2)
+  # prompt_overhead_tokens: 9000      # system + tool + guidance reserve (default: 9000)
+  # safety_fraction: 0.07             # window safety margin as fraction (default: 0.07)
+  # hunk_context_lines: 10            # forward-compat: context lines per hunk (default: 10, unused)
+  # min_hunk_split_tokens: 0          # min estimate before hunk-split is attempted (default: 0)
 ```
 
 ### Migration from legacy `provider:` + `model:` form

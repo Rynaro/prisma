@@ -5,7 +5,10 @@ import {
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputSchema,
+  type TokenizerFamily,
+  estimatePromptTokens,
   isReasoningModel,
+  serializeForEstimate,
 } from '@prisma-bot/shared';
 import { type OpenAIChatCompletionsArgs, createOpenAIClient } from './client.js';
 import { mapOpenAIError } from './error-mapping.js';
@@ -239,18 +242,85 @@ export const OPENAI_DEFAULT_MODEL = 'gpt-4o';
  */
 export const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 
+// ---------------------------------------------------------------------------
+// Model → tokenizer family map (Phase 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * OpenAI model → `TokenizerFamily` map (Phase 2).
+ *
+ * OpenAI uses two BPE vocabularies:
+ *   - `cl100k_base` (100k vocab): GPT-4 classic, GPT-3.5-turbo, text-embedding-ada-002.
+ *   - `o200k_base` (200k vocab): GPT-4o family, gpt-4.1, o-series (o1/o3/o4), gpt-5*.
+ *
+ * Conservative choice: when the model slug is not in this map we fall back to
+ * `cl100k` (the older, smaller vocab), which over-counts for o200k models —
+ * that is safe (never under-counts). The spec allows this conservative default.
+ *
+ * Exported so adapter tests can assert the mapping directly.
+ */
+export const OPENAI_TOKENIZER_FAMILY_MAP: Record<string, TokenizerFamily> = {
+  // GPT-4o family — o200k_base
+  'gpt-4o': 'o200k',
+  'gpt-4o-mini': 'o200k',
+  'gpt-4o-mini-2024-07-18': 'o200k',
+  'gpt-4o-2024-05-13': 'o200k',
+  'gpt-4o-2024-08-06': 'o200k',
+  'gpt-4o-2024-11-20': 'o200k',
+  'gpt-4o-latest': 'o200k',
+  // GPT-4.1 family — o200k_base
+  'gpt-4.1': 'o200k',
+  'gpt-4.1-mini': 'o200k',
+  'gpt-4.1-nano': 'o200k',
+  // o-series reasoning models — o200k_base
+  o1: 'o200k',
+  'o1-mini': 'o200k',
+  'o1-preview': 'o200k',
+  o3: 'o200k',
+  'o3-mini': 'o200k',
+  o4: 'o200k',
+  'o4-mini': 'o200k',
+  // gpt-5* — o200k_base (future models in the gpt-5 family)
+  'gpt-5': 'o200k',
+  // GPT-4 classic family — cl100k_base
+  'gpt-4': 'cl100k',
+  'gpt-4-turbo': 'cl100k',
+  'gpt-4-turbo-preview': 'cl100k',
+  'gpt-4-0125-preview': 'cl100k',
+  'gpt-4-1106-preview': 'cl100k',
+  // GPT-3.5 — cl100k_base
+  'gpt-3.5-turbo': 'cl100k',
+  'gpt-3.5-turbo-16k': 'cl100k',
+  'gpt-3.5-turbo-0125': 'cl100k',
+  'gpt-3.5-turbo-1106': 'cl100k',
+};
+
+/**
+ * Resolve the `TokenizerFamily` for a given OpenAI model slug.
+ * Falls back to `'cl100k'` (conservative; never under-counts for unknown models).
+ */
+export function resolveOpenAITokenizerFamily(model: string): TokenizerFamily {
+  return OPENAI_TOKENIZER_FAMILY_MAP[model] ?? 'cl100k';
+}
+
 /**
  * `OPENAI_CAPABILITIES` — declared capability set for the OpenAI adapter.
  *
  * Key differentiator vs. Copilot: `deterministic_seed: true` — OpenAI's
  * `/chat/completions` honors an integer `seed` parameter. This is a BOOL
  * (support flag); the INT seed value travels via `ProviderRequestShaping.deterministic_seed`.
+ *
+ * `tokenizer_family`: defaults to `'o200k'` matching the default model `gpt-4o`.
+ * Overridden at construction time via `resolveOpenAITokenizerFamily(model)`.
+ *
+ * Per chunking-stability-spec.md § Phase 2 "Provider capabilities".
  */
 export const OPENAI_CAPABILITIES: ProviderCapabilities = {
   structured_output: true,
   function_calling: true,
   deterministic_seed: true,
   max_context_tokens: 128000,
+  tokenizer_family: 'o200k',
 };
 
 /**
@@ -449,8 +519,15 @@ export class OpenAIProvider implements Provider {
   private readonly toolChoiceStyle: ToolChoiceStyle;
 
   constructor(options: OpenAIProviderOptions) {
-    this.capabilities = options.capabilities ?? OPENAI_CAPABILITIES;
     this.model = options.model ?? OPENAI_DEFAULT_MODEL;
+    // Phase 2: derive tokenizer_family from the resolved model unless the
+    // caller provides explicit capabilities (e.g. tests with a mock window).
+    const baseCapabilities = options.capabilities ?? OPENAI_CAPABILITIES;
+    this.capabilities = {
+      ...baseCapabilities,
+      tokenizer_family:
+        options.capabilities?.tokenizer_family ?? resolveOpenAITokenizerFamily(this.model),
+    };
     this.maxTokensPerCall = options.maxTokensPerCall;
     this.tokenParamStyle = options.tokenParamStyle ?? 'auto';
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
@@ -473,12 +550,21 @@ export class OpenAIProvider implements Provider {
 
   async review(input: ProviderReviewInput): Promise<ProviderReviewOutput> {
     if (this.maxTokensPerCall !== undefined) {
-      const estimate = Math.ceil(JSON.stringify(input).length / 4);
+      // Phase 2: unified estimator — counts the SAME serialized prompt the
+      // batcher counts, eliminating the HOTSPOT-2/HOTSPOT-6 divergence.
+      // Phase 4: throws `over_budget` (not `capability/cost_ceiling`) so the
+      // orchestrator's discriminator is a single `kind === 'over_budget'` check
+      // and the batch degrades (split/skip) instead of aborting the PR.
+      const estimate = estimatePromptTokens(
+        serializeForEstimate(input),
+        this.capabilities.tokenizer_family,
+      );
       if (estimate > this.maxTokensPerCall) {
         throw new ProviderErrorThrowable({
-          kind: 'capability',
-          missing_capability: 'cost_ceiling',
-          message: 'request exceeds maxTokensPerCall',
+          kind: 'over_budget',
+          estimated_tokens: estimate,
+          hard_cap_in: this.maxTokensPerCall,
+          message: `request exceeds per-call token budget: estimated ${estimate} tokens, cap ${this.maxTokensPerCall}`,
         });
       }
     }
@@ -590,10 +676,11 @@ export class OpenAIProvider implements Provider {
 
     // Detect response truncation: finish_reason==='length' means the model hit
     // the output token cap and the output may be a partial/invalid findings
-    // array. Treat as schema_validation so the orchestrator publishes
-    // malformed_provider_output and does not silently accept a truncated result.
-    // The message is param- and value-agnostic so it accurately reflects
-    // whatever token field was in play (max_tokens or max_completion_tokens).
+    // array. Throw output_truncated so the orchestrator can split-and-retry
+    // instead of dropping the batch's findings (chunking-stability-spec.md
+    // § Phase 1). The message is param- and value-agnostic so it accurately
+    // reflects whatever token field was in play (max_tokens or
+    // max_completion_tokens).
     if (
       typeof response === 'object' &&
       response !== null &&
@@ -609,8 +696,9 @@ export class OpenAIProvider implements Provider {
         (firstChoice as Record<string, unknown>).finish_reason === 'length'
       ) {
         throw new ProviderErrorThrowable({
-          kind: 'schema_validation',
+          kind: 'output_truncated',
           message: `openai response truncated: finish_reason is 'length' (output token cap: ${this.maxOutputTokens})`,
+          requested_max_tokens: this.maxOutputTokens,
         });
       }
     }

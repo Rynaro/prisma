@@ -141,7 +141,7 @@ These are MVP starting values, not ADR commitments. Operators are expected to re
 | `RETRY_TRANSIENT_BACKOFF_BASE_MS` | `500` | `tunable` | Initial backoff for transient retries; jittered. |
 | `RETRY_TRANSIENT_BACKOFF_MAX_MS` | `8000` | `tunable` | Cap on backoff growth so a single PR never waits absurdly long. |
 | `RETRY_RATELIMIT_MAX_ATTEMPTS` | `5` | `tunable` | Bounds retries on `rate_limit`; honors `Retry-After` headers when provided. |
-| `MAX_TOKENS_PER_PR` | `120000` | `tunable` | Per-call input backstop (soft cost-ceiling proxy) enforced by the provider adapters as `maxTokensPerCall`. Must stay above `chunking.call_token_budget` (default 60000) plus serialization overhead, or it rejects batches the chunker built. |
+| `MAX_TOKENS_PER_PR` | `120000` | `tunable` | Optional per-call input ceiling (v0.12.0+: soft override above the derived `hard_cap_in`). If set, the effective guard threshold is `min(MAX_TOKENS_PER_PR, hard_cap_in)`. Adapters call the unified estimator to count the exact serialized prompt. Leave unset to let `hard_cap_in` (derived from the provider's context window) dominate. |
 | `MAX_TOKENS_PER_WINDOW_PER_INSTALLATION` | `2000000` | `tunable` | Cost ceiling proxy per installation per window; protects against PR-storm cost blowups. |
 | `MAX_TOKENS_WINDOW_SECONDS` | `3600` | `tunable` | Sliding window for the per-installation cost ceiling. |
 | `OTEL_TRACES_SAMPLER_ARG` | `1.0` | `tunable` | Head-sample rate for traces; 1.0 is fine for MVP single-tenant volume. |

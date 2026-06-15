@@ -632,9 +632,11 @@ describe('buildConfigReply — chunking section', () => {
     expect(reply).toContain('max_provider_calls_per_pr: 6');
   });
 
-  it('includes chunking.call_token_budget default (60000)', () => {
+  it('includes chunking.call_token_budget default (Phase 2 sentinel 1_000_000)', () => {
+    // Phase 2: call_token_budget default raised to 1_000_000 sentinel so
+    // hard_cap_in (derived from provider window) dominates by default.
     const reply = buildConfigReply(defaultConfig());
-    expect(reply).toContain('call_token_budget: 60000');
+    expect(reply).toContain('call_token_budget: 1000000');
   });
 
   it('reflects chunking disabled when set in config', () => {
