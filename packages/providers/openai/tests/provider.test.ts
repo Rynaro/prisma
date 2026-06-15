@@ -180,6 +180,33 @@ describe('OpenAIProvider', () => {
     expect(chatCompletions).not.toHaveBeenCalled();
   });
 
+  it('cost-ceiling: a full chunker batch (~60k content tokens) passes the default guard', async () => {
+    // Regression (v0.11.0): the chunker packs each call to
+    // chunking.call_token_budget (default 60000 content tokens). The adapter
+    // guard (default MAX_TOKENS_PER_PR = 120000) must clear a full batch —
+    // including the serialization overhead the guard measures — or it rejects
+    // what the chunker deliberately built. A prior MAX_TOKENS_PER_PR/2 = 30000
+    // guard rejected such batches once real diff content filled the request.
+    const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
+    // ~60k content tokens: 12000 lines × 20 chars = 240k chars; /4 = 60k.
+    const bigContent = 'export const x = 1;\n'.repeat(12000);
+    const bigInput: ProviderReviewInput = {
+      files: [
+        {
+          path: 'src/big.ts',
+          hunks: [{ id: 'H1', line_start: 1, line_end: 12000, content: bigContent }],
+        },
+      ],
+    };
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      maxTokensPerCall: 120000, // production default after the v0.11.x fix
+      client: { chatCompletions },
+    });
+    await expect(provider.review(bigInput)).resolves.toBeDefined();
+    expect(chatCompletions).toHaveBeenCalledOnce();
+  });
+
   // T7: seed threading — args.seed === 42
   it('threads deterministic_seed=42 from request_shaping into args.seed', async () => {
     let capturedArgs: unknown;

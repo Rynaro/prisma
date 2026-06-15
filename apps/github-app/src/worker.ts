@@ -51,8 +51,17 @@ import { resolveRepoIdentity } from './repo-identity.js';
  *      that boots and logs `worker.started` but cannot service real work
  *      until the operator configures one of the API keys.
  *
- * Both real adapters use `maxTokensPerCall = MAX_TOKENS_PER_PR / 2` (a soft
- * cost-ceiling proxy per `docs/operational-runbooks.md` § Numeric tunables).
+ * All adapters use `maxTokensPerCall = MAX_TOKENS_PER_PR` as a per-call input
+ * backstop (a soft cost-ceiling proxy per `docs/operational-runbooks.md`
+ * § Numeric tunables). It is a backstop, NOT the primary control: the chunker
+ * (`chunking.call_token_budget`, default 60k) is what sizes each provider
+ * call, so this guard MUST stay above that budget plus serialization overhead —
+ * otherwise it rejects batches the chunker deliberately built. (The adapter
+ * pre-flight estimates the whole serialized request, which runs ~15-25% larger
+ * than the chunker's content-only estimate, so the default 120k leaves ample
+ * headroom over the 60k batch budget. A prior `/ 2` here set the guard to 30k —
+ * below the 60k chunker budget — which only surfaced once v0.11.0 put real diff
+ * content into the request.)
  * If both `ANTHROPIC_API_KEY` and `COPILOT_API_KEY` are set, Anthropic wins;
  * the operator must explicitly unset it to switch vendors. The chosen vendor
  * is observable via the `worker.provider.selected` log event.
@@ -64,7 +73,7 @@ import { resolveRepoIdentity } from './repo-identity.js';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379';
 const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? 'prisma-review-bot';
-const MAX_TOKENS_PER_PR = Number.parseInt(process.env.MAX_TOKENS_PER_PR ?? '60000', 10);
+const MAX_TOKENS_PER_PR = Number.parseInt(process.env.MAX_TOKENS_PER_PR ?? '120000', 10);
 
 const log = (event: string, payload: Record<string, unknown> = {}): void => {
   process.stdout.write(
@@ -99,7 +108,7 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
   if (anthropicKey !== undefined) {
     const opts: AnthropicProviderOptions = {
       apiKey: anthropicKey,
-      maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
+      maxTokensPerCall: MAX_TOKENS_PER_PR,
     };
     log('worker.provider.selected', { provider: 'anthropic' });
     return new AnthropicProvider(opts);
@@ -108,7 +117,7 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
   if (copilotKey !== undefined) {
     const opts: CopilotProviderOptions = {
       apiKey: copilotKey,
-      maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
+      maxTokensPerCall: MAX_TOKENS_PER_PR,
     };
     const model = await tryGetSecret(secretSource, 'COPILOT_MODEL');
     if (model !== undefined) {
@@ -125,7 +134,7 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
   if (openaiKey !== undefined) {
     const opts: OpenAIProviderOptions = {
       apiKey: openaiKey,
-      maxTokensPerCall: Math.floor(MAX_TOKENS_PER_PR / 2),
+      maxTokensPerCall: MAX_TOKENS_PER_PR,
     };
     const model = await tryGetSecret(secretSource, 'OPENAI_MODEL');
     if (model !== undefined) {
