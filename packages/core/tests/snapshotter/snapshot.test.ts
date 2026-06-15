@@ -215,8 +215,20 @@ describe('fetchPrSnapshot', () => {
     const [file] = snap.files;
     if (file === undefined) throw new Error('expected one file');
     expect(file.hunks).toEqual([
-      { old_start: 10, old_lines: 1, new_start: 12, new_lines: 5 },
-      { old_start: 20, old_lines: 3, new_start: 22, new_lines: 1 },
+      {
+        old_start: 10,
+        old_lines: 1,
+        new_start: 12,
+        new_lines: 5,
+        content: ' line\n+a\n+b\n+c\n+d\n+e',
+      },
+      {
+        old_start: 20,
+        old_lines: 3,
+        new_start: 22,
+        new_lines: 1,
+        content: '-x\n-y\n-z\n+single\n',
+      },
     ]);
   });
 

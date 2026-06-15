@@ -145,12 +145,24 @@ describe('runValidator', () => {
     expect(reject.reason_code).toBe('path_not_in_diff');
   });
 
-  it('produces identical dedupe_key for two findings with same path+line+identical message', () => {
+  it('dedupe_key is identical for same path+category regardless of wording or line', () => {
+    // The same logical issue, reworded and at a different line, must collapse:
+    // the key is derived from (path, category), not the free-text message.
     const snap = snapshot([file({ path: 'src/a.ts' })]);
     const output: ProviderReviewOutput = {
       findings: [
-        validProviderFinding({ path: 'src/a.ts', line: 11, message: 'Same   issue!' }),
-        validProviderFinding({ path: 'src/a.ts', line: 11, message: 'same issue' }),
+        validProviderFinding({
+          path: 'src/a.ts',
+          line: 11,
+          category: 'security',
+          message: 'Missing explicit authorization in this controller',
+        }),
+        validProviderFinding({
+          path: 'src/a.ts',
+          line: 13,
+          category: 'security',
+          message: 'Authorization check appears to be absent here',
+        }),
       ],
     };
     const result = runValidator(output, ctx(snap));
@@ -158,6 +170,21 @@ describe('runValidator', () => {
     const [a, b] = result.findings;
     if (a === undefined || b === undefined) throw new Error('expected two findings');
     expect(a.dedupe_key).toBe(b.dedupe_key);
+  });
+
+  it('dedupe_key differs for different categories in the same file', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [
+        validProviderFinding({ path: 'src/a.ts', line: 11, category: 'security', message: 'a' }),
+        validProviderFinding({ path: 'src/a.ts', line: 11, category: 'correctness', message: 'b' }),
+      ],
+    };
+    const result = runValidator(output, ctx(snap));
+    expect(result.findings).toHaveLength(2);
+    const [a, b] = result.findings;
+    if (a === undefined || b === undefined) throw new Error('expected two findings');
+    expect(a.dedupe_key).not.toBe(b.dedupe_key);
   });
 
   it('uses the injected generateId for deterministic ids', () => {
