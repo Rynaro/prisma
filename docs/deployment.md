@@ -1,5 +1,11 @@
 # Deployment
 
+> **Two deploy paths.** This document and `deploy/` describe the Docker Compose + Traefik path
+> (driven by `deploy/install.sh` and `bin/prisma`). An alternative single-host path using
+> **Kamal** (kamal-proxy native TLS, Redis accessory) is documented in
+> [`deployment-kamal.md`](deployment-kamal.md). The two are mutually exclusive on one host (both
+> bind ports 80/443) — pick one per server.
+
 ## Topology
 
 The App ships as two process roles backed by a single Redis instance:

@@ -16,3 +16,11 @@ coverage
 .vscode
 .eidolons
 docs/_planning
+
+# Never bake secrets into a build-from-source image (E10)
+**/.env
+**/.env.local
+deploy/.env
+.kamal/secrets
+.kamal/secrets.*
+.kamal/secrets-common

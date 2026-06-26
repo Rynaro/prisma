@@ -46,6 +46,10 @@ CMD ["sleep", "infinity"]
 # The CMD intentionally has no hardcoded role: compose overrides `command:`
 # per service (pnpm --filter @prisma-bot/github-app run start:app|start:worker).
 FROM base AS prod
+# Kamal prebuilt-image discovery: Kamal finds externally-built containers by the
+# Docker `service` label. This value MUST equal `service:` in config/deploy.yml
+# (prisma). Inert to the Compose/Traefik path (image metadata only).
+LABEL service="prisma"
 # Copy workspace manifests and lockfile first for better layer caching.
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc* ./
 COPY --chown=node:node apps/github-app/package.json ./apps/github-app/

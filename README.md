@@ -13,6 +13,7 @@ A production-ready GitHub App that reviews pull requests with swappable AI provi
 
 - **Try locally in 5 minutes** → [Local evaluation quickstart](#quickstart)
 - **Deploy to production** → [Interactive installer](#deploy-to-production)
+- **Deploy with Kamal (single host)** → [Kamal deploy path](./docs/deployment-kamal.md)
 - **Operate a deployment** → [Ops CLI `bin/prisma`](#operate-the-deployment)
 - **Integrate via GitHub App** → [App installation guide](./docs/install-github-app.md)
 - **Customize the review** → [Custom review prompts guide](./docs/custom-review-prompts.md)
@@ -67,6 +68,11 @@ bash deploy/install.sh --yes
 ```
 
 Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.12.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+
+Prefer Kamal? An alternative single-host path using Kamal + kamal-proxy (native TLS) with a
+Redis accessory is documented in [docs/deployment-kamal.md](./docs/deployment-kamal.md). The
+Compose+Traefik path above and the Kamal path are mutually exclusive on a single host (both
+bind ports 80/443) — pick one.
 
 ## Operate the Deployment
 
@@ -211,6 +217,7 @@ Organized by what you want to do (Diátaxis).
 - [GitHub App installation](./docs/install-github-app.md) — install on your org
 - [Customize the review](./docs/custom-review-prompts.md) — add custom guidance and context files
 - [Deployment](./docs/deployment.md) — env vars, topology, secrets, networking, health surfaces
+- [Deployment with Kamal](./docs/deployment-kamal.md) — alternative single-host Kamal path
 - [Contributing](./docs/contributing.md) — workspace, tests, ADRs, adding a provider
 
 ### Reference
