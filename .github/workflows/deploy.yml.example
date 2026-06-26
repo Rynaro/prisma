@@ -1,0 +1,51 @@
+# .github/workflows/deploy.yml.example — INERT Kamal deploy TEMPLATE.
+#
+# GitHub Actions only runs *.yml / *.yaml in .github/workflows/. This .example file
+# NEVER runs (here OR in a fork) until you rename it to deploy.yml IN YOUR OWN FORK
+# and populate YOUR OWN repo secrets. It deploys to YOUR server with YOUR creds —
+# it does NOT touch prisma-team infrastructure.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   KAMAL_REGISTRY_PASSWORD   GH PAT (read:packages) for ghcr.io
+#   SSH_PRIVATE_KEY           deploy key for root@<SERVER_IP>
+#   GITHUB_APP_ID  GITHUB_APP_SLUG  GITHUB_APP_PRIVATE_KEY  GITHUB_APP_WEBHOOK_SECRET
+#   ANTHROPIC_API_KEY         (or your chosen provider key)
+#
+# Activate:  git mv .github/workflows/deploy.yml.example .github/workflows/deploy.yml
+
+name: Deploy (Kamal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag to deploy (e.g. v0.12.0)"
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - run: gem install kamal
+      - name: Add SSH key
+        run: |
+          mkdir -p ~/.ssh && echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+      - name: Materialize .kamal/secrets from repo secrets
+        run: |
+          mkdir -p .kamal
+          cat > .kamal/secrets <<'EOF'
+          KAMAL_REGISTRY_PASSWORD=${{ secrets.KAMAL_REGISTRY_PASSWORD }}
+          GITHUB_APP_ID=${{ secrets.GITHUB_APP_ID }}
+          GITHUB_APP_SLUG=${{ secrets.GITHUB_APP_SLUG }}
+          GITHUB_APP_PRIVATE_KEY=${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          GITHUB_APP_WEBHOOK_SECRET=${{ secrets.GITHUB_APP_WEBHOOK_SECRET }}
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          EOF
+      # PREBUILT flow: pull the published image, do NOT build.
+      - name: Kamal deploy
+        run: kamal deploy --skip-push --version=${{ inputs.version }}

@@ -22,3 +22,9 @@ deploy/backups/
 # Per-developer tool state (not project assets)
 .claude/
 .eidolons/
+
+# Kamal secrets (per-deployment, never committed; only .example is tracked)
+.kamal/secrets
+.kamal/secrets.*
+.kamal/secrets-common
+!.kamal/secrets.example

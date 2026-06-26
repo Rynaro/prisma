@@ -1,0 +1,123 @@
+# config/deploy.yml — Kamal 2.x deployment for prisma.
+#
+# This is the KAMAL deploy path: an ALTERNATIVE to the Docker Compose + Traefik
+# stack under deploy/ (driven by deploy/install.sh and bin/prisma). The two paths
+# are mutually exclusive on a single host (both bind ports 80/443) — pick ONE.
+# Full guide: docs/deployment-kamal.md
+#
+# Replace every <PLACEHOLDER> before deploying. Validate with: kamal config
+# PRIMARY flow = PREBUILT published image (no local build):
+#   first run : kamal setup  --skip-push --version=vX.Y.Z
+#   redeploy  : kamal deploy --skip-push --version=vX.Y.Z
+# Pin an explicit version tag (e.g. v0.12.0); do NOT deploy `latest`.
+
+service: prisma
+image: ghcr.io/rynaro/prisma-bot
+
+# Roles. Both run the SAME prebuilt image and each overrides the image CMD (the
+# prod stage CMD intentionally errors). Both target the same single host.
+servers:
+  web:
+    hosts:
+      - <SERVER_IP>
+    cmd: "pnpm --filter @prisma-bot/github-app run start:app"
+  worker:
+    hosts:
+      - <SERVER_IP>
+    cmd: "pnpm --filter @prisma-bot/github-app run start:worker"
+    # Worker is a BullMQ consumer with NO HTTP listener — it must not be proxied
+    # or HTTP-health-probed. Health = "process up" (Kamal readiness_delay below).
+    proxy: false
+
+# kamal-proxy fronts the WEB (primary) role only. Native Let's Encrypt TLS.
+# Requires: a DNS A-record for <your-domain> -> <SERVER_IP>, and ports 80+443 open.
+proxy:
+  host: <your-domain>
+  app_port: 3000          # MUST equal env.clear PORT below; app binds 0.0.0.0:3000
+  ssl: true               # automatic Let's Encrypt; no email key required
+  # ssl_redirect defaults to true (kept) — the GitHub webhook URL MUST be https://
+  healthcheck:
+    path: /healthz/live   # prisma liveness probe (NOT the kamal default /up)
+    interval: 3
+    timeout: 5
+
+# Container registry. These are the DEPLOYING USER's GitHub credentials, never
+# prisma-team's. KAMAL_REGISTRY_PASSWORD = a GH PAT with read:packages.
+registry:
+  server: ghcr.io
+  username: <github-username>
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+# Redis as a Kamal accessory (self-hosted, persistent volume). Managed SEPARATELY
+# from `kamal deploy` (see `kamal accessory ...`). NO host port is published — it
+# is reachable ONLY on the internal `kamal` network, mirroring the compose path.
+accessories:
+  redis:
+    image: redis:7-alpine
+    host: <SERVER_IP>
+    volumes:
+      - redis-data:/data
+
+# Environment. Top-level env applies to BOTH roles.
+env:
+  clear:
+    PORT: "3000"                                   # MUST equal proxy.app_port
+    LOG_LEVEL: "info"
+    # On the `kamal` network the redis accessory resolves as <service>-redis.
+    # This is prisma-redis — NOT redis:6379 as in the compose path.
+    REDIS_URL: "redis://prisma-redis:6379"
+    INSTALLATION_REPLAY_WINDOW_SECONDS: "300"
+    OTEL_SERVICE_NAME: "prisma-review-bot"
+    OTEL_EXPORTER_OTLP_ENDPOINT: ""                # empty disables trace/metric export
+    OTEL_TRACES_SAMPLER_ARG: "1.0"
+    QUEUE_CONCURRENCY: "4"
+    JOB_TIMEOUT_SECONDS: "120"
+    RETRY_TRANSIENT_MAX_ATTEMPTS: "3"
+    RETRY_TRANSIENT_BACKOFF_BASE_MS: "500"
+    RETRY_TRANSIENT_BACKOFF_MAX_MS: "8000"
+    RETRY_RATELIMIT_MAX_ATTEMPTS: "5"
+    MAX_TOKENS_PER_PR: "60000"
+    MAX_TOKENS_PER_WINDOW_PER_INSTALLATION: "2000000"
+    MAX_TOKENS_WINDOW_SECONDS: "3600"
+    # Optional provider overrides (non-secret). Uncomment ONLY the pair matching
+    # the active provider key below.
+    # COPILOT_MODEL: ""
+    # COPILOT_BASE_URL: ""
+    # OPENAI_MODEL: ""
+    # OPENAI_BASE_URL: ""
+  secret:
+    - GITHUB_APP_ID
+    - GITHUB_APP_SLUG
+    - GITHUB_APP_PRIVATE_KEY
+    - GITHUB_APP_WEBHOOK_SECRET
+    # ---- Provider key: EXACTLY ONE may be active (uncommented). ----
+    # Precedence ANTHROPIC -> COPILOT -> OPENAI. NEVER leave an empty provider
+    # value. Switch providers by commenting one / uncommenting another in BOTH
+    # this file AND .kamal/secrets. Each active name MUST exist in .kamal/secrets
+    # or Kamal errors at deploy (the intended fail-fast safety net).
+    - ANTHROPIC_API_KEY
+    # - COPILOT_API_KEY
+    # - OPENAI_API_KEY
+
+# Keep N previous containers for fast `kamal rollback`.
+retain_containers: 5
+
+# Non-proxied roles (the worker) are considered ready this many seconds after the
+# container starts. Mirrors the compose worker warmup budget (start_period: 20s
+# in compose covers a slower tsx-at-runtime boot; tune up if the host is slow).
+readiness_delay: 10
+
+# ----------------------------------------------------------------------------
+# BUILD-FROM-SOURCE (SECONDARY / fork path) — DISABLED BY DEFAULT.
+# The primary flow pulls the prebuilt image (kamal deploy --skip-push --version).
+# Uncomment to build & push the Dockerfile `prod` stage to YOUR OWN registry,
+# then run a plain `kamal deploy` (NO --skip-push). Confirm .dockerignore excludes
+# secrets first (it does, per the sanctioned edit). Multiarch needs buildx/QEMU.
+# builder:
+#   arch:
+#     - amd64
+#     - arm64
+#   target: prod          # build the Dockerfile `prod` stage
+#   context: .
+# ----------------------------------------------------------------------------
