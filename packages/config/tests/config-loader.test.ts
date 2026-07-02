@@ -147,4 +147,131 @@ describe('loadRepoConfig', () => {
     expect((caught as ConfigParseError).code).toBe('schema_violation');
     expect((caught as ConfigParseError).message).toContain('per_pr');
   });
+
+  describe('guidance-only salvage (docs/config-spec.md § Failure modes)', () => {
+    const EMPTY_GUIDANCE = { instructions: undefined, path_instructions: [], context_files: [] };
+
+    it('salvages the rest of the config when only an oversized instructions block violates the schema', () => {
+      const oversizedInstructions = 'x'.repeat(3000);
+      const yaml = [
+        'mode: summary-only',
+        'comment_cap:',
+        '  per_pr: 3',
+        '  per_file: 1',
+        'nickname: custom-bot',
+        'review_guidance:',
+        `  instructions: "${oversizedInstructions}"`,
+        '',
+      ].join('\n');
+
+      let caught: unknown;
+      try {
+        parseRepoConfigYaml(yaml);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(ConfigParseError);
+      const err = caught as ConfigParseError;
+      expect(err.code).toBe('schema_violation');
+      expect(err.message).toContain('review_guidance.instructions');
+      expect(err.salvagedConfig).toBeDefined();
+      expect(err.salvagedConfig?.mode).toBe('summary-only');
+      expect(err.salvagedConfig?.comment_cap).toEqual({ per_pr: 3, per_file: 1 });
+      expect(err.salvagedConfig?.nickname).toBe('custom-bot');
+      expect(err.salvagedConfig?.review_guidance).toEqual(EMPTY_GUIDANCE);
+    });
+
+    it('salvages the rest of the config when context_files exceeds MAX_CONTEXT_FILES', () => {
+      const contextFilesYaml = Array.from(
+        { length: 6 },
+        (_, i) => `    - path: "docs/file-${i}.md"`,
+      ).join('\n');
+      const yaml = [
+        'mode: summary-plus-inline',
+        'nickname: another-bot',
+        'review_guidance:',
+        '  context_files:',
+        contextFilesYaml,
+        '',
+      ].join('\n');
+
+      let caught: unknown;
+      try {
+        parseRepoConfigYaml(yaml);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(ConfigParseError);
+      const err = caught as ConfigParseError;
+      expect(err.code).toBe('schema_violation');
+      expect(err.salvagedConfig).toBeDefined();
+      expect(err.salvagedConfig?.mode).toBe('summary-plus-inline');
+      expect(err.salvagedConfig?.nickname).toBe('another-bot');
+      expect(err.salvagedConfig?.review_guidance).toEqual(EMPTY_GUIDANCE);
+    });
+
+    it('salvages the rest of the config for a deep guidance violation (path_instructions[1].instructions)', () => {
+      const oversizedInstructions = 'y'.repeat(3000);
+      const yaml = [
+        'mode: summary-only',
+        'review_guidance:',
+        '  path_instructions:',
+        '    - path: "src/**"',
+        '      instructions: "ok"',
+        `    - path: "lib/**"`,
+        `      instructions: "${oversizedInstructions}"`,
+        '',
+      ].join('\n');
+
+      let caught: unknown;
+      try {
+        parseRepoConfigYaml(yaml);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(ConfigParseError);
+      const err = caught as ConfigParseError;
+      expect(err.code).toBe('schema_violation');
+      expect(err.salvagedConfig).toBeDefined();
+      expect(err.salvagedConfig?.mode).toBe('summary-only');
+      expect(err.salvagedConfig?.review_guidance).toEqual(EMPTY_GUIDANCE);
+    });
+
+    it('does NOT salvage when the violation is outside review_guidance', () => {
+      let caught: unknown;
+      try {
+        parseRepoConfigYaml('comment_cap:\n  per_pr: "five"\n  per_file: 1\n');
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(ConfigParseError);
+      expect((caught as ConfigParseError).salvagedConfig).toBeUndefined();
+    });
+
+    it('does NOT salvage when violations are mixed (guidance AND non-guidance)', () => {
+      const oversizedInstructions = 'z'.repeat(3000);
+      const yaml = [
+        'mode: invalid-mode',
+        'review_guidance:',
+        `  instructions: "${oversizedInstructions}"`,
+        '',
+      ].join('\n');
+
+      let caught: unknown;
+      try {
+        parseRepoConfigYaml(yaml);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(ConfigParseError);
+      const err = caught as ConfigParseError;
+      expect(err.code).toBe('schema_violation');
+      expect(err.salvagedConfig).toBeUndefined();
+    });
+  });
 });

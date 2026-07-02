@@ -187,6 +187,7 @@ The diff is never dropped — guidance can never evict the code review.
 - **File is a directory**: logged as "not_a_file", skipped, review proceeds
 - **File is too large**: truncated on UTF-8 boundary, logged as "truncated", included in review
 - **Malformed YAML**: caught at config-parse time; defaults used, error note in summary
+- **Guidance over a hard cap** (`instructions` > 2,048 bytes, more than 20 `path_instructions`, more than 5 `context_files`, or an over-long path block): only the `review_guidance` block is dropped — the **rest of your config** (`model`, `max_files`, `comment_cap`, `path_rules`, `nickname`, floors, …) still applies. A `worker.config.parse_error` log (with `salvaged: true`) is emitted and the summary notes which field was over the cap. This is distinct from the token budget above: caps are validated at parse time (hard reject of the guidance block), whereas the 7,500-token budget truncates *valid* guidance at render time.
 
 In all degradation cases, the review **succeeds**. The bot never fails a review because of config or context issues.
 
