@@ -67,7 +67,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.12.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.13.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 Prefer Kamal? An alternative single-host path using Kamal + kamal-proxy (native TLS) with a
 Redis accessory is documented in [docs/deployment-kamal.md](./docs/deployment-kamal.md). The
@@ -188,9 +188,9 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.12.0** — chunking-stability redesign: the diff-chunking subsystem is rebuilt for stability with small chunks. Output budgets are now configurable with split-and-retry on truncation; a single real-tokenizer estimator replaces two divergent ones; files larger than the call budget are split at hunk boundaries instead of skipped; and oversized PRs now get a prioritized partial review with a visible "not reviewed" list instead of being dropped wholesale. This eliminates four structural cliff-failures in the stability core.
+**v0.13.0** — resilient config + Kamal deploy: a `review_guidance`-only schema violation (e.g. `instructions` over the 2,048-byte cap, or more than 5 `context_files`) now degrades to **guidance-only** — the offending guidance block is dropped while `model`, file caps, `path_rules.exclude`, `nickname`, and floors are all honored — instead of silently reverting the entire repo config to defaults. Degradation is never silent: `worker.config.parse_error` is logged with `salvaged: true` and a check-run note names the dropped field. Also adds a coexisting Kamal deployment path alongside the existing flow.
 
-- 735+ tests across 49 files, all passing · 15/15 deterministic eval scenarios PASS
+- 801 tests across 52 files, all passing · 15/15 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
