@@ -1,4 +1,3 @@
-import { ConfigParseError, REPO_LOCAL_CONFIG_PATH, loadRepoConfig } from '@prisma-bot/config';
 import {
   type AppCredentials,
   InstallationAuth,
@@ -29,6 +28,7 @@ import {
 import IORedis from 'ioredis';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
+import { fetchRepoConfig } from './repo-config.js';
 import { resolveRepoIdentity } from './repo-identity.js';
 
 /**
@@ -294,57 +294,6 @@ const buildRepoLookup = (secretSource: SecretSource): RepoLookup => {
     });
     return resolution.identity;
   };
-};
-
-/**
- * Fetch and parse the per-repo config from `.github/review-bot.yml` at the
- * given ref. Returns `{ config, notes }` where `notes` carries any parse
- * error description (config error → default config, review succeeds).
- *
- * Per spec § S4 / §6.1: config is per-job (each PR's repo has its own config);
- * the static `defaultRepoConfig()` is removed from the per-process scope.
- */
-const fetchRepoConfig = async (
-  octokit: OctokitLike,
-  owner: string,
-  repo: string,
-  ref: string,
-): Promise<{ config: RepoConfig; notes: string[] }> => {
-  const fetcher = buildContentFetcher(octokit, owner, repo);
-  const result = await fetcher.fetchText({
-    path: REPO_LOCAL_CONFIG_PATH,
-    ref,
-    maxBytes: 65536,
-  });
-
-  if (!result.ok) {
-    if (result.reason === 'missing') {
-      // No config file → pure defaults, no note needed.
-      return { config: loadRepoConfig({ yamlContents: null }), notes: [] };
-    }
-    // Other fetch error → defaults + note.
-    return {
-      config: loadRepoConfig({ yamlContents: null }),
-      notes: [`config fetch failed (${result.reason}): using defaults`],
-    };
-  }
-
-  try {
-    const config = loadRepoConfig({ yamlContents: result.text });
-    return { config, notes: [] };
-  } catch (err) {
-    if (err instanceof ConfigParseError) {
-      log('worker.config.parse_error', { code: err.code, message: err.message });
-      return {
-        config: loadRepoConfig({ yamlContents: null }),
-        notes: [`config error (${err.code}): ${err.message} — using defaults`],
-      };
-    }
-    return {
-      config: loadRepoConfig({ yamlContents: null }),
-      notes: ['config parse error: unknown error — using defaults'],
-    };
-  }
 };
 
 /**
@@ -773,6 +722,7 @@ const start = async (): Promise<void> => {
         identity.owner,
         identity.repo,
         configRef,
+        log,
       );
 
       log('worker.config.loaded', {
