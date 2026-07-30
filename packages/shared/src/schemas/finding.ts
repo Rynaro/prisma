@@ -63,3 +63,25 @@ export const NormalizedFindingSchema = z
     path: ['line_end'],
   });
 export type NormalizedFinding = z.infer<typeof NormalizedFindingSchema>;
+
+/**
+ * Hard caps on the rendered highlight text. Bounds the summary section to
+ * <3 KB at max_items=5. Per spec § A.2 (positive feedback / highlights).
+ */
+export const HIGHLIGHT_MESSAGE_MAX_LENGTH = 200;
+export const HIGHLIGHT_RATIONALE_MAX_LENGTH = 500;
+
+/**
+ * `ReviewHighlight` — the validated form of a provider-reported "good
+ * decision". Deliberately NOT a finding: no line anchor, no severity, no
+ * category, no dedupe_key. `path`, when present, is guaranteed by the
+ * validator (not by this schema) to be one of the input files.
+ */
+export const ReviewHighlightSchema = z
+  .object({
+    path: z.string().min(1).optional(),
+    message: z.string().min(1).max(HIGHLIGHT_MESSAGE_MAX_LENGTH),
+    rationale: z.string().min(1).max(HIGHLIGHT_RATIONALE_MAX_LENGTH),
+  })
+  .strict();
+export type ReviewHighlight = z.infer<typeof ReviewHighlightSchema>;

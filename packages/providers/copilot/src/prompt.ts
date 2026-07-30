@@ -1,9 +1,10 @@
 import type { ProviderReviewInput } from '@prisma-bot/shared';
 import {
-  FINDING_JSON_SCHEMA,
   IMMUTABLE_SYSTEM_PROMPT,
   TOOL_DESCRIPTION,
+  buildToolInputSchema,
   renderCustomGuidance,
+  renderPositiveFeedback,
   renderUserMessage,
 } from '@prisma-bot/shared';
 
@@ -35,21 +36,11 @@ export interface PromptShape {
   tool_choice: { type: 'function'; function: { name: 'submit_review_findings' } };
 }
 
-const TOOL_PARAMETERS_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['findings'],
-  properties: {
-    findings: {
-      type: 'array',
-      items: FINDING_JSON_SCHEMA,
-    },
-  },
-};
-
 export function buildPrompt(input: ProviderReviewInput): PromptShape {
   const userMessage =
-    renderUserMessage(input) + (renderCustomGuidance(input.custom_guidance) ?? '');
+    renderUserMessage(input) +
+    (renderCustomGuidance(input.custom_guidance) ?? '') +
+    (renderPositiveFeedback(input.positive_feedback) ?? '');
   return {
     messages: [
       { role: 'system', content: IMMUTABLE_SYSTEM_PROMPT },
@@ -60,7 +51,7 @@ export function buildPrompt(input: ProviderReviewInput): PromptShape {
       function: {
         name: 'submit_review_findings',
         description: TOOL_DESCRIPTION,
-        parameters: TOOL_PARAMETERS_SCHEMA,
+        parameters: buildToolInputSchema(input.positive_feedback),
       },
     },
     tool_choice: { type: 'function', function: { name: 'submit_review_findings' } },

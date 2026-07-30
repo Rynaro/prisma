@@ -64,6 +64,15 @@ export const ProviderRequestShapingSchema = z
   .strict();
 export type ProviderRequestShaping = z.infer<typeof ProviderRequestShapingSchema>;
 
+/**
+ * Presence == enabled. Absence => zero prompt bytes, zero tool-schema bytes.
+ * Per spec § A.3 (positive feedback / highlights).
+ */
+export const PositiveFeedbackRequestSchema = z
+  .object({ max_items: z.number().int().min(1).max(5) })
+  .strict();
+export type PositiveFeedbackRequest = z.infer<typeof PositiveFeedbackRequestSchema>;
+
 export const ProviderReviewInputSchema = z
   .object({
     files: z.array(PrefilteredFileSchema),
@@ -76,6 +85,12 @@ export const ProviderReviewInputSchema = z
      * resolution; never constructed by providers themselves (they render it).
      */
     custom_guidance: CustomGuidanceSchema.optional(),
+    /**
+     * Present only when the repo enabled `positive_feedback`. Absent when the
+     * feature is not configured → zero-config behavior is byte-identical to
+     * today (prompt bytes and tool schema unchanged).
+     */
+    positive_feedback: PositiveFeedbackRequestSchema.optional(),
   })
   .strict();
 export type ProviderReviewInput = z.infer<typeof ProviderReviewInputSchema>;
@@ -100,9 +115,25 @@ export const ProviderReviewOutputFindingSchema = z
   .strict();
 export type ProviderReviewOutputFinding = z.infer<typeof ProviderReviewOutputFindingSchema>;
 
+/**
+ * A provider-reported "good decision" in the diff. Deliberately NOT a finding:
+ * no line anchor, no severity, no category. `path`, when present, MUST be one
+ * of the input files (enforced by the validator, not by this schema).
+ */
+export const ProviderReviewOutputHighlightSchema = z
+  .object({
+    path: z.string().min(1).optional(),
+    message: z.string().min(1),
+    rationale: z.string().min(1),
+  })
+  .strict();
+export type ProviderReviewOutputHighlight = z.infer<typeof ProviderReviewOutputHighlightSchema>;
+
 export const ProviderReviewOutputSchema = z
   .object({
     findings: z.array(ProviderReviewOutputFindingSchema),
+    /** Present only when the repo enabled `positive_feedback`; ignored otherwise. */
+    highlights: z.array(ProviderReviewOutputHighlightSchema).optional(),
   })
   .strict();
 export type ProviderReviewOutput = z.infer<typeof ProviderReviewOutputSchema>;

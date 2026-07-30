@@ -1,4 +1,8 @@
-import type { CustomGuidance, ProviderReviewInput } from '../schemas/index.js';
+import type {
+  CustomGuidance,
+  PositiveFeedbackRequest,
+  ProviderReviewInput,
+} from '../schemas/index.js';
 
 /**
  * `review-prompt.ts` — shared prompt-builder module.
@@ -17,6 +21,12 @@ import type { CustomGuidance, ProviderReviewInput } from '../schemas/index.js';
  *   - `renderCustomGuidance(g)` — NEW: renders the delimited, untrusted guidance
  *     block below the user message. Returns `null` when guidance is absent/empty
  *     (→ legacy prompt bytes unchanged, zero-config invariant preserved).
+ *   - `HIGHLIGHT_JSON_SCHEMA` / `buildToolInputSchema(pf)` — NEW: the tool
+ *     wrapper schema, byte-identical to the legacy `{findings}` literal when
+ *     `pf` is absent; adds a capped `highlights` array when present.
+ *   - `renderPositiveFeedback(pf)` — NEW: renders the positive-feedback
+ *     instruction block, or `null` when `pf` is absent (same zero-config
+ *     guarantee as `renderCustomGuidance`).
  *
  * No vendor SDK is imported here (ADR-002 vendor-isolation guarantee: `shared`
  * has zero vendor SDK imports; `scripts/check-vendor-isolation.sh` stays green).
@@ -87,6 +97,69 @@ export const FINDING_JSON_SCHEMA: object = {
     suggested_fix: { type: 'string', minLength: 1 },
   },
 };
+
+export const HIGHLIGHT_JSON_SCHEMA: object = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['message', 'rationale'],
+  properties: {
+    path: {
+      type: 'string',
+      minLength: 1,
+      description: 'Optional file this highlight refers to; MUST be one of the input files.',
+    },
+    message: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 200,
+      description: 'One line naming the good decision that was made in this diff.',
+    },
+    rationale: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 500,
+      description: 'Why that decision is good, grounded in the supplied hunks.',
+    },
+  },
+};
+
+/**
+ * Build the tool wrapper schema. Returns the legacy `{findings}` object
+ * BYTE-IDENTICALLY when `pf` is absent (zero-config invariant); adds the
+ * `highlights` array with a hard `maxItems` when it is present.
+ */
+export function buildToolInputSchema(pf: PositiveFeedbackRequest | undefined | null): object {
+  if (pf === undefined || pf === null) {
+    return {
+      type: 'object',
+      additionalProperties: false,
+      required: ['findings'],
+      properties: {
+        findings: {
+          type: 'array',
+          items: FINDING_JSON_SCHEMA,
+        },
+      },
+    };
+  }
+
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['findings'],
+    properties: {
+      findings: {
+        type: 'array',
+        items: FINDING_JSON_SCHEMA,
+      },
+      highlights: {
+        type: 'array',
+        items: HIGHLIGHT_JSON_SCHEMA,
+        maxItems: pf.max_items,
+      },
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // User message renderer (byte-identical to the three adapter implementations)
@@ -213,5 +286,33 @@ export function renderCustomGuidance(g: CustomGuidance | undefined | null): stri
   }
 
   lines.push('END_REPO_GUIDANCE>>>');
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Positive feedback renderer (NEW — spec § A.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the positive-feedback instruction block, or `null` when `pf` is
+ * absent. Mirrors `renderCustomGuidance`: append the result (or '') to the
+ * user message. Placed AFTER the untrusted-guidance block so first-party
+ * instructions are never enclosed by repo-owner content.
+ *
+ * Returning `null` preserves the zero-config invariant: when
+ * `input.positive_feedback` is absent, the final user message is
+ * byte-identical to the legacy prompt.
+ */
+export function renderPositiveFeedback(
+  pf: PositiveFeedbackRequest | undefined | null,
+): string | null {
+  if (pf === undefined || pf === null) return null;
+
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('## Positive feedback (optional)');
+  lines.push(
+    `Also report up to ${pf.max_items} concrete good decision(s) visible in this diff by passing a \`highlights\` array to \`submit_review_findings\`. Each entry: \`message\` = what was done well (one line), \`rationale\` = why that decision is good, optional \`path\` = the file it applies to (it MUST be one of the files listed above). Only cite decisions you can verify from the supplied hunks; never invent praise, and never let a highlight replace or soften a finding. If nothing stands out, omit \`highlights\`.`,
+  );
   return lines.join('\n');
 }

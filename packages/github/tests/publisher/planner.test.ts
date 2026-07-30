@@ -4,9 +4,15 @@ import {
   type RankedFindings,
   type RepoConfig,
   RepoConfigSchema,
+  type ReviewHighlight,
 } from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
-import { type PriorDedupeState, planPublication } from '../../src/publisher/index.js';
+import {
+  CLEAN_APPROVAL_MESSAGE,
+  type PriorDedupeState,
+  type PublicationExtras,
+  planPublication,
+} from '../../src/publisher/index.js';
 
 const noPrior: PriorDedupeState = { published_inline_dedupe_keys: new Set<string>() };
 
@@ -371,5 +377,201 @@ describe('planPublication — notice/preamble (oversized + fallback paths)', () 
     ];
     const plan = planPublication(ranked, cfgWithMode('summary-plus-inline'), noPrior, notice);
     partitionInvariant(ranked, plan);
+  });
+});
+
+// ── Highlights + clean-review approval (S4) ─────────────────────────────────
+
+const highlight = (overrides: Partial<ReviewHighlight> = {}): ReviewHighlight => ({
+  message: overrides.message ?? 'Good decision',
+  rationale: overrides.rationale ?? 'Because reasons.',
+  ...(overrides.path !== undefined ? { path: overrides.path } : {}),
+});
+
+describe('planPublication — byte-identical default (S4 invariant)', () => {
+  it('summary markdown is unchanged under default config', () => {
+    const ranked = [finding({ id: 'A', severity: 'high', confidence: 0.9 })];
+    const plan = planPublication(ranked, buildConfig(), noPrior);
+    const expected = [
+      '**Mode: summary-plus-inline**',
+      '',
+      '### Inline (1)',
+      '- `src/a.ts:10` — **HIGH** (confidence 0.90) — title',
+      '',
+      'Caps: per_pr=5 per_file=1. Floors: severity≥medium, confidence≥0.70.',
+    ].join('\n');
+    expect(plan.summary_markdown).toBe(expected);
+  });
+
+  it('highlights/clean_approval/approval_managed default to empty/null/false without extras', () => {
+    const ranked = [finding({ id: 'A', severity: 'high', confidence: 0.9 })];
+    const plan = planPublication(ranked, buildConfig(), noPrior);
+    expect(plan.highlights).toEqual([]);
+    expect(plan.clean_approval).toBeNull();
+    expect(plan.approval_managed).toBe(false);
+  });
+});
+
+describe('planPublication — highlights section', () => {
+  it('renders a Highlights section', () => {
+    const extras: PublicationExtras = {
+      highlights: [highlight({ message: 'Clean extraction' }), highlight({ message: 'Good test' })],
+    };
+    const plan = planPublication([], cfgWithMode('summary-only'), noPrior, undefined, extras);
+    expect(plan.summary_markdown).toContain('### Highlights (2)');
+    expect(plan.highlights).toHaveLength(2);
+  });
+
+  it('renders highlights after the findings sections', () => {
+    const ranked = [finding({ id: 'A', severity: 'high', confidence: 0.9 })];
+    const extras: PublicationExtras = { highlights: [highlight()] };
+    const plan = planPublication(
+      ranked,
+      cfgWithMode('summary-plus-inline'),
+      noPrior,
+      undefined,
+      extras,
+    );
+    const inlineIdx = plan.summary_markdown.indexOf('### Inline');
+    const highlightsIdx = plan.summary_markdown.indexOf('### Highlights');
+    expect(inlineIdx).toBeGreaterThanOrEqual(0);
+    expect(highlightsIdx).toBeGreaterThan(inlineIdx);
+  });
+
+  it('renders a highlight with a path using the `path` — **message** — rationale shape', () => {
+    const extras: PublicationExtras = {
+      highlights: [
+        highlight({
+          path: 'src/a.ts',
+          message: 'Nice guard clause',
+          rationale: 'Avoids a null deref.',
+        }),
+      ],
+    };
+    const plan = planPublication([], cfgWithMode('summary-only'), noPrior, undefined, extras);
+    expect(plan.summary_markdown).toContain(
+      '- `src/a.ts` — **Nice guard clause** — Avoids a null deref.',
+    );
+  });
+
+  it('renders a highlight without a path using the **message** — rationale shape', () => {
+    const extras: PublicationExtras = {
+      highlights: [highlight({ message: 'Good naming', rationale: 'Clear intent.' })],
+    };
+    const plan = planPublication([], cfgWithMode('summary-only'), noPrior, undefined, extras);
+    expect(plan.summary_markdown).toContain('- **Good naming** — Clear intent.');
+  });
+
+  it('empty highlights renders no Highlights section', () => {
+    const plan = planPublication([], cfgWithMode('summary-only'), noPrior, undefined, {
+      highlights: [],
+    });
+    expect(plan.summary_markdown).not.toContain('### Highlights');
+  });
+});
+
+describe('planPublication — clean-review approval', () => {
+  const cleanCfg = (overrides: Partial<RepoConfig> = {}, mode: Mode = 'summary-plus-inline') =>
+    RepoConfigSchema.parse({
+      mode,
+      approval: { celebrate_clean: true, clean_conclusion: 'neutral', approve_on_clean: false },
+      ...overrides,
+    });
+
+  it('renders the approval message on a clean review', () => {
+    const extras: PublicationExtras = { clean_review: true };
+    const plan = planPublication([], cleanCfg(), noPrior, undefined, extras);
+    expect(plan.summary_markdown).toContain('Prisma reviewed this PR and found no issues');
+    expect(plan.clean_approval).not.toBeNull();
+    expect(plan.clean_approval?.body).toBe(CLEAN_APPROVAL_MESSAGE);
+  });
+
+  it('suppresses the empty-review notice when celebrating', () => {
+    const notice = '⚠️ Lower your floors to see more findings.';
+    const extras: PublicationExtras = { clean_review: true };
+    const plan = planPublication([], cleanCfg(), noPrior, notice, extras);
+    expect(plan.summary_markdown).not.toContain(notice);
+    expect(plan.summary_markdown).toContain('Prisma reviewed this PR and found no issues');
+  });
+
+  it('never celebrates in dry-run', () => {
+    const extras: PublicationExtras = { clean_review: true };
+    const plan = planPublication([], cleanCfg({}, 'dry-run'), noPrior, undefined, extras);
+    expect(plan.summary_markdown).toContain('_No findings._');
+    expect(plan.summary_markdown).not.toContain('Prisma reviewed this PR and found no issues');
+    expect(plan.clean_approval).toBeNull();
+    expect(plan.approval_managed).toBe(false);
+  });
+
+  it('clean_approval is null when clean_review is asserted but ranked is non-empty', () => {
+    const ranked = [finding({ id: 'A', severity: 'high', confidence: 0.9 })];
+    const extras: PublicationExtras = { clean_review: true };
+    const plan = planPublication(ranked, cleanCfg(), noPrior, undefined, extras);
+    expect(plan.clean_approval).toBeNull();
+  });
+
+  it('clean_approval is null when the caller does not assert clean_review, even with an empty ranked list', () => {
+    const plan = planPublication([], cleanCfg(), noPrior);
+    expect(plan.clean_approval).toBeNull();
+  });
+
+  it('clean_approval.celebrate is false when approval.celebrate_clean is false (byte-identical body)', () => {
+    const extras: PublicationExtras = { clean_review: true };
+    const plan = planPublication(
+      [],
+      RepoConfigSchema.parse({ mode: 'summary-plus-inline' }),
+      noPrior,
+      undefined,
+      extras,
+    );
+    expect(plan.clean_approval?.celebrate).toBe(false);
+    expect(plan.summary_markdown).toContain('_No findings._');
+  });
+
+  it('approval_managed is true only when approve_on_clean is set and mode is not dry-run', () => {
+    const managed = planPublication(
+      [],
+      RepoConfigSchema.parse({
+        mode: 'summary-plus-inline',
+        approval: { approve_on_clean: true },
+      }),
+      noPrior,
+    );
+    expect(managed.approval_managed).toBe(true);
+
+    const notManagedDryRun = planPublication(
+      [],
+      RepoConfigSchema.parse({ mode: 'dry-run', approval: { approve_on_clean: true } }),
+      noPrior,
+    );
+    expect(notManagedDryRun.approval_managed).toBe(false);
+
+    const notManagedDisabled = planPublication(
+      [],
+      RepoConfigSchema.parse({ mode: 'summary-plus-inline' }),
+      noPrior,
+    );
+    expect(notManagedDisabled.approval_managed).toBe(false);
+  });
+
+  it('clean_approval.submit_review mirrors approval.approve_on_clean', () => {
+    const extras: PublicationExtras = { clean_review: true };
+    const plan = planPublication(
+      [],
+      RepoConfigSchema.parse({
+        mode: 'summary-plus-inline',
+        approval: { approve_on_clean: true },
+      }),
+      noPrior,
+      undefined,
+      extras,
+    );
+    expect(plan.clean_approval?.submit_review).toBe(true);
+  });
+
+  it('partition invariant still holds on a clean, celebrated review with highlights', () => {
+    const extras: PublicationExtras = { clean_review: true, highlights: [highlight()] };
+    const plan = planPublication([], cleanCfg(), noPrior, undefined, extras);
+    partitionInvariant([], plan);
   });
 });
