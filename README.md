@@ -67,7 +67,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.13.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.13.1`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 Prefer Kamal? An alternative single-host path using Kamal + kamal-proxy (native TLS) with a
 Redis accessory is documented in [docs/deployment-kamal.md](./docs/deployment-kamal.md). The
@@ -188,9 +188,9 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.13.0** — resilient config + Kamal deploy: a `review_guidance`-only schema violation (e.g. `instructions` over the 2,048-byte cap, or more than 5 `context_files`) now degrades to **guidance-only** — the offending guidance block is dropped while `model`, file caps, `path_rules.exclude`, `nickname`, and floors are all honored — instead of silently reverting the entire repo config to defaults. Degradation is never silent: `worker.config.parse_error` is logged with `salvaged: true` and a check-run note names the dropped field. Also adds a coexisting Kamal deployment path alongside the existing flow.
+**v0.13.1** — lossless finding titles: inline review-comment titles are no longer cut mid-word at 120 chars — titles now end at a sentence or word boundary with a visible `…`, whitespace-normalized to a single line, surrogate-pair-safe, and when truncation fires the full provider message is preserved as the first paragraph of the comment body (zero information loss). The shared prompt now instructs all providers (anthropic/openai/copilot) that `message` is a one-line headline (≤ ~100 chars) with detail in `rationale`; whitespace-only messages are rejected (`blank_message`). Fixes the recurring truncated-title reports (#35).
 
-- 801 tests across 52 files, all passing · 15/15 deterministic eval scenarios PASS
+- 819 tests across 52 files, all passing · 15/15 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
