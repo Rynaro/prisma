@@ -79,9 +79,9 @@ Identifiers reused verbatim from Phase 1: `ProviderReviewInput`, `ProviderReview
 ### title
 
 - **Type.** String.
-- **Allowed values / range.** Non-empty string; length cap declared by Phase 4.
+- **Allowed values / range.** Non-empty string; at most `FINDING_TITLE_MAX_LENGTH` (120) characters (`@prisma-bot/shared`).
 - **Required.** Required.
-- **Validation rule (plain English).** Non-empty. Length cap declared by Phase 4.
+- **Validation rule (plain English).** Non-empty, at most 120 characters. The validator derives `title` from the provider's `message`: normalized (whitespace collapsed to single spaces), returned verbatim when it already fits; otherwise the leading sentence is preferred when it is between 30 and 120 characters, and failing that the message is cut at the last word boundary at or before the cap with a trailing `…` (U+2026, counted inside the 120-character budget). When truncation fires, the full trimmed `message` is preserved as the first paragraph of `explanation` so no information is lost.
 - **Audit purpose.** Short rendered headline used in inline comments and Checks summary entries.
 
 ### explanation
@@ -189,7 +189,7 @@ The validator constructs each `NormalizedFinding` from a single `ProviderReviewO
 | `category` | Carried from `ProviderReviewOutput.category`. |
 | `severity` | Carried from `ProviderReviewOutput.severity`. |
 | `confidence` | Carried from `ProviderReviewOutput.confidence`. |
-| `title` | Derived from `ProviderReviewOutput.message`. |
+| `title` | Derived from `ProviderReviewOutput.message`: the headline verbatim when it fits within 120 characters; otherwise the leading sentence (if between 30 and 120 characters) or a word-boundary cut with a trailing `…`. The full message is preserved in `explanation` when truncation fires. |
 | `explanation` | Derived from `ProviderReviewOutput.rationale`. |
 | `suggested_fix` | Carried from `ProviderReviewOutput.suggested_fix` when the provider returns one; otherwise absent. |
 | `evidence` | Added by the validator from the prefiltered diff context. No `ProviderReviewOutput` source. |

@@ -113,6 +113,23 @@ describe('runValidator', () => {
     expect(reject.reason_code).toBe('line_not_in_diff');
   });
 
+  it('rejects a whitespace-only message with reason blank_message (would otherwise yield an empty title)', () => {
+    // `message: z.string().min(1)` admits whitespace-only strings; normalizing
+    // collapses them to '', which must not silently escape as an empty title.
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: '   \n\t ' })],
+    };
+    const result = runValidator(output, ctx(snap));
+    expect(result.findings).toEqual([]);
+    expect(result.rejections).toHaveLength(1);
+    const [reject] = result.rejections;
+    if (reject === undefined) throw new Error('expected one rejection');
+    expect(reject.stage).toBe('validator');
+    expect(reject.reason_code).toBe('blank_message');
+    expect(reject.finding_id).toBeNull();
+  });
+
   it('treats a removed-file path as path_not_in_diff (snapshot drops it from the analyzable set)', () => {
     const snap = snapshot([file({ path: 'src/gone.ts', status: 'removed', hunks: [] })]);
     const output: ProviderReviewOutput = {
@@ -252,8 +269,202 @@ describe('runValidator', () => {
     }
   });
 
-  it('truncates very long messages into a 120-char title', () => {
-    const longMessage = `${'A'.repeat(200)}`;
+  // --- Title derivation (deriveTitle) — AC-001 … AC-009, AC-015 ---
+
+  it('title never exceeds the cap', () => {
+    // AC-001
+    const longMessage = 'A'.repeat(300);
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.title.length).toBeLessThanOrEqual(120);
+  });
+
+  it('short message is unchanged', () => {
+    // AC-002
+    const shortMessage = 'B'.repeat(80);
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: shortMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.title).toBe(shortMessage);
+  });
+
+  it('cuts at a word boundary', () => {
+    // AC-003 — the 120-char prefix of this message ends mid-word ("...alp").
+    const longMessage = Array.from({ length: 20 }, () => 'alphabet').join(' ');
+    expect(longMessage.slice(0, 120).endsWith(' ')).toBe(false);
+    expect(longMessage.slice(119, 120)).not.toBe(' ');
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    const withoutEllipsis = first.title.replace(/…$/, '');
+    expect(longMessage.startsWith(withoutEllipsis)).toBe(true);
+    expect(withoutEllipsis.endsWith(' ')).toBe(false);
+    expect(longMessage.charAt(withoutEllipsis.length)).toBe(' ');
+  });
+
+  it('uses the last space at or before the 120-char boundary, not an earlier one (off-by-one regression)', () => {
+    // Repro: a space sits exactly at index 119 (the last position that still
+    // lets "<word>…" land flush at 120 chars). An earlier, buggy window that
+    // searched only slice(0, 119) would miss it and cut at the first space
+    // instead, wasting most of the budget.
+    const longMessage = `${'A'.repeat(100)} ${'B'.repeat(18)} ${'C'.repeat(50)}`;
+    expect(longMessage.charAt(119)).toBe(' ');
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.title).toBe(`${'A'.repeat(100)} ${'B'.repeat(18)}…`);
+    expect(first.title.length).toBe(120);
+  });
+
+  it('never splits an astral code point (emoji) at the degenerate hard-cut boundary', () => {
+    // No spaces anywhere, so the degenerate hard-cut path fires. The emoji
+    // (a surrogate pair) straddles the raw code-unit cut index.
+    const emoji = '\u{1F600}';
+    const longMessage = `${'A'.repeat(118)}${emoji}${'A'.repeat(50)}`;
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    const unpairedSurrogateRe =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    expect(unpairedSurrogateRe.test(first.title)).toBe(false);
+    expect(first.title.endsWith('…')).toBe(true);
+    expect(first.title.length).toBeLessThanOrEqual(120);
+  });
+
+  it('never splits an astral code point (emoji) at the word-boundary cut', () => {
+    // The emoji is the final character of the word immediately preceding the
+    // space chosen as the cut point.
+    const emoji = '\u{1F600}';
+    const longMessage = `${'A'.repeat(90)} ${'B'.repeat(25)}${emoji} ${'C'.repeat(30)}`;
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    const unpairedSurrogateRe =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    expect(unpairedSurrogateRe.test(first.title)).toBe(false);
+    expect(first.title).toContain(emoji);
+    expect(first.title.endsWith('…')).toBe(true);
+    expect(first.title.length).toBeLessThanOrEqual(120);
+  });
+
+  it('marks truncation with an ellipsis', () => {
+    // AC-004
+    const longMessage = Array.from({ length: 20 }, () => 'alphabet').join(' ');
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.title.endsWith('…')).toBe(true);
+  });
+
+  it('prefers the first sentence', () => {
+    // AC-005 — first sentence is 97 chars (within [30,120]), followed by a
+    // second sentence that pushes the whole message past the cap.
+    const longMessage =
+      'This function does not validate its input parameter properly and could throw at runtime for null. ' +
+      'It might additionally throw if given a negative number as well, causing further problems downstream.';
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.title).toBe(
+      'This function does not validate its input parameter properly and could throw at runtime for null.',
+    );
+    expect(first.title.endsWith('…')).toBe(false);
+  });
+
+  it('preserves the full message in the explanation', () => {
+    // AC-006
+    const longMessage = Array.from({ length: 20 }, () => 'alphabet').join(' ');
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [
+        validProviderFinding({
+          path: 'src/a.ts',
+          line: 11,
+          message: longMessage,
+          rationale: 'Some rationale text.',
+        }),
+      ],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.explanation).toContain(longMessage);
+    expect(first.explanation).toContain('Some rationale text.');
+  });
+
+  it('leaves the explanation untouched when the title fits', () => {
+    // AC-007
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [
+        validProviderFinding({
+          path: 'src/a.ts',
+          line: 11,
+          message: 'Short headline.',
+          rationale: 'Full rationale narrative goes here.',
+        }),
+      ],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.explanation).toBe('Full rationale narrative goes here.');
+  });
+
+  it('renders the title on a single line', () => {
+    // AC-008
+    const message =
+      'Race condition:\n  the counter increments\twithout   locking causing double charges';
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message })],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    expect(first.title).not.toMatch(/\n/);
+    expect(first.title).not.toMatch(/\s{2,}/);
+    expect(first.title).toBe(
+      'Race condition: the counter increments without locking causing double charges',
+    );
+  });
+
+  it('hard-cuts a single oversized token', () => {
+    // AC-009
+    const longMessage = 'A'.repeat(200);
     const snap = snapshot([file({ path: 'src/a.ts' })]);
     const output: ProviderReviewOutput = {
       findings: [validProviderFinding({ path: 'src/a.ts', line: 11, message: longMessage })],
@@ -262,9 +473,56 @@ describe('runValidator', () => {
     const [first] = result.findings;
     if (first === undefined) throw new Error('expected one finding');
     expect(first.title.length).toBe(120);
-    expect(first.title).toBe('A'.repeat(120));
-    // The full provider message is preserved as the explanation source via rationale
-    expect(first.explanation.length).toBeGreaterThan(0);
+    expect(first.title).toBe(`${'A'.repeat(119)}…`);
+  });
+
+  it('dedupe_key is independent of the message', () => {
+    // AC-015
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [
+        validProviderFinding({ path: 'src/a.ts', line: 11, category: 'security', message: 'x' }),
+        validProviderFinding({
+          path: 'src/a.ts',
+          line: 12,
+          category: 'security',
+          message: 'A much, much longer message describing the very same issue in different words',
+        }),
+      ],
+    };
+    const result = runValidator(output, ctx(snap));
+    expect(result.findings).toHaveLength(2);
+    const [a, b] = result.findings;
+    if (a === undefined || b === undefined) throw new Error('expected two findings');
+    expect(a.dedupe_key).toBe(b.dedupe_key);
+  });
+
+  it('regression: production mid-word truncation defect (PR #8647, discussion r3524035352) is fixed', () => {
+    const productionMessage =
+      "Potential bug: The string conversion in the value of `answers` may always return `'true'` or " +
+      "`'false'` rather than the intended value";
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [
+        validProviderFinding({
+          path: 'src/a.ts',
+          line: 11,
+          message: productionMessage,
+          rationale: 'The == operator coerces types; use === and check the actual boolean.',
+        }),
+      ],
+    };
+    const result = runValidator(output, ctx(snap));
+    const [first] = result.findings;
+    if (first === undefined) throw new Error('expected one finding');
+    // The observed production defect: a mid-word cut ending in "...the i" with
+    // no ellipsis. Assert it is not that.
+    expect(first.title).not.toBe(productionMessage.slice(0, 120));
+    expect(first.title.endsWith('the i')).toBe(false);
+    expect(first.title.length).toBeLessThanOrEqual(120);
+    expect(first.title.endsWith('…')).toBe(true);
+    // The full sentence survives, unabridged, in the explanation.
+    expect(first.explanation).toContain(productionMessage);
   });
 
   it('records line_start === line_end for single-line findings', () => {

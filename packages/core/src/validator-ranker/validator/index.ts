@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  FINDING_TITLE_MAX_LENGTH,
   type NormalizedFinding,
   type PrSnapshot,
   type ProviderReviewOutput,
@@ -104,7 +105,100 @@ const buildEvidence = (path: string, hunkId: string, line: number): string[] => 
   `hunk:${hunkId}`,
 ];
 
-const truncateTitle = (msg: string): string => (msg.length <= 120 ? msg : msg.slice(0, 120));
+interface DerivedTitle {
+  title: string;
+  truncated: boolean;
+}
+
+/** Ellipsis glyph — U+2026, exactly one character, counted inside the budget. */
+const ELLIPSIS = '…';
+
+/** First-sentence floor: below this, abbreviation-truncated stubs (`e.g.`) are rejected. */
+const MIN_SENTENCE_LENGTH = 30;
+
+/**
+ * Match the leading sentence: text up to the first `.`, `!` or `?` that is
+ * itself followed by whitespace or end-of-string. A lookahead (rather than a
+ * consuming match) keeps the trailing separator out of the captured sentence.
+ * Mid-word punctuation (`e.g.`, `Node.js`) is never followed by whitespace or
+ * end-of-string, so it never matches here.
+ */
+const LEADING_SENTENCE_RE = /^(.+?[.!?])(?=\s|$)/;
+
+/** Trim + collapse every whitespace run (incl. newlines) to a single space. */
+const normalizeMessage = (message: string): string => message.trim().replace(/\s+/g, ' ');
+
+/**
+ * Returns `str` unchanged unless its last UTF-16 code unit is a lone high
+ * surrogate (0xD800–0xDBFF), in which case that trailing unit is dropped.
+ *
+ * Every raw, length-based cut below (`slice(0, n)`) operates on UTF-16 code
+ * units, not code points; an astral character (e.g. an emoji) is encoded as
+ * a high+low surrogate pair, and a cut that lands between the two halves
+ * leaves a lone high surrogate that GitHub renders as `�`. Word-boundary
+ * cuts (which stop just before a plain space — always a single code unit,
+ * never half of a pair) cannot themselves straddle a pair in well-formed
+ * input, but the degenerate hard-cut path slices at a raw index and needs
+ * this guard. Applied unconditionally at every cut site as cheap defense in
+ * depth. Pure, O(1) beyond the slice itself.
+ */
+const dropDanglingHighSurrogate = (str: string): string => {
+  const lastCode = str.charCodeAt(str.length - 1);
+  return lastCode >= 0xd800 && lastCode <= 0xdbff ? str.slice(0, -1) : str;
+};
+
+/**
+ * Graceful, lossless title derivation — replaces the old hard mid-word slice.
+ *
+ * 1. Normalize: trim, then collapse every whitespace run (incl. newlines) to
+ *    a single space, so the rendered bold title never breaks mid-line.
+ * 2. Fits: normalized length within the cap → return verbatim, untruncated.
+ * 3. Sentence preference: if the leading sentence is within
+ *    [MIN_SENTENCE_LENGTH, FINDING_TITLE_MAX_LENGTH], prefer it. No ellipsis
+ *    is appended — the returned text is a genuine complete sentence, not a
+ *    truncation artifact — but `truncated` is still reported `true` so the
+ *    explanation-prepend (no-information-loss mechanism) still fires.
+ * 4/5. Word boundary (or, absent any space in the 120-character window, a
+ *    degenerate hard cut): cut at the last space at or before
+ *    `FINDING_TITLE_MAX_LENGTH - 1` (i.e. anywhere in the first
+ *    `FINDING_TITLE_MAX_LENGTH` characters) and append the ellipsis; absent
+ *    any such space, hard-cut at `FINDING_TITLE_MAX_LENGTH - 1` characters
+ *    instead, reserving one character of the budget for the ellipsis.
+ *
+ * Post-condition: `title.length <= FINDING_TITLE_MAX_LENGTH` always; the
+ * ellipsis is present iff the title was cut mid-message (word boundary or
+ * degenerate hard cut) — never when the first-sentence path is taken.
+ */
+const deriveTitle = (message: string): DerivedTitle => {
+  const normalized = normalizeMessage(message);
+
+  if (normalized.length <= FINDING_TITLE_MAX_LENGTH) {
+    return { title: normalized, truncated: false };
+  }
+
+  const sentenceMatch = normalized.match(LEADING_SENTENCE_RE);
+  const sentence = sentenceMatch?.[1];
+  if (
+    sentence !== undefined &&
+    sentence.length >= MIN_SENTENCE_LENGTH &&
+    sentence.length <= FINDING_TITLE_MAX_LENGTH
+  ) {
+    return { title: sentence, truncated: true };
+  }
+
+  // Search the full 120-character window (indices 0..FINDING_TITLE_MAX_LENGTH-1)
+  // for the last space, so a space sitting exactly at the final index is not
+  // missed (an off-by-one there would forfeit the last few characters of
+  // budget for no reason — see the regression test below).
+  const searchWindow = normalized.slice(0, FINDING_TITLE_MAX_LENGTH);
+  const lastSpace = searchWindow.lastIndexOf(' ');
+  const rawCut =
+    lastSpace === -1
+      ? normalized.slice(0, FINDING_TITLE_MAX_LENGTH - 1)
+      : normalized.slice(0, lastSpace);
+  const cut = dropDanglingHighSurrogate(rawCut);
+  return { title: `${cut}${ELLIPSIS}`, truncated: true };
+};
 
 const excerptFor = (value: unknown): string => {
   try {
@@ -191,9 +285,33 @@ export const runValidator = (
       continue;
     }
 
+    // `message: z.string().min(1)` admits whitespace-only strings (e.g. "   ").
+    // Normalizing collapses those to '', which would otherwise silently
+    // produce a NormalizedFinding with an empty title — reject explicitly
+    // instead, per `NormalizedFindingSchema.title.min(1)`.
+    if (normalizeMessage(providerFinding.message).length === 0) {
+      rejections.push({
+        finding_id: null,
+        stage: 'validator',
+        reason_code: 'blank_message',
+        reason_message:
+          'provider message is blank (whitespace-only) and normalizes to an empty title',
+        provider_output_excerpt: excerptFor(providerFinding),
+        timestamp: ctx.ran_at,
+      });
+      continue;
+    }
+
     const id = ctx.generateId ? ctx.generateId() : `${ctx.run_id}:${index}`;
     const evidence = buildEvidence(providerFinding.path, hunk.id, providerFinding.line);
     const dedupe_key = computeDedupeKey(providerFinding.path, providerFinding.category);
+    const { title, truncated } = deriveTitle(providerFinding.message);
+    // No-information-loss mechanism (H-A, spec § Approach — Layer B): when the
+    // rendered title is truncated, prepend the full trimmed provider message as
+    // the first paragraph of `explanation` so nothing the model wrote is lost.
+    const explanation = truncated
+      ? `${providerFinding.message.trim()}\n\n${providerFinding.rationale}`
+      : providerFinding.rationale;
     const finding: NormalizedFinding = {
       id,
       path: providerFinding.path,
@@ -202,14 +320,17 @@ export const runValidator = (
       category: providerFinding.category,
       severity: providerFinding.severity,
       confidence: providerFinding.confidence,
-      title: truncateTitle(providerFinding.message),
-      explanation: providerFinding.rationale,
+      title,
+      explanation,
       evidence,
       render_target: 'inline',
       source_artifacts_used: ['pr_diff'],
       dedupe_key,
       ...(providerFinding.suggested_fix !== undefined
         ? { suggested_fix: providerFinding.suggested_fix }
+        : {}),
+      ...(truncated
+        ? { validator_notes: ['title truncated: full message preserved in explanation'] }
         : {}),
     };
     findings.push(finding);

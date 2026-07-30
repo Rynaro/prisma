@@ -28,6 +28,14 @@ export const RenderTargetSchema = z.enum(['inline', 'summary', 'dropped']);
 export type RenderTarget = z.infer<typeof RenderTargetSchema>;
 
 /**
+ * Hard cap on `NormalizedFinding.title` length, in characters. The single
+ * source of truth for the 120-character rendered-headline budget: the core
+ * validator's `deriveTitle` imports this constant rather than hardcoding 120
+ * a second time. See `docs/review-findings-schema.md` § title.
+ */
+export const FINDING_TITLE_MAX_LENGTH = 120;
+
+/**
  * `NormalizedFinding` — the validator's output. 15 fields per docs/review-findings-schema.md
  * § Field reference, field-by-field. Required/optional and ranges match the spec exactly.
  */
@@ -40,7 +48,7 @@ export const NormalizedFindingSchema = z
     category: CategorySchema,
     severity: SeveritySchema,
     confidence: z.number().min(0).max(1),
-    title: z.string().min(1),
+    title: z.string().min(1).max(FINDING_TITLE_MAX_LENGTH),
     explanation: z.string().min(1),
     suggested_fix: z.string().min(1).optional(),
     evidence: z.array(z.string().min(1)).min(1),
