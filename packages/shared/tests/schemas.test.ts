@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { parseCommand, parseMentionCandidate, requiresWrite } from '../src/commands/parse.js';
 import {
   DEFAULT_REPO_CONFIG,
+  FINDING_TITLE_MAX_LENGTH,
   GenerationSchema,
   JobPayloadSchema,
   MAX_CONTEXT_FILES,
@@ -93,6 +94,22 @@ describe('@prisma-bot/shared schemas', () => {
       const result = NormalizedFindingSchema.safeParse({
         ...validNormalizedFinding,
         render_target: 'silenced',
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('accepts a title exactly at FINDING_TITLE_MAX_LENGTH', () => {
+      const result = NormalizedFindingSchema.safeParse({
+        ...validNormalizedFinding,
+        title: 'x'.repeat(FINDING_TITLE_MAX_LENGTH),
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects a title exceeding FINDING_TITLE_MAX_LENGTH', () => {
+      const result = NormalizedFindingSchema.safeParse({
+        ...validNormalizedFinding,
+        title: 'x'.repeat(FINDING_TITLE_MAX_LENGTH + 1),
       });
       expect(result.success).toBe(false);
     });
