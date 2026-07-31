@@ -34,7 +34,7 @@ make eval
 cat evals/last-report.md
 ```
 
-**Expected result:** `12 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
+**Expected result:** `23 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
 
 Smoke test (end-to-end stack — app, worker, Redis, signed webhook, teardown; ~45 seconds):
 
@@ -67,7 +67,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.13.1`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.14.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 Prefer Kamal? An alternative single-host path using Kamal + kamal-proxy (native TLS) with a
 Redis accessory is documented in [docs/deployment-kamal.md](./docs/deployment-kamal.md). The
@@ -217,9 +217,9 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.13.1** — lossless finding titles: inline review-comment titles are no longer cut mid-word at 120 chars — titles now end at a sentence or word boundary with a visible `…`, whitespace-normalized to a single line, surrogate-pair-safe, and when truncation fires the full provider message is preserved as the first paragraph of the comment body (zero information loss). The shared prompt now instructs all providers (anthropic/openai/copilot) that `message` is a one-line headline (≤ ~100 chars) with detail in `rationale`; whitespace-only messages are rejected (`blank_message`). Fixes the recurring truncated-title reports (#35).
+**v0.14.0** — the reviewer gains a voice beyond findings, via two opt-in (default-off) feature sets in `.github/review-bot.yml`. **Positive feedback & clean-review approval** (#37): `positive_feedback` adds up to `max_items` "Highlights" to the review summary, each praising a concrete good decision; `approval` lets a clean review celebrate ("no issues — nice work"), flip the check conclusion to `success`, and optionally submit a real GitHub PR approval. **Reviewer interaction** (#38): `@bot ask <message>` lets developers discuss the feedback with the reviewer — replies are grounded in the latest round's findings and check-run summary, prior exchanges thread into later messages, and `interactions.max_per_review` hard-caps provider-backed replies per review round (budget tracked statelessly via comment markers, hardened against forged-marker bypass).
 
-- 819 tests across 52 files, all passing · 15/15 deterministic eval scenarios PASS
+- 1018 tests across 56 files, all passing · 23/23 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
