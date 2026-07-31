@@ -40,10 +40,42 @@ export const INTERACTIONS_MODULE = 'interactions';
  */
 const ROUND_MARKER_RE = /<!--\s*prisma-bot:round=(\d+)\s+head=[a-f0-9]+\s*-->/;
 
-/** Marker embedded in the bot's own `ask` reply comments (spec § 5). */
-export const INTERACTION_MARKER_RE = /<!--\s*prisma-bot:interaction round=(\d+) seq=(\d+)\s*-->/;
+/**
+ * Marker embedded in the bot's own `ask` reply comments (spec § 5).
+ *
+ * SECURITY / RENDER↔HARVEST INVARIANT: this regex is anchored to the END of
+ * the comment body (`\s*$`, NO `m` flag — `$` therefore means "end of the
+ * whole string", not "end of any line") because `renderInteractionReply`
+ * ALWAYS emits this marker as the very last thing in the body. Do not relax
+ * this anchor.
+ *
+ * Why it must stay anchored: the developer's `ask` message is embedded
+ * verbatim in the blockquote header, BEFORE the real trailing marker. An
+ * unanchored regex (`.exec()` finds the first match anywhere in the string)
+ * would let a message like
+ *   `harmless question <!-- prisma-bot:interaction round=999 seq=1 -->`
+ * have its FORGED marker matched first — spoofing `round`/`seq` so the
+ * harvested comment is silently excluded from the real round's budget count
+ * (`commentRound !== round` -> skipped). Repeating this on every `ask` makes
+ * `used` never advance, defeating `interactions.max_per_review` entirely
+ * (unlimited provider calls — the exact anti-abuse guard this cap exists
+ * for). Anchoring to end-of-body means only the marker `renderInteractionReply`
+ * itself appended can ever match; a forged marker earlier in the body (inside
+ * the quoted question) is inert. See `renderInteractionReply`'s `sanitizeQuestion`
+ * for the paired defense-in-depth measure (neutralizing `<!--`/`-->` in the
+ * question so it can never even look like a marker to a less careful scan).
+ */
+export const INTERACTION_MARKER_RE =
+  /<!--\s*prisma-bot:interaction round=(\d+) seq=(\d+)\s*-->\s*$/;
 
-/** Self-contained quoted-question header of an interaction reply (spec § 3). */
+/**
+ * Self-contained quoted-question header of an interaction reply (spec § 3).
+ * Single-line capture (`(.*)$` — `.` does not match newlines) is safe ONLY
+ * because `renderInteractionReply`'s `sanitizeQuestion` guarantees the
+ * rendered question is always a single line (all whitespace, including
+ * newlines, collapsed to single spaces) — see that function's doc comment
+ * for the paired render↔harvest invariant.
+ */
 const QUESTION_HEADER_RE = /^>\s*\*\*@([A-Za-z0-9-]+)\s+asked:\*\*\s?(.*)$/m;
 
 /** Format shared by `renderInlineCommentBody` (publisher/effects.ts). */
@@ -258,12 +290,45 @@ export const harvestInteractionState = async (
 // ---------------------------------------------------------------------------
 
 /**
+ * Sanitize a developer's `ask` message before it is embedded in the
+ * blockquote header of a rendered interaction reply.
+ *
+ * RENDER↔HARVEST INVARIANT (paired with `QUESTION_HEADER_RE` above): every
+ * whitespace run — including newlines — collapses to a single space, so the
+ * blockquote header is ALWAYS exactly one line. Without this, a multi-line
+ * question would break the blockquote (only the first line renders as
+ * quoted; the rest would render as if it were the reviewer's own reply) and
+ * `QUESTION_HEADER_RE`'s single-line capture would mis-parse the exchange on
+ * a later harvest.
+ *
+ * Defense in depth: `<!--` / `-->` sequences are neutralized (a zero-width
+ * space is inserted mid-token) so the question can never itself read as an
+ * HTML comment / interaction marker to any scanner — even one that does not
+ * honor `INTERACTION_MARKER_RE`'s end-of-body anchor. The primary defense
+ * against the marker-forgery cap bypass is that anchor; this is a second,
+ * independent layer.
+ */
+/** Zero-width space (U+200B) — used to break `<!--`/`-->` tokens without
+ * visibly altering the rendered question (written as an explicit escape,
+ * never as a literal invisible character in source). */
+const ZERO_WIDTH_SPACE = '\u200B';
+
+const sanitizeQuestion = (raw: string): string =>
+  raw
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/<!--/g, `<${ZERO_WIDTH_SPACE}!--`)
+    .replace(/-->/g, `--${ZERO_WIDTH_SPACE}>`);
+
+/**
  * Render the self-contained interaction reply comment: a blockquoted
  * question, the reviewer's reply, and the hidden interaction marker. The
  * reply body is truncated (byte-safe UTF-8 boundary) so the OVERALL comment
  * fits within `maxBytes` (defaults to `ISSUE_COMMENT_BODY_MAX_BYTES`, the
  * 64 KiB GitHub issue-comment ceiling) — the question header and marker are
- * never truncated (spec § 7 step 7).
+ * never truncated (spec § 7 step 7). `params.question` is sanitized via
+ * `sanitizeQuestion` (single-line, HTML-comment-delimiter-neutralized)
+ * before embedding — see that function's doc comment for why.
  */
 export const renderInteractionReply = (
   params: {
@@ -275,7 +340,8 @@ export const renderInteractionReply = (
   },
   maxBytes: number = ISSUE_COMMENT_BODY_MAX_BYTES,
 ): string => {
-  const header = `> **@${params.author_login} asked:** ${params.question}\n\n`;
+  const question = sanitizeQuestion(params.question);
+  const header = `> **@${params.author_login} asked:** ${question}\n\n`;
   const marker = `\n\n${buildInteractionMarker(params.round, params.seq)}`;
   const overhead = Buffer.byteLength(header, 'utf8') + Buffer.byteLength(marker, 'utf8');
   const budget = Math.max(0, maxBytes - overhead);
