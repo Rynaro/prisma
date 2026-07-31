@@ -1,6 +1,8 @@
 import type {
   ProviderCapabilities,
   ProviderError,
+  ProviderRespondInput,
+  ProviderRespondOutput,
   ProviderReviewInput,
   ProviderReviewOutput,
 } from './provider.js';
@@ -8,8 +10,15 @@ import type {
 /**
  * `Provider` — the single interface every model adapter implements.
  *
- * Per ADR-002 § Decision and api-contracts.md § Provider adapter contract:
- *   - `review(input)` is the only entry point used by the pipeline.
+ * Per ADR-002 § Decision (as amended by the reviewer-interaction spec §6) and
+ * api-contracts.md § Provider adapter contract:
+ *   - `review(input)` is the pipeline's review entry point.
+ *   - `respond(input)` is the reviewer-interaction entry point (`@bot ask
+ *     <message>`) — a second MANDATORY method, chosen over a
+ *     capability-gated optional method because every adapter can produce
+ *     plain markdown and a mandatory method keeps the pipeline free of
+ *     runtime capability branching. See ADR-002 § Amendment (reviewer
+ *     interaction) and docs/_planning/reviewer-interaction/spec.md § 6.
  *   - `capabilities` is a typed bag the pipeline reads (it does not
  *     rediscover capabilities at call time).
  *   - On failure, adapters throw `ProviderErrorThrowable` (instance of `Error`)
@@ -28,6 +37,7 @@ export interface Provider {
   readonly name: string;
   readonly capabilities: ProviderCapabilities;
   review(input: ProviderReviewInput): Promise<ProviderReviewOutput>;
+  respond(input: ProviderRespondInput): Promise<ProviderRespondOutput>;
 }
 
 export type { ProviderError };

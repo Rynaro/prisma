@@ -4,12 +4,15 @@ import {
   DEFAULT_REPO_CONFIG,
   FINDING_TITLE_MAX_LENGTH,
   GenerationSchema,
+  InteractionsSchema,
   JobPayloadSchema,
   MAX_CONTEXT_FILES,
   MAX_INSTRUCTION_BLOCK_BYTES,
   MAX_PATH_INSTRUCTIONS,
   NormalizedFindingSchema,
   ProviderOptionsSchema,
+  ProviderRespondInputSchema,
+  ProviderRespondOutputSchema,
   ProviderReviewInputSchema,
   ProviderReviewOutputHighlightSchema,
   ProviderReviewOutputSchema,
@@ -727,6 +730,37 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
       expect(cmd.kind).toBe('help');
       expect((cmd as { unknown?: boolean }).unknown).toBe(false);
     });
+
+    // --- `ask <message>` (reviewer-interaction spec § 7) ---
+
+    it.each([
+      ['ask why is this risky?', 'why is this risky?'],
+      ['ASK why is this risky?', 'why is this risky?'],
+      ['Ask why is this risky?', 'why is this risky?'],
+      ['  ask   why is finding 2 wrong  ', 'why is finding 2 wrong'],
+    ])('parses "%s" → kind=ask, message=%s', (rest, message) => {
+      const cmd = parseCommand(rest);
+      expect(cmd.kind).toBe('ask');
+      if (cmd.kind === 'ask') {
+        expect(cmd.message).toBe(message);
+      }
+    });
+
+    it('preserves the original casing of the message (never lowercased)', () => {
+      const cmd = parseCommand('ask Why Is This A Security Risk?');
+      expect(cmd).toEqual({ kind: 'ask', message: 'Why Is This A Security Risk?' });
+    });
+
+    it.each([['ask'], ['ask   '], ['ASK'], ['  ask  ']])(
+      'empty message after "ask" ("%s") → help with unknown:true',
+      (rest) => {
+        expect(parseCommand(rest)).toEqual({ kind: 'help', unknown: true });
+      },
+    );
+
+    it('"askfoo" (no separating whitespace) is NOT treated as ask — falls through to unknown', () => {
+      expect(parseCommand('askfoo bar')).toEqual({ kind: 'help', unknown: true });
+    });
   });
 
   describe('requiresWrite', () => {
@@ -735,6 +769,7 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
       expect(requiresWrite({ kind: 'full_review' })).toBe(false);
       expect(requiresWrite({ kind: 'help', unknown: false })).toBe(false);
       expect(requiresWrite({ kind: 'configuration' })).toBe(false);
+      expect(requiresWrite({ kind: 'ask', message: 'why?' })).toBe(false);
     });
   });
 
@@ -1029,6 +1064,49 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
     });
   });
 
+  // ── Reviewer interaction (`@bot ask <message>`) config ─────────────────────
+
+  describe('interactions config', () => {
+    it('defaults to disabled with max_per_review=3', () => {
+      expect(DEFAULT_REPO_CONFIG.interactions).toEqual({ enabled: false, max_per_review: 3 });
+    });
+
+    it('InteractionsSchema.parse(undefined) yields the same defaults', () => {
+      expect(InteractionsSchema.parse(undefined)).toEqual({ enabled: false, max_per_review: 3 });
+    });
+
+    it('accepts a fully-specified interactions block', () => {
+      const result = RepoConfigSchema.safeParse({
+        interactions: { enabled: true, max_per_review: 10 },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.interactions).toEqual({ enabled: true, max_per_review: 10 });
+      }
+    });
+
+    it('rejects max_per_review below 1', () => {
+      const result = RepoConfigSchema.safeParse({
+        interactions: { enabled: true, max_per_review: 0 },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects max_per_review above 25', () => {
+      const result = RepoConfigSchema.safeParse({
+        interactions: { enabled: true, max_per_review: 26 },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects unknown keys in interactions block (strict)', () => {
+      const result = RepoConfigSchema.safeParse({
+        interactions: { enabled: true, unknown_key: 'nope' },
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
   describe('ProviderReviewOutput highlights', () => {
     it('accepts an optional highlights array', () => {
       const result = ProviderReviewOutputSchema.safeParse({
@@ -1097,6 +1175,105 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
         positive_feedback: { max_items: 6 },
       });
       expect(result.success).toBe(false);
+    });
+  });
+
+  // ── Reviewer interaction (`@bot ask <message>`) provider contract ──────────
+
+  describe('ProviderRespondInput / ProviderRespondOutput', () => {
+    const validRespondInput = {
+      pr: {
+        title: 'Fix payment race condition',
+        description: 'Guards the charge handler with a mutex.',
+        base_ref: 'main',
+        head_ref: 'fix/payment-race',
+        head_sha: 'deadbeefcafef00d',
+      },
+      review_context: {
+        round: 2,
+        summary_markdown: 'Round 2 · 1 still open',
+        findings: [
+          {
+            file: 'src/payments/charge.ts',
+            line: 142,
+            severity: 'high' as const,
+            category: 'security' as const,
+            title: 'Unbounded user input passed into SQL builder',
+            body: 'The string in req.body.query is interpolated into the SQL builder.',
+          },
+        ],
+      },
+      thread: [],
+      message: { author_login: 'alice', text: 'why is finding 2 a security risk?' },
+    };
+
+    it('accepts a minimal valid input', () => {
+      const result = ProviderRespondInputSchema.safeParse(validRespondInput);
+      expect(result.success).toBe(true);
+    });
+
+    it('accepts an input with thread exchanges and optional guidance/generation', () => {
+      const result = ProviderRespondInputSchema.safeParse({
+        ...validRespondInput,
+        thread: [
+          {
+            author_login: 'alice',
+            question: 'first question',
+            reply_markdown: 'first reply',
+          },
+        ],
+        guidance: 'Prefer functional style.',
+        generation: { temperature: 0.2 },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.thread).toHaveLength(1);
+      }
+    });
+
+    it('rejects unknown top-level keys (strict)', () => {
+      const result = ProviderRespondInputSchema.safeParse({
+        ...validRespondInput,
+        unknown_key: 'nope',
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a finding using `path` instead of `file`', () => {
+      const result = ProviderRespondInputSchema.safeParse({
+        ...validRespondInput,
+        review_context: {
+          ...validRespondInput.review_context,
+          findings: [
+            { ...validRespondInput.review_context.findings[0], path: 'x', file: undefined },
+          ],
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects more than MAX_RESPOND_THREAD_EXCHANGES (10) thread entries', () => {
+      const thread = Array.from({ length: 11 }, (_, i) => ({
+        author_login: 'alice',
+        question: `q${i}`,
+        reply_markdown: `r${i}`,
+      }));
+      const result = ProviderRespondInputSchema.safeParse({ ...validRespondInput, thread });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects an empty message.text', () => {
+      const result = ProviderRespondInputSchema.safeParse({
+        ...validRespondInput,
+        message: { author_login: 'alice', text: '' },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('ProviderRespondOutputSchema requires a non-empty reply_markdown', () => {
+      expect(ProviderRespondOutputSchema.safeParse({ reply_markdown: 'ok' }).success).toBe(true);
+      expect(ProviderRespondOutputSchema.safeParse({ reply_markdown: '' }).success).toBe(false);
+      expect(ProviderRespondOutputSchema.safeParse({}).success).toBe(false);
     });
   });
 });

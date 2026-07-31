@@ -85,20 +85,39 @@ export const parseMentionCandidate = (body: string): MentionCandidateResult | nu
 
 /**
  * V1 command vocabulary (closed discriminated union).
+ *
+ * `ask` (reviewer-interaction spec § 7): first token `ask`, case-insensitive;
+ * the remainder is the developer's message, ORIGINAL casing preserved
+ * (leading/trailing whitespace trimmed only) — unlike the other commands, the
+ * message is free text handed to the provider verbatim, so we never
+ * lowercase or collapse internal whitespace. Empty remainder degrades to
+ * `{ kind: 'help', unknown: true }` per spec § 3.
  */
 export type Command =
   | { kind: 'review' }
   | { kind: 'full_review' }
   | { kind: 'help'; unknown: boolean }
-  | { kind: 'configuration' };
+  | { kind: 'configuration' }
+  | { kind: 'ask'; message: string };
+
+/**
+ * Matches a leading `ask` token (case-insensitive) followed by either
+ * end-of-string or whitespace + the free-text message. Anchored at both ends
+ * so `askfoo` (no separating whitespace) does NOT match — it falls through
+ * to the unknown-command path like any other unrecognised token.
+ */
+const ASK_COMMAND_RE = /^ask(?:\s+([\s\S]*))?$/i;
 
 /**
  * Map the text remainder after the `@<mention>` token to a v1 `Command`.
- * Comparison is case-insensitive and whitespace-normalized.
+ * Comparison is case-insensitive and whitespace-normalized for the closed
+ * vocabulary (`review` / `full review` / `help` / `configuration`); `ask`
+ * additionally captures the free-text message with its original casing.
  * Unknown or empty input → `{ kind: 'help', unknown: true }` (graceful degradation).
  */
 export const parseCommand = (rest: string): Command => {
-  const normalized = rest.trim().toLowerCase().replace(/\s+/g, ' ');
+  const trimmed = rest.trim();
+  const normalized = trimmed.toLowerCase().replace(/\s+/g, ' ');
 
   if (normalized === 'review') {
     return { kind: 'review' };
@@ -111,6 +130,15 @@ export const parseCommand = (rest: string): Command => {
   }
   if (normalized === 'configuration' || normalized === 'config') {
     return { kind: 'configuration' };
+  }
+
+  const askMatch = ASK_COMMAND_RE.exec(trimmed);
+  if (askMatch !== null) {
+    const message = (askMatch[1] ?? '').trim();
+    if (message.length === 0) {
+      return { kind: 'help', unknown: true };
+    }
+    return { kind: 'ask', message };
   }
 
   // Unknown or empty → help with unknown flag set.
