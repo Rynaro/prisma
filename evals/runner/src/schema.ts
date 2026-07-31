@@ -65,6 +65,13 @@ const PullsGetDataSchema = z
         ref: z.string().min(1),
       })
       .strict(),
+    /**
+     * PR title/description. Defaulted so existing fixtures that predate the
+     * reviewer-interaction feature (docs/_planning/reviewer-interaction/spec.md
+     * § 6, `RespondPrMeta`) keep parsing unchanged.
+     */
+    title: z.string().min(1).default('Evaluated PR'),
+    body: z.string().nullable().default(null),
   })
   .strict();
 export type PullsGetData = z.infer<typeof PullsGetDataSchema>;
@@ -117,6 +124,20 @@ const PriorCheckRunSchema = z
   .strict();
 
 /**
+ * A pre-existing bot-authored issue/PR conversation comment to replay from
+ * `issues.listComments`. Used by reviewer-interaction (`ask`) scenarios to
+ * simulate prior `@bot ask` reply comments (interaction markers) so the
+ * budget/thread harvest (`packages/github/src/interactions`) has something
+ * to observe. Per docs/_planning/reviewer-interaction/spec.md § 8.
+ */
+const PriorIssueCommentSchema = z
+  .object({
+    id: z.number().int().nonnegative(),
+    body: z.string(),
+  })
+  .strict();
+
+/**
  * A pre-existing PR review to replay from `pulls.listReviews` (S8). Used by
  * the `approve-on-clean-idempotent` scenario to simulate an already-approved
  * PR: `findOurApproval` must observe this entry and skip a redundant
@@ -160,6 +181,8 @@ export const ScenarioOctokitResponsesSchema = z
     repos_get_content: ReposGetContentMapSchema.optional(),
     /** Pre-existing PR reviews to replay from `pulls.listReviews` (S8). */
     prior_reviews: z.array(PriorReviewSchema).optional(),
+    /** Pre-existing bot-authored issue comments to replay from `issues.listComments`. */
+    prior_issue_comments: z.array(PriorIssueCommentSchema).optional(),
   })
   .strict();
 
@@ -327,6 +350,36 @@ const FROZEN_METRIC_IDS = [
 export const MetricIdSchema = z.enum(FROZEN_METRIC_IDS);
 export type MetricId = z.infer<typeof MetricIdSchema>;
 
+/**
+ * `ask_request` / `ask_expectations` — reviewer-interaction (`@bot ask
+ * <message>`) scenario extension. Present ONLY on interaction scenarios; the
+ * runner (`cli.ts`) branches to `runAskForFixture` + `evaluateAskExpectations`
+ * when `ask_request` is set, instead of the review-pipeline runner. The
+ * review-pipeline fields (`provider_script`, most of `expectations`) are
+ * still required by the schema for these fixtures but are UNUSED — kept as
+ * harmless placeholders so the schema stays a single, additive surface
+ * rather than a discriminated union (lower risk of breaking the 20+
+ * pre-existing review-pipeline fixtures).
+ * Per docs/_planning/reviewer-interaction/spec.md § 8.
+ */
+export const AskRequestSchema = z
+  .object({
+    commenter_login: z.string().min(1),
+    message: z.string().min(1),
+  })
+  .strict();
+export type AskRequest = z.infer<typeof AskRequestSchema>;
+
+export const AskExpectationsSchema = z
+  .object({
+    kind: z.enum(['disabled', 'no_round', 'cap_exceeded', 'replied']),
+    reply_contains: z.array(z.string().min(1)).default([]),
+    reply_not_contains: z.array(z.string().min(1)).default([]),
+    provider_calls: z.number().int().nonnegative(),
+  })
+  .strict();
+export type AskExpectations = z.infer<typeof AskExpectationsSchema>;
+
 export const ScenarioFixtureSchema = z
   .object({
     id: z.string().min(1),
@@ -338,6 +391,11 @@ export const ScenarioFixtureSchema = z
     provider_script: z.array(ProviderScriptStepSchema),
     expectations: ScenarioExpectationsSchema,
     metrics: z.array(MetricIdSchema).min(1),
+    /** Present only on reviewer-interaction (`ask`) scenarios. */
+    ask_request: AskRequestSchema.optional(),
+    /** Required alongside `ask_request`; validated by the loader (not zod) so
+     * the error message names the scenario id. */
+    ask_expectations: AskExpectationsSchema.optional(),
   })
   .strict();
 

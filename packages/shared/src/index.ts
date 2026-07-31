@@ -3,6 +3,7 @@ export const SHARED_PACKAGE_NAME = '@prisma-bot/shared';
 export * from './audit-log/index.js';
 export * from './schemas/index.js';
 export * from './prompt/review-prompt.js';
+export * from './prompt/respond-prompt.js';
 export * from './commands/parse.js';
 export * from './model-slug.js';
 export * from './tokens/estimator.js';

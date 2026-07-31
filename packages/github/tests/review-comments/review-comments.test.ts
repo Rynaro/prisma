@@ -26,7 +26,13 @@ const buildFake = (): FakeOctokit => {
   fake.rest = {
     pulls: {
       get: async () => ({
-        data: { number: 1, head: { sha: 'a', ref: 'm' }, base: { sha: 'b', ref: 'm' } },
+        data: {
+          number: 1,
+          head: { sha: 'a', ref: 'm' },
+          base: { sha: 'b', ref: 'm' },
+          title: 'test PR',
+          body: null,
+        },
       }),
       listFiles: async () => ({ data: [] }),
     },
@@ -71,6 +77,7 @@ const buildFake = (): FakeOctokit => {
     issues: {
       createComment: async () => ({ data: { id: 1, body: null, user: null } }),
       getComment: async () => ({ data: { id: 1, body: null, user: null } }),
+      listComments: async () => ({ data: [] }),
     },
     reactions: {
       createForIssueComment: async () => ({ data: { id: 1 } }),

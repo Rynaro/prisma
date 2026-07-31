@@ -31,8 +31,24 @@ export interface CopilotChatCompletionsArgs {
   max_tokens: number;
 }
 
+/**
+ * `CopilotTextCompletionArgs` — the wire shape for a plain-text (no tools)
+ * `/chat/completions` request, used by `respond()` (reviewer-interaction,
+ * `@bot ask <message>`). Mirrors `CopilotChatCompletionsArgs` minus the
+ * `tools`/`tool_choice` fields.
+ */
+export interface CopilotTextCompletionArgs {
+  model: string;
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+  max_tokens: number;
+  seed?: number;
+  temperature?: number;
+  top_p?: number;
+}
+
 export interface CopilotClient {
   chatCompletions(args: CopilotChatCompletionsArgs): Promise<unknown>;
+  textCompletion(args: CopilotTextCompletionArgs): Promise<unknown>;
 }
 
 const DEFAULT_BASE_URL = 'https://models.github.ai/inference';
@@ -52,78 +68,95 @@ function headersToRecord(headers: Headers): Record<string, string> {
   return out;
 }
 
+/**
+ * Shared POST-and-error-mapping logic for both `chatCompletions` and
+ * `textCompletion` (mirrors the OpenAI client's `postChatCompletion` — the
+ * two GitHub Models wire calls only differ in request body shape).
+ */
+async function postChatCompletion(
+  url: string,
+  apiKey: string,
+  timeoutMs: number | undefined,
+  body: unknown,
+): Promise<unknown> {
+  const controller = timeoutMs !== undefined ? new AbortController() : undefined;
+  const timeoutHandle =
+    controller !== undefined && timeoutMs !== undefined
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : undefined;
+
+  const init: RequestInit = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  };
+  if (controller !== undefined) {
+    init.signal = controller.signal;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  if (!response.ok) {
+    let errorPayload: unknown;
+    try {
+      errorPayload = await response.json();
+    } catch {
+      try {
+        errorPayload = { message: await response.text() };
+      } catch {
+        errorPayload = { message: `HTTP ${response.status}` };
+      }
+    }
+    const payload =
+      typeof errorPayload === 'object' && errorPayload !== null
+        ? (errorPayload as Record<string, unknown>)
+        : {};
+    const innerError =
+      typeof payload.error === 'object' && payload.error !== null
+        ? (payload.error as { type?: string; code?: string; message?: string })
+        : undefined;
+    const messageRaw =
+      (innerError?.message ?? (typeof payload.message === 'string' ? payload.message : '')) ||
+      `copilot HTTP ${response.status}`;
+    const httpError: CopilotHttpError = {
+      status: response.status,
+      headers: headersToRecord(response.headers),
+      message: messageRaw,
+    };
+    if (innerError !== undefined) {
+      const e: { type?: string; code?: string } = {};
+      if (innerError.type !== undefined) e.type = innerError.type;
+      if (innerError.code !== undefined) e.code = innerError.code;
+      httpError.error = e;
+    }
+    throw httpError;
+  }
+
+  return response.json();
+}
+
 export function createCopilotClient(opts: CreateCopilotClientOptions): CopilotClient {
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
   const url = `${baseUrl}/chat/completions`;
   const timeoutMs = opts.timeoutMs;
 
   return {
-    async chatCompletions(args: CopilotChatCompletionsArgs): Promise<unknown> {
-      const controller = timeoutMs !== undefined ? new AbortController() : undefined;
-      const timeoutHandle =
-        controller !== undefined && timeoutMs !== undefined
-          ? setTimeout(() => controller.abort(), timeoutMs)
-          : undefined;
-
-      const init: RequestInit = {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          Authorization: `Bearer ${opts.apiKey}`,
-        },
-        body: JSON.stringify(args),
-      };
-      if (controller !== undefined) {
-        init.signal = controller.signal;
-      }
-
-      let response: Response;
-      try {
-        response = await fetch(url, init);
-      } finally {
-        if (timeoutHandle !== undefined) {
-          clearTimeout(timeoutHandle);
-        }
-      }
-
-      if (!response.ok) {
-        let errorPayload: unknown;
-        try {
-          errorPayload = await response.json();
-        } catch {
-          try {
-            errorPayload = { message: await response.text() };
-          } catch {
-            errorPayload = { message: `HTTP ${response.status}` };
-          }
-        }
-        const payload =
-          typeof errorPayload === 'object' && errorPayload !== null
-            ? (errorPayload as Record<string, unknown>)
-            : {};
-        const innerError =
-          typeof payload.error === 'object' && payload.error !== null
-            ? (payload.error as { type?: string; code?: string; message?: string })
-            : undefined;
-        const messageRaw =
-          (innerError?.message ?? (typeof payload.message === 'string' ? payload.message : '')) ||
-          `copilot HTTP ${response.status}`;
-        const httpError: CopilotHttpError = {
-          status: response.status,
-          headers: headersToRecord(response.headers),
-          message: messageRaw,
-        };
-        if (innerError !== undefined) {
-          const e: { type?: string; code?: string } = {};
-          if (innerError.type !== undefined) e.type = innerError.type;
-          if (innerError.code !== undefined) e.code = innerError.code;
-          httpError.error = e;
-        }
-        throw httpError;
-      }
-
-      return response.json();
+    chatCompletions(args: CopilotChatCompletionsArgs): Promise<unknown> {
+      return postChatCompletion(url, opts.apiKey, timeoutMs, args);
+    },
+    textCompletion(args: CopilotTextCompletionArgs): Promise<unknown> {
+      return postChatCompletion(url, opts.apiKey, timeoutMs, args);
     },
   };
 }

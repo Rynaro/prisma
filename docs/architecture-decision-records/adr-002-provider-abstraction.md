@@ -76,3 +76,41 @@ Accepted costs of this decision:
 ## Consequences (later)
 
 Adding or swapping a provider must be additive: a new adapter that satisfies the interface and its schemas. No core pipeline change is permitted to add provider B. If a future provider's capability cannot be modeled in the existing capability flags, the flags evolve; the pipeline does not learn a new vendor.
+
+## Amendment — reviewer interaction (`@bot ask <message>`), 2026-07-30
+
+Per `docs/_planning/reviewer-interaction/spec.md` § 6. Additive to the
+Decision and Interface contract above; the original decision (single typed
+`Provider` interface, no vendor SDK outside its adapter) is unchanged and
+this note does not reopen it.
+
+`Provider` gains a second **mandatory** method:
+
+```ts
+interface Provider {
+  readonly name: string;
+  readonly capabilities: ProviderCapabilities;
+  review(input: ProviderReviewInput): Promise<ProviderReviewOutput>;
+  respond(input: ProviderRespondInput): Promise<ProviderRespondOutput>;
+}
+```
+
+`respond()` is the reviewer-interaction entry point: given the review context
+(latest round's findings + check-run summary), the prior thread exchanges
+(when `interactions.max_per_review > 1`), and the developer's message, it
+returns a single markdown reply (`ProviderRespondOutput.reply_markdown`).
+
+**Why mandatory, not capability-gated-optional** (the trade-off this
+amendment records): a capability flag (e.g. `capabilities.respond`) would let
+the pipeline branch at runtime on whether an adapter supports interaction —
+but every adapter can already produce a plain-text completion (no
+tool/JSON-schema contract is required, unlike `review()`), so a capability
+gate would only add a runtime branch with no adapter that could legitimately
+say "no". A mandatory method keeps the pipeline (and the worker's `ask`
+dispatch) free of that branching entirely. All four adapters
+(`anthropic`, `openai`, `copilot`, `fake`) implement it.
+
+Full field-by-field contract: `docs/api-contracts.md` § "`respond()` —
+reviewer interaction". No vendor SDK type crosses the boundary here either —
+the same invariant as `review()` — and adapters map vendor failures to the
+same five `ProviderError` variants.

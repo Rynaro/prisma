@@ -1,5 +1,6 @@
 import {
   ProviderErrorThrowable,
+  type ProviderRespondInput,
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputFindingSchema,
@@ -8,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import {
   FAKE_PROVIDER_NAME,
   FakeProvider,
+  type FakeRespondStep,
   type FakeStep,
   makeFindingFixture,
 } from '../src/index.js';
@@ -137,5 +139,98 @@ describe('@prisma-bot/provider-fake', () => {
     const overridden = makeFindingFixture({ severity: 'critical', confidence: 0.42 });
     expect(overridden.severity).toBe('critical');
     expect(overridden.confidence).toBe(0.42);
+  });
+
+  // ── respond() — reviewer interaction (`@bot ask <message>`) ────────────────
+
+  const baseRespondInput: ProviderRespondInput = {
+    pr: {
+      title: 'Fix payment race condition',
+      description: '',
+      base_ref: 'main',
+      head_ref: 'fix/payment-race',
+      head_sha: 'deadbeefcafef00d',
+    },
+    review_context: {
+      round: 2,
+      summary_markdown: 'Round 2 · 1 still open',
+      findings: [
+        {
+          file: 'src/payments/charge.ts',
+          line: 142,
+          severity: 'high',
+          category: 'security',
+          title: 'Unbounded user input',
+          body: 'Reachable from a public route.',
+        },
+      ],
+    },
+    thread: [],
+    message: { author_login: 'alice', text: 'why is finding 2 a security risk?' },
+  };
+
+  describe('respond()', () => {
+    it('is deterministic: echoes round, finding count, and thread length with no script', async () => {
+      const provider = new FakeProvider({ script: [] });
+      const out = await provider.respond(baseRespondInput);
+      expect(out.reply_markdown).toContain('Round 2');
+      expect(out.reply_markdown).toContain('1 finding(s)');
+      expect(out.reply_markdown).toContain('0 prior exchange(s)');
+    });
+
+    it('echoes a non-zero thread length when prior exchanges are present', async () => {
+      const provider = new FakeProvider({ script: [] });
+      const out = await provider.respond({
+        ...baseRespondInput,
+        thread: [{ author_login: 'bob', question: 'q1', reply_markdown: 'r1' }],
+      });
+      expect(out.reply_markdown).toContain('1 prior exchange(s)');
+    });
+
+    it('is stable across repeated calls with the same shape (key-less evals)', async () => {
+      const provider = new FakeProvider({ script: [] });
+      const out1 = await provider.respond(baseRespondInput);
+      const out2 = await provider.respond(baseRespondInput);
+      expect(out1.reply_markdown).toBe(out2.reply_markdown);
+    });
+
+    it('records each respond() input in respondCalls', async () => {
+      const provider = new FakeProvider({ script: [] });
+      await provider.respond(baseRespondInput);
+      expect(provider.respondCalls).toHaveLength(1);
+      expect(provider.respondCalls[0]?.message.text).toBe(baseRespondInput.message.text);
+    });
+
+    it('honors an optional respondScript for scripted outputs', async () => {
+      const step: FakeRespondStep = {
+        kind: 'output',
+        output: { reply_markdown: 'scripted reply' },
+      };
+      const provider = new FakeProvider({ script: [], respondScript: [step] });
+      const out = await provider.respond(baseRespondInput);
+      expect(out.reply_markdown).toBe('scripted reply');
+    });
+
+    it('falls back to the canned reply once the respondScript is exhausted', async () => {
+      const step: FakeRespondStep = {
+        kind: 'output',
+        output: { reply_markdown: 'scripted reply' },
+      };
+      const provider = new FakeProvider({ script: [], respondScript: [step] });
+      await provider.respond(baseRespondInput);
+      const out2 = await provider.respond(baseRespondInput);
+      expect(out2.reply_markdown).toContain('Round 2');
+    });
+
+    it('honors a scripted error (provider-failure eval scenario)', async () => {
+      const provider = new FakeProvider({
+        script: [],
+        respondScript: [{ kind: 'error', error: { kind: 'auth', message: 'bad credentials' } }],
+      });
+      await expect(provider.respond(baseRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'auth',
+      });
+    });
   });
 });

@@ -54,7 +54,7 @@ Subscribe to the following webhook events:
 | Event | Why |
 | --- | --- |
 | `pull_request` | The trigger that makes the bot review a PR (`opened`, `synchronize`, `reopened` actions). |
-| `issue_comment` | Enables PR comment-command mentions: `@bot review`, `@bot full review`, `@bot help`, `@bot configuration`. Only the `created` action is accepted; `edited` and `deleted` are ignored. Bot-authored comments are dropped at ingress (loop prevention). |
+| `issue_comment` | Enables PR comment-command mentions: `@bot review`, `@bot full review`, `@bot help`, `@bot configuration`, `@bot ask <message>` (opt-in — see `interactions` in `docs/config-spec.md`). Only the `created` action is accepted; `edited` and `deleted` are ignored. Bot-authored comments are dropped at ingress (loop prevention). |
 | `check_run` | Enables the native GitHub "Re-run" button on the "AI Code Review" check run. Only the `rerequested` action is accepted; `completed`, `created`, and all others are ignored. |
 | `installation` | The bot must observe install/uninstall to track installation lifecycle. |
 | `installation_repositories` | Repository add/remove against an existing installation. |

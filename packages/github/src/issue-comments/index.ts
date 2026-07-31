@@ -67,7 +67,24 @@ export interface IssueCommentsClient {
     comment_id: number;
     content: ReactionContent;
   }): Promise<void>;
+
+  /**
+   * List every issue/PR conversation comment authored by this App on the
+   * given PR conversation. Mirrors `ReviewCommentsClient.listOurs` /
+   * `CheckRunsClient.listOurs` — used by the reviewer-interaction harvest
+   * (`packages/github/src/interactions`) to find prior `@bot ask` reply
+   * comments and their embedded `<!-- prisma-bot:interaction ... -->` markers
+   * (spec § 5 / § 7 step 2).
+   */
+  listOurs(args: {
+    owner: string;
+    repo: string;
+    issue_number: number;
+    app_login: string;
+  }): Promise<Array<{ id: number; body: string }>>;
 }
+
+const DEFAULT_PER_PAGE = 100;
 
 const utf8ByteLength = (s: string): number => Buffer.byteLength(s, 'utf8');
 
@@ -104,5 +121,32 @@ export const buildIssueCommentsClient = (octokit: OctokitLike): IssueCommentsCli
       comment_id: args.comment_id,
       content: args.content,
     });
+  },
+
+  async listOurs(args): Promise<Array<{ id: number; body: string }>> {
+    const accumulated: Array<{ id: number; body: string }> = [];
+    let page = 1;
+    const expectedLogin = `${args.app_login}[bot]`;
+    // Octokit pagination: fetch until a short page is returned.
+    while (true) {
+      const response = await octokit.rest.issues.listComments({
+        owner: args.owner,
+        repo: args.repo,
+        issue_number: args.issue_number,
+        per_page: DEFAULT_PER_PAGE,
+        page,
+      });
+      const batch = response.data;
+      for (const comment of batch) {
+        if (comment.user === null) continue;
+        if (comment.user.type !== 'Bot') continue;
+        if (comment.user.login !== expectedLogin) continue;
+        if (typeof comment.body !== 'string') continue;
+        accumulated.push({ id: comment.id, body: comment.body });
+      }
+      if (batch.length < DEFAULT_PER_PAGE) break;
+      page += 1;
+    }
+    return accumulated;
   },
 });

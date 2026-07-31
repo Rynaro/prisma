@@ -161,6 +161,16 @@ approval:
 
 Safety posture: all three keys default **off** — a repo with no `.github/review-bot.yml` (or with these keys absent) gets byte-identical prompt, tool schema, summary, and API calls. `approve_on_clean` is honored **only from the repository's default branch** (a PR cannot grant itself an approval by shipping config in its own diff), and the bot **never** submits `REQUEST_CHANGES` — a dissatisfied later commit dismisses the earlier approval instead. See [docs/config-spec.md](./docs/config-spec.md) § `positive_feedback` / § `approval` and [docs/publication-policy.md](./docs/publication-policy.md).
 
+**Reviewer interaction.** A per-repo, default-off opt-in that lets a developer talk to the reviewer about its feedback:
+
+```yaml
+interactions:
+  enabled: true
+  max_per_review: 3
+```
+
+`@prisma-bot ask <message>` asks or tells the reviewer something about the latest review round's findings — "why is finding 2 a security risk?", "we sanitize upstream, this is a false positive", etc. The reply is grounded in that round's findings + check-run summary and quotes your question, so each exchange is self-contained. `max_per_review` hard-caps provider-backed replies per review round (a new review round resets the budget); when it is greater than 1, later replies in the same round also see the prior exchanges as thread context. GitHub is the only state — the budget is tracked via a hidden marker in the bot's own reply comments, no database involved. Disabled (the default) → a friendly opt-in notice, no provider call. See [docs/config-spec.md](./docs/config-spec.md) § `interactions`.
+
 ## Commands
 
 Mention the bot in a PR comment to trigger actions without opening the GitHub UI:
@@ -170,6 +180,7 @@ Mention the bot in a PR comment to trigger actions without opening the GitHub UI
 @prisma-bot full review
 @prisma-bot help
 @prisma-bot configuration
+@prisma-bot ask <message>
 ```
 
 | Command | What it does |
@@ -178,6 +189,7 @@ Mention the bot in a PR comment to trigger actions without opening the GitHub UI
 | `full review` | Full re-review: all diff files are reviewed from scratch, ignoring prior-round dedupe state. |
 | `help` | Replies with the command vocabulary in a PR comment. No provider call is made. |
 | `configuration` | Replies with the resolved repo configuration (mode, caps, thresholds). No provider call is made. |
+| `ask <message>` | Discuss the review feedback (opt-in; see `interactions` above). |
 
 **Nickname.** If you prefer a shorter mention, set `nickname` in `.github/review-bot.yml`:
 

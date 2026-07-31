@@ -136,6 +136,8 @@ const buildOctokitSpy = (opts: OctokitFakeOptions = {}): OctokitSpy => {
             number: 42,
             head: { sha: 'a'.repeat(40), ref: 'feature' },
             base: { sha: 'b'.repeat(40), ref: 'main' },
+            title: 'test PR',
+            body: null,
           },
         }),
         listFiles: async (params) => {
@@ -201,6 +203,7 @@ const buildOctokitSpy = (opts: OctokitFakeOptions = {}): OctokitSpy => {
       issues: {
         createComment: async () => ({ data: { id: 1, body: null, user: null } }),
         getComment: async () => ({ data: { id: 1, body: null, user: null } }),
+        listComments: async () => ({ data: [] }),
       },
       reactions: {
         createForIssueComment: async () => ({ data: { id: 1 } }),

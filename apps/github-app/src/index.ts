@@ -58,3 +58,6 @@ export type {
   SnapshotterCall,
 } from './pipeline/index.js';
 export { runPipeline } from './pipeline/index.js';
+
+export type { AskContext, AskDeps, AskRequest, AskResult } from './interactions.js';
+export { runAsk } from './interactions.js';

@@ -577,6 +577,38 @@ are inert in `dry-run` (nothing PR-visible is ever published in dry-run,
 approval included). **`approval.approve_on_clean` is honored only when
 resolved from the repository's default branch** — see § Failure modes below.
 
+### interactions
+
+- **Type.** Object: `{ enabled: boolean, max_per_review: integer }`.
+- **Required.** Optional.
+- **Default.** `{ enabled: false, max_per_review: 3 }`.
+- **Validation rule.** `max_per_review` must be an integer in `[1, 25]`. Like
+  every other bounded numeric in this schema, an out-of-range value **rejects
+  the entire file** and falls back to full defaults (see § Failure modes —
+  "Type mismatch on a known key").
+- **Example.**
+  ```yaml
+  interactions:
+    enabled: true
+    max_per_review: 5
+  ```
+
+Opt-in reviewer interaction: `@bot ask <message>` lets a developer ask or tell
+the reviewer something about its feedback on the current review round.
+Absent, or present with `enabled: false` (the default), `ask` never calls the
+provider — it replies with a friendly, opt-in notice pointing at this key.
+`max_per_review` hard-caps provider-backed `ask` replies per review round
+(anti-chat-abuse guard); the budget is tracked statelessly via
+`<!-- prisma-bot:interaction round=<N> seq=<M> -->` markers embedded in the
+bot's own reply comments — GitHub is the only durable state, no Redis/DB
+addition. A new published review round resets the budget to zero. When
+`max_per_review > 1`, later replies within the same round also carry the
+prior exchanges as thread context. The `configuration` command reply always
+echoes this block (like `command_marker`), and the `help` reply always lists
+the `ask <message>` row (the row itself is not gated by `enabled`; invoking it
+while disabled is what triggers the opt-in notice). See
+`docs/_planning/reviewer-interaction/spec.md` for the full contract.
+
 ## Precedence matrix
 
 The following table declares how filtering keys interact. Rows are the filtering key in question; the cell describes its resolution rule against the named other key. "Applies first" means evaluated before; "applies last" means evaluated after.
@@ -684,6 +716,10 @@ approval:
   celebrate_clean: false
   clean_conclusion: neutral
   approve_on_clean: false
+# Optional: reviewer interaction (`@bot ask <message>`). Default off; see § interactions.
+interactions:
+  enabled: false
+  max_per_review: 3
 ```
 
 ### Migration from legacy `provider:` + `model:` form

@@ -80,8 +80,27 @@ export interface OpenAIChatCompletionsArgs {
   [k: string]: unknown;
 }
 
+/**
+ * `OpenAITextCompletionArgs` — the wire shape for a plain-text (no tools)
+ * `/chat/completions` request, used by `respond()` (reviewer-interaction,
+ * `@bot ask <message>`). Mirrors `OpenAIChatCompletionsArgs` minus the
+ * `tools`/`tool_choice` fields — `respond()` has no JSON-schema contract, the
+ * model simply replies with markdown text.
+ */
+export interface OpenAITextCompletionArgs {
+  model: string;
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+  max_tokens?: number;
+  max_completion_tokens?: number;
+  seed?: number;
+  temperature?: number;
+  top_p?: number;
+  [k: string]: unknown;
+}
+
 export interface OpenAIClient {
   chatCompletions(args: OpenAIChatCompletionsArgs): Promise<unknown>;
+  textCompletion(args: OpenAITextCompletionArgs): Promise<unknown>;
 }
 
 export const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
@@ -101,78 +120,96 @@ function headersToRecord(headers: Headers): Record<string, string> {
   return out;
 }
 
+/**
+ * Shared POST-and-error-mapping logic for both `chatCompletions` and
+ * `textCompletion` — the only difference between the two wire calls is the
+ * request body shape (tools present vs. absent); the HTTP/error handling is
+ * identical, so it is factored here once (DRY) rather than duplicated.
+ */
+async function postChatCompletion(
+  url: string,
+  apiKey: string,
+  timeoutMs: number | undefined,
+  body: unknown,
+): Promise<unknown> {
+  const controller = timeoutMs !== undefined ? new AbortController() : undefined;
+  const timeoutHandle =
+    controller !== undefined && timeoutMs !== undefined
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : undefined;
+
+  const init: RequestInit = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  };
+  if (controller !== undefined) {
+    init.signal = controller.signal;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  if (!response.ok) {
+    let errorPayload: unknown;
+    try {
+      errorPayload = await response.json();
+    } catch {
+      try {
+        errorPayload = { message: await response.text() };
+      } catch {
+        errorPayload = { message: `HTTP ${response.status}` };
+      }
+    }
+    const payload =
+      typeof errorPayload === 'object' && errorPayload !== null
+        ? (errorPayload as Record<string, unknown>)
+        : {};
+    const innerError =
+      typeof payload.error === 'object' && payload.error !== null
+        ? (payload.error as { type?: string; code?: string; message?: string })
+        : undefined;
+    const messageRaw =
+      (innerError?.message ?? (typeof payload.message === 'string' ? payload.message : '')) ||
+      `openai HTTP ${response.status}`;
+    const httpError: OpenAIHttpError = {
+      status: response.status,
+      headers: headersToRecord(response.headers),
+      message: messageRaw,
+    };
+    if (innerError !== undefined) {
+      const e: { type?: string; code?: string } = {};
+      if (innerError.type !== undefined) e.type = innerError.type;
+      if (innerError.code !== undefined) e.code = innerError.code;
+      httpError.error = e;
+    }
+    throw httpError;
+  }
+
+  return response.json();
+}
+
 export function createOpenAIClient(opts: CreateOpenAIClientOptions): OpenAIClient {
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
   const url = `${baseUrl}/chat/completions`;
   const timeoutMs = opts.timeoutMs;
 
   return {
-    async chatCompletions(args: OpenAIChatCompletionsArgs): Promise<unknown> {
-      const controller = timeoutMs !== undefined ? new AbortController() : undefined;
-      const timeoutHandle =
-        controller !== undefined && timeoutMs !== undefined
-          ? setTimeout(() => controller.abort(), timeoutMs)
-          : undefined;
-
-      const init: RequestInit = {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          Authorization: `Bearer ${opts.apiKey}`,
-        },
-        body: JSON.stringify(args),
-      };
-      if (controller !== undefined) {
-        init.signal = controller.signal;
-      }
-
-      let response: Response;
-      try {
-        response = await fetch(url, init);
-      } finally {
-        if (timeoutHandle !== undefined) {
-          clearTimeout(timeoutHandle);
-        }
-      }
-
-      if (!response.ok) {
-        let errorPayload: unknown;
-        try {
-          errorPayload = await response.json();
-        } catch {
-          try {
-            errorPayload = { message: await response.text() };
-          } catch {
-            errorPayload = { message: `HTTP ${response.status}` };
-          }
-        }
-        const payload =
-          typeof errorPayload === 'object' && errorPayload !== null
-            ? (errorPayload as Record<string, unknown>)
-            : {};
-        const innerError =
-          typeof payload.error === 'object' && payload.error !== null
-            ? (payload.error as { type?: string; code?: string; message?: string })
-            : undefined;
-        const messageRaw =
-          (innerError?.message ?? (typeof payload.message === 'string' ? payload.message : '')) ||
-          `openai HTTP ${response.status}`;
-        const httpError: OpenAIHttpError = {
-          status: response.status,
-          headers: headersToRecord(response.headers),
-          message: messageRaw,
-        };
-        if (innerError !== undefined) {
-          const e: { type?: string; code?: string } = {};
-          if (innerError.type !== undefined) e.type = innerError.type;
-          if (innerError.code !== undefined) e.code = innerError.code;
-          httpError.error = e;
-        }
-        throw httpError;
-      }
-
-      return response.json();
+    chatCompletions(args: OpenAIChatCompletionsArgs): Promise<unknown> {
+      return postChatCompletion(url, opts.apiKey, timeoutMs, args);
+    },
+    textCompletion(args: OpenAITextCompletionArgs): Promise<unknown> {
+      return postChatCompletion(url, opts.apiKey, timeoutMs, args);
     },
   };
 }

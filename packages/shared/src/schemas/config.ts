@@ -307,6 +307,27 @@ export const ApprovalSchema = z
 export type ApprovalConfig = z.infer<typeof ApprovalSchema>;
 
 /**
+ * Reviewer interaction (`@bot ask <message>`). Opt-in; default-off, same
+ * convention as `PositiveFeedbackSchema` / `ApprovalSchema`. `max_per_review`
+ * hard-caps provider-backed `ask` replies per review round (anti-chat-abuse
+ * guard); the budget is tracked statelessly via `<!-- prisma-bot:interaction
+ * round=<N> seq=<M> -->` markers embedded in the bot's own reply comments —
+ * GitHub is the only durable state (no Redis/DB addition).
+ *
+ * Per docs/config-spec.md § interactions and
+ * docs/_planning/reviewer-interaction/spec.md § 4.
+ */
+export const InteractionsSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    /** Hard cap on provider-backed interaction replies per review round. */
+    max_per_review: z.number().int().min(1).max(25).default(3),
+  })
+  .strict()
+  .default({ enabled: false, max_per_review: 3 });
+export type InteractionsConfig = z.infer<typeof InteractionsSchema>;
+
+/**
  * `language_overrides` is a map from a language tag to an object whose shape is a
  * subset of this top-level configuration (config-spec.md § language_overrides).
  * For Phase 5.1 we accept any subset of the public top-level keys; the validator
@@ -438,6 +459,11 @@ export const RepoConfigSchema = z
      * Clean-review approval. Opt-in; default-off. See `ApprovalSchema` above.
      */
     approval: ApprovalSchema,
+    /**
+     * Reviewer interaction (`@bot ask <message>`). Opt-in; default-off. See
+     * `InteractionsSchema` above.
+     */
+    interactions: InteractionsSchema,
   })
   .describe('Repo-local .github/review-bot.yml configuration');
 

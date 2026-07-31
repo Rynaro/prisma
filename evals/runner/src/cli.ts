@@ -1,5 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
+import { evaluateAskExpectations } from './ask-assertions.js';
+import { runAskForFixture } from './ask-runner.js';
 import { evaluateExpectations } from './assertions.js';
 import { loadScenarioFixture, loadScenarioIndex } from './loader.js';
 import { runPipelineForFixture } from './pipeline-runner.js';
@@ -124,6 +126,24 @@ const runOne = async (
     ? indexFixturePath.slice('fixtures/'.length)
     : basename(indexFixturePath);
   const loaded = await loadScenarioFixture(fixturesRoot, stripped);
+
+  // Reviewer-interaction (`ask`) scenarios carry `ask_request` and are routed
+  // to the ask runner/assertions instead of the review-pipeline ones — `ask`
+  // is not part of `runPipeline` (spec § 7).
+  if (loaded.fixture.ask_request !== undefined) {
+    if (loaded.fixture.ask_expectations === undefined) {
+      throw new Error(
+        `fixture ${loaded.fixture.id} sets ask_request but is missing ask_expectations`,
+      );
+    }
+    const askOutcome = await runAskForFixture({
+      fixture: loaded.fixture,
+      filesPayload: loaded.filesPayload,
+    });
+    const askAssertion = evaluateAskExpectations(askOutcome, loaded.fixture.ask_expectations);
+    return fromAssertionReport(loaded.fixture.id, askAssertion, loaded.fixture.description);
+  }
+
   const outcome = await runPipelineForFixture({
     fixture: loaded.fixture,
     filesPayload: loaded.filesPayload,

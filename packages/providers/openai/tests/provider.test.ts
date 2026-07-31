@@ -1,4 +1,8 @@
-import { ProviderErrorThrowable, type ProviderReviewInput } from '@prisma-bot/shared';
+import {
+  ProviderErrorThrowable,
+  type ProviderRespondInput,
+  type ProviderReviewInput,
+} from '@prisma-bot/shared';
 import { describe, expect, it, vi } from 'vitest';
 import type { OpenAIChatCompletionsArgs } from '../src/client.js';
 import {
@@ -21,6 +25,26 @@ const validInput: ProviderReviewInput = {
     },
   ],
 };
+
+const validRespondInput: ProviderRespondInput = {
+  pr: {
+    title: 'Fix payment race condition',
+    description: '',
+    base_ref: 'main',
+    head_ref: 'fix/payment-race',
+    head_sha: 'deadbeefcafef00d',
+  },
+  review_context: { round: 2, summary_markdown: 'Round 2', findings: [] },
+  thread: [],
+  message: { author_login: 'alice', text: 'why is finding 2 a security risk?' },
+};
+
+function textCompletionResponse(content: string, finish_reason = 'stop') {
+  return {
+    id: 'chatcmpl-fake',
+    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason }],
+  };
+}
 
 function chatCompletionsResponse(toolArgs: unknown, toolName = 'submit_review_findings') {
   return {
@@ -55,7 +79,7 @@ describe('OpenAIProvider', () => {
   it('exposes name = "openai" and default capabilities with deterministic_seed true', () => {
     const provider = new OpenAIProvider({
       apiKey: 'irrelevant',
-      client: { chatCompletions: vi.fn() },
+      client: { chatCompletions: vi.fn(), textCompletion: vi.fn() },
     });
     expect(provider.name).toBe(OPENAI_PROVIDER_NAME);
     expect(provider.name).toBe('openai');
@@ -84,7 +108,7 @@ describe('OpenAIProvider', () => {
         ],
       }),
     );
-    const client: OpenAIClientLike = { chatCompletions };
+    const client: OpenAIClientLike = { chatCompletions, textCompletion: vi.fn() };
     const provider = new OpenAIProvider({ apiKey: 'k', client });
 
     const out = await provider.review(validInput);
@@ -113,7 +137,7 @@ describe('OpenAIProvider', () => {
     );
     const provider = new OpenAIProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
@@ -134,7 +158,7 @@ describe('OpenAIProvider', () => {
     });
     const provider = new OpenAIProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
@@ -147,7 +171,7 @@ describe('OpenAIProvider', () => {
     const chatCompletions = vi.fn().mockRejectedValue({ status: 401, message: 'invalid api key' });
     const provider = new OpenAIProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     try {
       await provider.review(validInput);
@@ -167,7 +191,7 @@ describe('OpenAIProvider', () => {
     const provider = new OpenAIProvider({
       apiKey: 'k',
       maxTokensPerCall: 1, // any non-trivial input will exceed this
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     try {
       await provider.review(validInput);
@@ -209,7 +233,7 @@ describe('OpenAIProvider', () => {
     const provider = new OpenAIProvider({
       apiKey: 'k',
       maxTokensPerCall: 200_000, // must be above the unified estimate (~143k for this input)
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     await expect(provider.review(bigInput)).resolves.toBeDefined();
     expect(chatCompletions).toHaveBeenCalledOnce();
@@ -222,7 +246,10 @@ describe('OpenAIProvider', () => {
       capturedArgs = args;
       return Promise.resolve(chatCompletionsResponse({ findings: [] }));
     });
-    const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     await provider.review({ ...validInput, request_shaping: { deterministic_seed: 42 } });
     expect(chatCompletions).toHaveBeenCalledTimes(1);
     expect((capturedArgs as Record<string, unknown>).seed).toBe(42);
@@ -235,7 +262,10 @@ describe('OpenAIProvider', () => {
       capturedArgs = args;
       return Promise.resolve(chatCompletionsResponse({ findings: [] }));
     });
-    const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     await provider.review(validInput);
     expect(chatCompletions).toHaveBeenCalledTimes(1);
     expect('seed' in (capturedArgs as Record<string, unknown>)).toBe(false);
@@ -248,7 +278,10 @@ describe('OpenAIProvider', () => {
       capturedArgs = args;
       return Promise.resolve(chatCompletionsResponse({ findings: [] }));
     });
-    const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
 
     // with override
     await provider.review({ ...validInput, request_shaping: { model: 'gpt-4-turbo' } });
@@ -286,7 +319,10 @@ describe('OpenAIProvider', () => {
         },
       ],
     });
-    const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
       cause_kind: 'output_truncated',
@@ -296,7 +332,10 @@ describe('OpenAIProvider', () => {
   // T11: finish_reason==='tool_calls' (normal) → does NOT throw truncation error
   it('does not throw truncation error when finish_reason is "tool_calls"', async () => {
     const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
-    const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     const out = await provider.review(validInput);
     expect(out.findings).toHaveLength(0);
   });
@@ -311,7 +350,7 @@ describe('OpenAIProvider', () => {
     // Use a classic model (max_tokens param) with non-default maxOutputTokens.
     const provider = new OpenAIProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
       model: 'gpt-4o',
       maxOutputTokens: 8192,
     });
@@ -330,11 +369,109 @@ describe('OpenAIProvider', () => {
     // No maxOutputTokens option, classic model → defaults to 4096 via max_tokens.
     const provider = new OpenAIProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
       model: 'gpt-4o',
     });
     await provider.review(validInput);
     expect(capturedArgs?.max_tokens).toBe(4096);
+  });
+});
+
+describe('OpenAIProvider — respond()', () => {
+  it('happy path: text completion → non-empty ProviderRespondOutput', async () => {
+    const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse('Good catch.'));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    const out = await provider.respond(validRespondInput);
+    expect(out.reply_markdown).toBe('Good catch.');
+    expect(textCompletion).toHaveBeenCalledTimes(1);
+    const callArgs = textCompletion.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.tools).toBeUndefined();
+    expect(callArgs.tool_choice).toBeUndefined();
+  });
+
+  it('reasoning model (o3) still uses max_completion_tokens for respond()', async () => {
+    const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse('ok'));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      model: 'o3',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await provider.respond(validRespondInput);
+    const callArgs = textCompletion.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect('max_completion_tokens' in callArgs).toBe(true);
+    expect('max_tokens' in callArgs).toBe(false);
+  });
+
+  it('throws schema_validation when the message has no text content', async () => {
+    const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse(''));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'schema_validation',
+    });
+  });
+
+  it('client throws → mapped through mapOpenAIError and re-thrown as ProviderErrorThrowable', async () => {
+    const textCompletion = vi.fn().mockRejectedValue({ status: 401, message: 'invalid api key' });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'auth',
+    });
+  });
+
+  it('throws output_truncated when finish_reason is "length"', async () => {
+    const textCompletion = vi
+      .fn()
+      .mockResolvedValue(textCompletionResponse('partial...', 'length'));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'output_truncated',
+    });
+  });
+
+  it('over_budget: oversized input throws before client.textCompletion is called', async () => {
+    const textCompletion = vi.fn();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      maxTokensPerCall: 1,
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'over_budget',
+    });
+    expect(textCompletion).not.toHaveBeenCalled();
+  });
+
+  it('generation.temperature/top_p/seed flow through to the wire request', async () => {
+    const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse('ok'));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await provider.respond({
+      ...validRespondInput,
+      generation: { temperature: 0.2, top_p: 0.9, seed: 42, max_output_tokens: 2048 },
+    });
+    const callArgs = textCompletion.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.temperature).toBe(0.2);
+    expect(callArgs.top_p).toBe(0.9);
+    expect(callArgs.seed).toBe(42);
+    expect(callArgs.max_tokens).toBe(2048);
   });
 });
 
@@ -440,6 +577,7 @@ describe('OpenAIProvider — token param per-request wiring', () => {
         capturedArgs = args as Record<string, unknown>;
         return Promise.resolve(chatCompletionsResponse({ findings: [] }));
       }),
+      textCompletion: vi.fn(),
     };
     return { client, getArgs: () => capturedArgs };
   }
@@ -561,6 +699,7 @@ describe('OpenAIProvider — token param per-request wiring', () => {
     };
     const client: OpenAIClientLike = {
       chatCompletions: vi.fn().mockResolvedValue(truncatedResponse),
+      textCompletion: vi.fn(),
     };
     const provider = new OpenAIProvider({
       apiKey: 'k',
@@ -605,6 +744,7 @@ describe('OpenAIProvider — generation→vendor mapping (spec § 5.3)', () => {
         capturedArgs = args as Record<string, unknown>;
         return Promise.resolve(chatCompletionsResponse({ findings: [] }));
       }),
+      textCompletion: vi.fn(),
     };
     return { client, getArgs: () => capturedArgs };
   }
@@ -689,6 +829,7 @@ describe('OpenAIProvider — provider_options passthrough (spec § 5.3, § 3.7)'
         capturedArgs = args as Record<string, unknown>;
         return Promise.resolve(chatCompletionsResponse({ findings: [] }));
       }),
+      textCompletion: vi.fn(),
     };
     return { client, getArgs: () => capturedArgs };
   }
@@ -950,6 +1091,7 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
           }))(),
         );
       }),
+      textCompletion: vi.fn(),
     };
     return { client, getArgs: () => capturedArgs };
   }
@@ -1077,7 +1219,10 @@ describe('OpenAIProvider — extractToolCallArguments works with required tool_c
         },
       ],
     });
-    const provider = new OpenAIProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     // o3 is a reasoning model -> tool_choice will be 'required'
     const out = await provider.review({ ...validInput, request_shaping: { model: 'o3' } });
     expect(out.findings).toHaveLength(1);

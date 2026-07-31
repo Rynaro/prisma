@@ -39,6 +39,9 @@ const makeFakeIssueComments = (): IssueCommentsClient & {
     async addReaction(args) {
       reactionCalls.push({ comment_id: args.comment_id, content: args.content });
     },
+    async listOurs() {
+      return [];
+    },
   };
 };
 
@@ -881,5 +884,109 @@ describe('buildConfigReply — generation and provider_options (config-dx)', () 
     // Values not present
     expect(reply).not.toContain("'low'");
     expect(reply).not.toContain("'enabled'");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reviewer interaction (`ask`) — help row, configuration echo, template
+// replies. Mirrors worker.ts logic (not exported); see the file-level doc
+// comment for why these local mirrors exist.
+// Per docs/_planning/reviewer-interaction/spec.md § 3.
+// ---------------------------------------------------------------------------
+
+describe('buildHelpReply — includes the ask command row (reviewer interaction)', () => {
+  const buildHelpReply = (botLogin: string, marker = '@'): string =>
+    `### ${botLogin} — commands\n\n| Command | Description |\n|---|---|\n| \`${marker}${botLogin} review\` | Run an incremental review (skips already-posted findings) |\n| \`${marker}${botLogin} full review\` | Run a fresh review (re-evaluates all findings) |\n| \`${marker}${botLogin} help\` | Show this command reference |\n| \`${marker}${botLogin} configuration\` | Show the effective repo configuration |\n| \`${marker}${botLogin} ask <message>\` | Discuss the review feedback (opt-in) |\n\nYou can also click **Re-run** on the "AI Code Review" check to trigger an incremental round.`;
+
+  it('includes the ask <message> row', () => {
+    const reply = buildHelpReply('mybot');
+    expect(reply).toContain('`@mybot ask <message>`');
+    expect(reply).toContain('Discuss the review feedback (opt-in)');
+  });
+
+  it('respects the configured marker', () => {
+    const reply = buildHelpReply('mybot', '$');
+    expect(reply).toContain('`$mybot ask <message>`');
+  });
+});
+
+describe('buildConfigReply — interactions block (reviewer interaction)', () => {
+  /**
+   * Local mirror of worker.ts buildConfigReply, extended with the
+   * `interactions` echo (spec § 3: "configuration reply echoes the block
+   * (always, like command_marker)").
+   */
+  const buildConfigReply = (config: RepoConfig): string => {
+    const lines: string[] = ['### Effective repo configuration\n', '```yaml'];
+    lines.push(`mode: ${config.mode}`);
+    lines.push(`command_marker: "${config.command_marker}"`);
+    lines.push(`max_files: ${config.max_files}`);
+    lines.push(`max_changed_lines: ${config.max_changed_lines}`);
+    lines.push(
+      'interactions:',
+      `  enabled: ${String(config.interactions.enabled)}`,
+      `  max_per_review: ${config.interactions.max_per_review}`,
+    );
+    lines.push('```');
+    return lines.join('\n');
+  };
+
+  const defaultConfig = (): RepoConfig => RepoConfigSchema.parse({});
+
+  it('always echoes interactions.enabled and max_per_review (default off)', () => {
+    const reply = buildConfigReply(defaultConfig());
+    expect(reply).toContain('interactions:');
+    expect(reply).toContain('enabled: false');
+    expect(reply).toContain('max_per_review: 3');
+  });
+
+  it('reflects a non-default interactions configuration', () => {
+    const config = RepoConfigSchema.parse({
+      interactions: { enabled: true, max_per_review: 10 },
+    });
+    const reply = buildConfigReply(config);
+    expect(reply).toContain('enabled: true');
+    expect(reply).toContain('max_per_review: 10');
+  });
+});
+
+describe('ask template replies (disabled / no_round / cap_exceeded)', () => {
+  /** Mirrors worker.ts buildInteractionsDisabledReply / buildNoRoundReply / buildCapExceededReply. */
+  const buildInteractionsDisabledReply = (): string =>
+    'Interactions are disabled for this repository. Ask a maintainer to opt in by setting `interactions.enabled: true` in `.github/review-bot.yml`.';
+  const buildNoRoundReply = (botLogin: string, marker = '@'): string =>
+    `I don't have a published review round for this PR yet — run \`${marker}${botLogin} review\` first, then ask again.`;
+  const buildCapExceededReply = (used: number, max: number): string =>
+    `This review round has reached its interaction limit (\`${used}/${max}\`, per \`interactions.max_per_review\`). Run a new review round to reset the budget, or raise \`interactions.max_per_review\` in \`.github/review-bot.yml\`.`;
+
+  it('disabled reply points at .github/review-bot.yml and never mentions the provider', () => {
+    const reply = buildInteractionsDisabledReply();
+    expect(reply).toContain('.github/review-bot.yml');
+    expect(reply.toLowerCase()).not.toContain('provider');
+  });
+
+  it('no_round reply suggests running review first, respecting the configured marker', () => {
+    const reply = buildNoRoundReply('mybot', '$');
+    expect(reply).toContain('$mybot review');
+  });
+
+  it('cap_exceeded reply states the used/max values and suggests a new round', () => {
+    const reply = buildCapExceededReply(3, 3);
+    expect(reply).toContain('3/3');
+    expect(reply).toContain('interactions.max_per_review');
+    expect(reply.toLowerCase()).toContain('new review round');
+  });
+});
+
+describe('parseCommand ask integration (worker-side)', () => {
+  it('parseCommand maps "ask <message>" → {kind: ask, message}', () => {
+    expect(parseCommand('ask why is finding 2 risky?')).toEqual({
+      kind: 'ask',
+      message: 'why is finding 2 risky?',
+    });
+  });
+
+  it('requiresWrite returns false for ask', () => {
+    expect(requiresWrite({ kind: 'ask', message: 'why?' })).toBe(false);
   });
 });

@@ -2,13 +2,17 @@ import {
   type Provider,
   type ProviderCapabilities,
   ProviderErrorThrowable,
+  type ProviderRespondInput,
+  type ProviderRespondOutput,
+  ProviderRespondOutputSchema,
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputSchema,
+  buildRespondPrompt,
   estimatePromptTokens,
   serializeForEstimate,
 } from '@prisma-bot/shared';
-import { createCopilotClient } from './client.js';
+import { type CopilotTextCompletionArgs, createCopilotClient } from './client.js';
 import { mapCopilotError } from './error-mapping.js';
 import { buildPrompt } from './prompt.js';
 
@@ -71,6 +75,11 @@ export interface CopilotClientLike {
     tool_choice: { type: 'function'; function: { name: string } };
     max_tokens: number;
   }): Promise<unknown>;
+  /**
+   * Plain-text (no tools) completion — used by `respond()`
+   * (reviewer-interaction, `@bot ask <message>`). See `CopilotTextCompletionArgs`.
+   */
+  textCompletion(args: CopilotTextCompletionArgs): Promise<unknown>;
 }
 
 /**
@@ -184,6 +193,46 @@ function extractToolCallArguments(response: unknown, toolName: string): unknown 
     kind: 'schema_validation',
     message: `copilot response missing tool_call for tool '${toolName}'`,
   });
+}
+
+/** Extract the plain-text assistant reply from a chat-completions response (no tools). */
+function extractMessageContent(response: unknown): string {
+  if (typeof response !== 'object' || response === null) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'copilot response was not an object',
+    });
+  }
+  const record = response as Record<string, unknown>;
+  const choices = record.choices;
+  if (!Array.isArray(choices) || choices.length === 0) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'copilot response missing choices array',
+    });
+  }
+  const firstChoice = choices[0];
+  if (typeof firstChoice !== 'object' || firstChoice === null) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'copilot first choice was not an object',
+    });
+  }
+  const message = (firstChoice as Record<string, unknown>).message;
+  if (typeof message !== 'object' || message === null) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'copilot choice missing message',
+    });
+  }
+  const content = (message as Record<string, unknown>).content;
+  if (typeof content !== 'string' || content.trim().length === 0) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'copilot message missing text content',
+    });
+  }
+  return content.trim();
 }
 
 /**
@@ -302,6 +351,97 @@ export class CopilotProvider implements Provider {
       throw new ProviderErrorThrowable({
         kind: 'schema_validation',
         message: 'copilot tool_call arguments failed ProviderReviewOutput schema',
+        zod_issues: parsed.error.issues.map((issue) => issue.message),
+      });
+    }
+    return parsed.data;
+  }
+
+  /**
+   * `respond()` — reviewer-interaction entry point (`@bot ask <message>`).
+   * No tool/JSON-schema is involved: a plain-text completion is requested
+   * (`textCompletion`, no `tools`/`tool_choice`) and the assistant's message
+   * content is returned as `reply_markdown`. Error mapping mirrors `review()`.
+   */
+  async respond(input: ProviderRespondInput): Promise<ProviderRespondOutput> {
+    if (this.maxTokensPerCall !== undefined) {
+      // Simple chars/4 estimate (the cost-ceiling-proxy heuristic `review()`
+      // used before the unified estimator existed) — `estimatePromptTokens`/
+      // `serializeForEstimate` are typed specifically for `ProviderReviewInput`'s
+      // diff-hunk shape. Safe here because `ProviderRespondInput` is already
+      // hard-capped by the caller (MAX_RESPOND_* in shared/schemas/provider.ts).
+      const estimate = Math.ceil(JSON.stringify(input).length / 4);
+      if (estimate > this.maxTokensPerCall) {
+        throw new ProviderErrorThrowable({
+          kind: 'over_budget',
+          estimated_tokens: estimate,
+          hard_cap_in: this.maxTokensPerCall,
+          message: `request exceeds per-call token budget: estimated ${estimate} tokens, cap ${this.maxTokensPerCall}`,
+        });
+      }
+    }
+
+    const prompt = buildRespondPrompt(input);
+
+    const args: CopilotTextCompletionArgs = {
+      model: this.model,
+      messages: prompt.messages,
+      max_tokens: this.maxOutputTokens,
+    };
+    const generation = input.generation;
+    if (generation !== undefined) {
+      if (typeof generation.max_output_tokens === 'number') {
+        args.max_tokens = generation.max_output_tokens;
+      }
+      if (typeof generation.temperature === 'number') {
+        args.temperature = generation.temperature;
+      }
+      if (typeof generation.top_p === 'number') {
+        args.top_p = generation.top_p;
+      }
+      if (typeof generation.seed === 'number') {
+        args.seed = generation.seed;
+      }
+    }
+
+    let response: unknown;
+    try {
+      response = await this.client.textCompletion(args);
+    } catch (err) {
+      if (err instanceof ProviderErrorThrowable) {
+        throw err;
+      }
+      throw new ProviderErrorThrowable(mapCopilotError(err));
+    }
+
+    if (
+      typeof response === 'object' &&
+      response !== null &&
+      Array.isArray((response as Record<string, unknown>).choices) &&
+      ((response as Record<string, unknown>).choices as unknown[])[0] !== undefined
+    ) {
+      const firstChoice = (
+        (response as Record<string, unknown>).choices as Record<string, unknown>[]
+      )[0];
+      if (
+        typeof firstChoice === 'object' &&
+        firstChoice !== null &&
+        (firstChoice as Record<string, unknown>).finish_reason === 'length'
+      ) {
+        throw new ProviderErrorThrowable({
+          kind: 'output_truncated',
+          message: `copilot respond output truncated: finish_reason is 'length' (max_tokens: ${this.maxOutputTokens})`,
+          requested_max_tokens: this.maxOutputTokens,
+        });
+      }
+    }
+
+    const text = extractMessageContent(response);
+    const parsed = ProviderRespondOutputSchema.safeParse({ reply_markdown: text });
+    if (!parsed.success) {
+      throw new ProviderErrorThrowable({
+        kind: 'schema_validation',
+        message: 'copilot respond output failed ProviderRespondOutput schema',
         zod_issues: parsed.error.issues.map((issue) => issue.message),
       });
     }

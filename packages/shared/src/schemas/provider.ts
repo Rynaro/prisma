@@ -138,6 +138,124 @@ export const ProviderReviewOutputSchema = z
   .strict();
 export type ProviderReviewOutput = z.infer<typeof ProviderReviewOutputSchema>;
 
+// ---------------------------------------------------------------------------
+// respond() — reviewer interaction (`@bot ask <message>`)
+// Per docs/_planning/reviewer-interaction/spec.md § 6.
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard caps for the `respond()` provider entry. Single source of truth
+ * (mirrors the `guidance.ts` cap convention) — imported by the GitHub
+ * harvest helpers (`packages/github/src/interactions`) and the worker's
+ * `ask` dispatch (`apps/github-app`) so every caller enforces the same
+ * bounds. Per spec § 6 / § 7 step 6.
+ */
+export const MAX_RESPOND_FINDINGS = 20;
+export const MAX_RESPOND_FINDING_BODY_BYTES = 500;
+export const MAX_RESPOND_SUMMARY_BYTES = 4096;
+export const MAX_RESPOND_THREAD_EXCHANGES = 10;
+export const MAX_RESPOND_THREAD_BYTES = 8192;
+
+/**
+ * `RespondPrMeta` — the PR metadata carried on `ProviderRespondInput.pr`.
+ * No pre-existing shared schema carries exactly this field set (title +
+ * description together): `PrSnapshot` (snapshot.ts) has no title/description,
+ * and the GitHub `PullsGetData` client shape (packages/github) is
+ * vendor-adjacent, not a shared/provider-facing type. Declared fresh here per
+ * spec § 6 (deviation noted: spec says "reuse existing PR meta shape" but no
+ * such shape existed; this is the new canonical one going forward).
+ */
+export const RespondPrMetaSchema = z
+  .object({
+    title: z.string().min(1),
+    /** PR body/description; empty string when the PR has no description. */
+    description: z.string(),
+    base_ref: z.string().min(1),
+    head_ref: z.string().min(1),
+    head_sha: z.string().min(1),
+  })
+  .strict();
+export type RespondPrMeta = z.infer<typeof RespondPrMetaSchema>;
+
+/**
+ * A single harvested finding rendered into the `respond()` review context.
+ * Field names per spec § 6 (`file`, not `path` — distinct from
+ * `ProviderReviewOutputFinding` because it is sourced from an already-posted
+ * inline comment, not a fresh provider output).
+ */
+export const RespondFindingSchema = z
+  .object({
+    file: z.string().min(1),
+    line: z.number().int().positive(),
+    severity: SeveritySchema,
+    category: CategorySchema,
+    title: z.string().min(1),
+    body: z.string().min(1),
+  })
+  .strict();
+export type RespondFinding = z.infer<typeof RespondFindingSchema>;
+
+/**
+ * A prior exchange within the current review round's interaction thread.
+ * `question` is the developer's original `ask` message; `reply_markdown` is
+ * the reviewer's previously-posted reply. Oldest→newest ordering is a
+ * contract of the array position, not a field on this schema.
+ */
+export const RespondExchangeSchema = z
+  .object({
+    author_login: z.string().min(1),
+    question: z.string().min(1),
+    reply_markdown: z.string().min(1),
+  })
+  .strict();
+export type RespondExchange = z.infer<typeof RespondExchangeSchema>;
+
+/**
+ * `ProviderRespondInput` — vendor-neutral input to `Provider.respond()`.
+ * Per spec § 6:
+ *   - `review_context` carries the latest published round's findings +
+ *     check-run summary (both byte-capped by the caller before this schema
+ *     is constructed — see `MAX_RESPOND_*` above).
+ *   - `thread` carries prior exchanges THIS round, oldest→newest; empty on
+ *     the first interaction of a round, or whenever `max_per_review <= 1`
+ *     (spec § 7 step 6 — thread context is only assembled when more than one
+ *     message is allowed per round).
+ *   - `guidance` mirrors `config.review_guidance.instructions` when set.
+ */
+export const ProviderRespondInputSchema = z
+  .object({
+    pr: RespondPrMetaSchema,
+    review_context: z
+      .object({
+        round: z.number().int().positive(),
+        summary_markdown: z.string(),
+        findings: z.array(RespondFindingSchema).max(MAX_RESPOND_FINDINGS),
+      })
+      .strict(),
+    thread: z.array(RespondExchangeSchema).max(MAX_RESPOND_THREAD_EXCHANGES),
+    message: z
+      .object({
+        author_login: z.string().min(1),
+        text: z.string().min(1),
+      })
+      .strict(),
+    guidance: z.string().min(1).optional(),
+    generation: GenerationSchema.optional(),
+  })
+  .strict();
+export type ProviderRespondInput = z.infer<typeof ProviderRespondInputSchema>;
+
+/**
+ * `ProviderRespondOutput` — non-empty markdown reply. The worker truncates
+ * to the 64 KiB issue-comment ceiling before posting (spec § 7 step 7).
+ */
+export const ProviderRespondOutputSchema = z
+  .object({
+    reply_markdown: z.string().min(1),
+  })
+  .strict();
+export type ProviderRespondOutput = z.infer<typeof ProviderRespondOutputSchema>;
+
 /**
  * `ProviderError` discriminated union per `api-contracts.md` § Provider adapter contract
  * and `system-design.md` § Error taxonomy mapping. Variants:

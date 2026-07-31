@@ -4,6 +4,9 @@ import {
   type ProviderError,
   ProviderErrorSchema,
   ProviderErrorThrowable,
+  type ProviderRespondInput,
+  type ProviderRespondOutput,
+  ProviderRespondOutputSchema,
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputFinding,
@@ -32,10 +35,23 @@ export type FakeStep =
   | { kind: 'error'; error: ProviderError }
   | { kind: 'output_lazy'; build: (input: ProviderReviewInput) => ProviderReviewOutput };
 
+/**
+ * Scripted step for `FakeProvider.respond()`. Optional — unlike `review()`,
+ * `respond()` does not require a script: absent/exhausted `respondScript`
+ * falls back to a deterministic canned reply (see `respond()` below) so
+ * evals and worker tests can call `ask` without pre-programming every step.
+ * `respondScript` remains available for negative-path tests (e.g. asserting
+ * the worker's provider-failure reply semantics).
+ */
+export type FakeRespondStep =
+  | { kind: 'output'; output: ProviderRespondOutput }
+  | { kind: 'error'; error: ProviderError };
+
 export interface FakeProviderOptions {
   name?: string;
   capabilities?: ProviderCapabilities;
   script: FakeStep[];
+  respondScript?: FakeRespondStep[];
 }
 
 /**
@@ -56,10 +72,15 @@ export class FakeProvider implements Provider {
   private cursor = 0;
   private readonly recordedCalls: ProviderReviewInput[] = [];
 
+  private readonly respondScript: FakeRespondStep[];
+  private respondCursor = 0;
+  private readonly recordedRespondCalls: ProviderRespondInput[] = [];
+
   constructor(options: FakeProviderOptions) {
     this.name = options.name ?? FAKE_PROVIDER_NAME;
     this.capabilities = options.capabilities ?? DEFAULT_CAPABILITIES;
     this.script = options.script;
+    this.respondScript = options.respondScript ?? [];
   }
 
   get calls(): ReadonlyArray<ProviderReviewInput> {
@@ -68,6 +89,10 @@ export class FakeProvider implements Provider {
 
   get remainingSteps(): number {
     return Math.max(0, this.script.length - this.cursor);
+  }
+
+  get respondCalls(): ReadonlyArray<ProviderRespondInput> {
+    return this.recordedRespondCalls;
   }
 
   async review(input: ProviderReviewInput): Promise<ProviderReviewOutput> {
@@ -87,6 +112,28 @@ export class FakeProvider implements Provider {
     // step.kind === 'error'
     const validatedError = ProviderErrorSchema.parse(step.error);
     throw new ProviderErrorThrowable(validatedError);
+  }
+
+  /**
+   * Deterministic (unless scripted): echoes `round`, the outstanding finding
+   * count, and the thread length, so evals stay key-less and stable per
+   * docs/_planning/reviewer-interaction/spec.md § 6 "FakeProvider.respond()".
+   */
+  async respond(input: ProviderRespondInput): Promise<ProviderRespondOutput> {
+    this.recordedRespondCalls.push(input);
+    const step = this.respondScript[this.respondCursor];
+    if (step !== undefined) {
+      this.respondCursor += 1;
+      if (step.kind === 'error') {
+        const validatedError = ProviderErrorSchema.parse(step.error);
+        throw new ProviderErrorThrowable(validatedError);
+      }
+      return ProviderRespondOutputSchema.parse(step.output);
+    }
+
+    const { review_context, thread } = input;
+    const reply_markdown = `Round ${review_context.round}: I reviewed ${review_context.findings.length} finding(s) and see ${thread.length} prior exchange(s) in this thread. (fake provider canned reply)`;
+    return ProviderRespondOutputSchema.parse({ reply_markdown });
   }
 }
 

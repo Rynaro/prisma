@@ -46,6 +46,13 @@ export interface PullsGetData {
   head: { sha: string; ref: string; repo?: { full_name?: string } | null };
   base: { sha: string; ref: string; repo?: { full_name?: string } | null };
   base_ref?: string | null;
+  /**
+   * PR title + description ("body" in the GitHub API). Added for the
+   * reviewer-interaction `respond()` provider input (`RespondPrMeta`) —
+   * see `docs/_planning/reviewer-interaction/spec.md` § 6.
+   */
+  title: string;
+  body: string | null;
 }
 
 /**
@@ -124,6 +131,20 @@ export interface IssueCommentData {
   id: number;
   body: string | null | undefined;
   user: { login: string; type: string } | null;
+}
+
+/**
+ * Parameters for listing PR/issue conversation comments.
+ * Mapping: octokit.rest.issues.listComments
+ * Used by the reviewer-interaction interaction-ledger harvest (spec § 5) to
+ * find the bot's own prior `ask` reply comments.
+ */
+export interface IssuesListCommentsParams {
+  owner: string;
+  repo: string;
+  issue_number: number;
+  per_page?: number;
+  page?: number;
 }
 
 /**
@@ -261,6 +282,7 @@ export interface OctokitLike {
         repo: string;
         comment_id: number;
       }): Promise<{ data: IssueCommentData }>;
+      listComments(params: IssuesListCommentsParams): Promise<{ data: IssueCommentData[] }>;
     };
     reactions: {
       createForIssueComment(
@@ -341,6 +363,10 @@ export const createDefaultOctokit = (token: string): OctokitLike => {
           inner.rest.issues.getComment(
             params as unknown as Parameters<typeof inner.rest.issues.getComment>[0],
           ) as unknown as Promise<{ data: IssueCommentData }>,
+        listComments: (params) =>
+          inner.rest.issues.listComments(
+            params as unknown as Parameters<typeof inner.rest.issues.listComments>[0],
+          ) as unknown as Promise<{ data: IssueCommentData[] }>,
       },
       reactions: {
         createForIssueComment: (params) =>
