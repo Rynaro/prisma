@@ -1,4 +1,8 @@
-import { ProviderErrorThrowable, type ProviderReviewInput } from '@prisma-bot/shared';
+import {
+  ProviderErrorThrowable,
+  type ProviderRespondInput,
+  type ProviderReviewInput,
+} from '@prisma-bot/shared';
 import { describe, expect, it, vi } from 'vitest';
 import { COPILOT_PROVIDER_NAME, type CopilotClientLike, CopilotProvider } from '../src/index.js';
 
@@ -10,6 +14,26 @@ const validInput: ProviderReviewInput = {
     },
   ],
 };
+
+const validRespondInput: ProviderRespondInput = {
+  pr: {
+    title: 'Fix payment race condition',
+    description: '',
+    base_ref: 'main',
+    head_ref: 'fix/payment-race',
+    head_sha: 'deadbeefcafef00d',
+  },
+  review_context: { round: 2, summary_markdown: 'Round 2', findings: [] },
+  thread: [],
+  message: { author_login: 'alice', text: 'why is finding 2 a security risk?' },
+};
+
+function textCompletionResponse(content: string, finish_reason = 'stop') {
+  return {
+    id: 'chatcmpl-fake',
+    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason }],
+  };
+}
 
 function chatCompletionsResponse(toolArgs: unknown, toolName = 'submit_review_findings') {
   return {
@@ -43,7 +67,7 @@ describe('CopilotProvider', () => {
   it('exposes name = "copilot" and default capabilities', () => {
     const provider = new CopilotProvider({
       apiKey: 'irrelevant',
-      client: { chatCompletions: vi.fn() },
+      client: { chatCompletions: vi.fn(), textCompletion: vi.fn() },
     });
     expect(provider.name).toBe(COPILOT_PROVIDER_NAME);
     expect(provider.name).toBe('copilot');
@@ -68,7 +92,7 @@ describe('CopilotProvider', () => {
         ],
       }),
     );
-    const client: CopilotClientLike = { chatCompletions };
+    const client: CopilotClientLike = { chatCompletions, textCompletion: vi.fn() };
     const provider = new CopilotProvider({ apiKey: 'k', client });
 
     const out = await provider.review(validInput);
@@ -96,7 +120,7 @@ describe('CopilotProvider', () => {
     );
     const provider = new CopilotProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
@@ -116,7 +140,7 @@ describe('CopilotProvider', () => {
     });
     const provider = new CopilotProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
@@ -128,7 +152,7 @@ describe('CopilotProvider', () => {
     const chatCompletions = vi.fn().mockRejectedValue({ status: 401, message: 'invalid api key' });
     const provider = new CopilotProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     try {
       await provider.review(validInput);
@@ -147,7 +171,7 @@ describe('CopilotProvider', () => {
     const provider = new CopilotProvider({
       apiKey: 'k',
       maxTokensPerCall: 1, // any non-trivial input will exceed this
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
     });
     try {
       await provider.review(validInput);
@@ -192,7 +216,10 @@ describe('CopilotProvider', () => {
         },
       ],
     });
-    const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new CopilotProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     await expect(provider.review(validInput)).rejects.toMatchObject({
       name: 'ProviderErrorThrowable',
       cause_kind: 'output_truncated',
@@ -227,7 +254,7 @@ describe('CopilotProvider', () => {
     // Use a non-default maxOutputTokens so we can distinguish it.
     const provider = new CopilotProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
       maxOutputTokens: 8192,
     });
     try {
@@ -245,7 +272,10 @@ describe('CopilotProvider', () => {
   // T11: finish_reason==='tool_calls' (normal) → does NOT throw truncation error
   it('does not throw truncation error when finish_reason is "tool_calls"', async () => {
     const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
-    const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new CopilotProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     const out = await provider.review(validInput);
     expect(out.findings).toHaveLength(0);
   });
@@ -256,7 +286,7 @@ describe('CopilotProvider', () => {
     // Provide non-default value to verify it flows through.
     const provider = new CopilotProvider({
       apiKey: 'k',
-      client: { chatCompletions },
+      client: { chatCompletions, textCompletion: vi.fn() },
       maxOutputTokens: 8192,
     });
     await provider.review(validInput);
@@ -269,9 +299,81 @@ describe('CopilotProvider', () => {
   it('AC1.5: default maxOutputTokens is 4096 (happy-path regression)', async () => {
     const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
     // No maxOutputTokens option → defaults to 4096.
-    const provider = new CopilotProvider({ apiKey: 'k', client: { chatCompletions } });
+    const provider = new CopilotProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+    });
     await provider.review(validInput);
     const callArgs = chatCompletions.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(callArgs.max_tokens).toBe(4096);
+  });
+
+  describe('respond()', () => {
+    it('happy path: text completion → non-empty ProviderRespondOutput', async () => {
+      const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse('Good catch.'));
+      const provider = new CopilotProvider({
+        apiKey: 'k',
+        client: { chatCompletions: vi.fn(), textCompletion },
+      });
+      const out = await provider.respond(validRespondInput);
+      expect(out.reply_markdown).toBe('Good catch.');
+      expect(textCompletion).toHaveBeenCalledTimes(1);
+      const callArgs = textCompletion.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(callArgs.tools).toBeUndefined();
+      expect(callArgs.tool_choice).toBeUndefined();
+      expect(callArgs.max_tokens).toBe(4096);
+    });
+
+    it('throws schema_validation when the message has no text content', async () => {
+      const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse(''));
+      const provider = new CopilotProvider({
+        apiKey: 'k',
+        client: { chatCompletions: vi.fn(), textCompletion },
+      });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'schema_validation',
+      });
+    });
+
+    it('client throws → mapped through mapCopilotError and re-thrown as ProviderErrorThrowable', async () => {
+      const textCompletion = vi.fn().mockRejectedValue({ status: 401, message: 'invalid api key' });
+      const provider = new CopilotProvider({
+        apiKey: 'k',
+        client: { chatCompletions: vi.fn(), textCompletion },
+      });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'auth',
+      });
+    });
+
+    it('throws output_truncated when finish_reason is "length"', async () => {
+      const textCompletion = vi
+        .fn()
+        .mockResolvedValue(textCompletionResponse('partial...', 'length'));
+      const provider = new CopilotProvider({
+        apiKey: 'k',
+        client: { chatCompletions: vi.fn(), textCompletion },
+      });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'output_truncated',
+      });
+    });
+
+    it('over_budget: oversized input throws before client.textCompletion is called', async () => {
+      const textCompletion = vi.fn();
+      const provider = new CopilotProvider({
+        apiKey: 'k',
+        maxTokensPerCall: 1,
+        client: { chatCompletions: vi.fn(), textCompletion },
+      });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'over_budget',
+      });
+      expect(textCompletion).not.toHaveBeenCalled();
+    });
   });
 });

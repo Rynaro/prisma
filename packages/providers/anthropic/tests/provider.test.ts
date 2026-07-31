@@ -1,4 +1,8 @@
-import { ProviderErrorThrowable, type ProviderReviewInput } from '@prisma-bot/shared';
+import {
+  ProviderErrorThrowable,
+  type ProviderRespondInput,
+  type ProviderReviewInput,
+} from '@prisma-bot/shared';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ANTHROPIC_PROVIDER_NAME,
@@ -14,6 +18,23 @@ const validInput: ProviderReviewInput = {
     },
   ],
 };
+
+const validRespondInput: ProviderRespondInput = {
+  pr: {
+    title: 'Fix payment race condition',
+    description: '',
+    base_ref: 'main',
+    head_ref: 'fix/payment-race',
+    head_sha: 'deadbeefcafef00d',
+  },
+  review_context: { round: 2, summary_markdown: 'Round 2', findings: [] },
+  thread: [],
+  message: { author_login: 'alice', text: 'why is finding 2 a security risk?' },
+};
+
+function textResponse(text: string) {
+  return { content: [{ type: 'text', text }] };
+}
 
 function toolUseResponse(input: unknown, toolName = 'submit_review_findings') {
   return {
@@ -229,5 +250,65 @@ describe('AnthropicProvider', () => {
     await provider.review(validInput);
     const callArgs = create.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(callArgs.max_tokens).toBe(4096);
+  });
+
+  describe('respond()', () => {
+    it('happy path: text response → non-empty ProviderRespondOutput', async () => {
+      const create = vi
+        .fn()
+        .mockResolvedValue(textResponse('Good catch — that finding is a false positive.'));
+      const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+      const out = await provider.respond(validRespondInput);
+      expect(out.reply_markdown).toBe('Good catch — that finding is a false positive.');
+      expect(create).toHaveBeenCalledTimes(1);
+      const callArgs = create.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(callArgs.tools).toBeUndefined();
+    });
+
+    it('throws schema_validation when the response has no text content', async () => {
+      const create = vi
+        .fn()
+        .mockResolvedValue({ content: [{ type: 'tool_use', name: 'x', input: {} }] });
+      const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'schema_validation',
+      });
+    });
+
+    it('client throws → mapped through mapAnthropicError and re-thrown as ProviderErrorThrowable', async () => {
+      const create = vi.fn().mockRejectedValue({ status: 401, message: 'invalid api key' });
+      const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'auth',
+      });
+    });
+
+    it('throws output_truncated when stop_reason is "max_tokens"', async () => {
+      const create = vi.fn().mockResolvedValue({
+        stop_reason: 'max_tokens',
+        content: [{ type: 'text', text: 'partial...' }],
+      });
+      const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'output_truncated',
+      });
+    });
+
+    it('over_budget: oversized input throws before client.messages.create is called', async () => {
+      const create = vi.fn();
+      const provider = new AnthropicProvider({
+        apiKey: 'k',
+        maxTokensPerCall: 1,
+        client: { messages: { create } },
+      });
+      await expect(provider.respond(validRespondInput)).rejects.toMatchObject({
+        name: 'ProviderErrorThrowable',
+        cause_kind: 'over_budget',
+      });
+      expect(create).not.toHaveBeenCalled();
+    });
   });
 });

@@ -2,9 +2,13 @@ import {
   type Provider,
   type ProviderCapabilities,
   ProviderErrorThrowable,
+  type ProviderRespondInput,
+  type ProviderRespondOutput,
+  ProviderRespondOutputSchema,
   type ProviderReviewInput,
   type ProviderReviewOutput,
   ProviderReviewOutputSchema,
+  buildRespondPrompt,
   estimatePromptTokens,
   serializeForEstimate,
 } from '@prisma-bot/shared';
@@ -96,6 +100,49 @@ function isToolUseBlock(block: unknown): block is ToolUseBlock {
   }
   const record = block as Record<string, unknown>;
   return record.type === 'tool_use' && typeof record.name === 'string';
+}
+
+interface TextBlock {
+  type: 'text';
+  text: string;
+}
+
+function isTextBlock(block: unknown): block is TextBlock {
+  if (typeof block !== 'object' || block === null) {
+    return false;
+  }
+  const record = block as Record<string, unknown>;
+  return record.type === 'text' && typeof record.text === 'string';
+}
+
+/** Concatenate every `text` content block into a single trimmed string. */
+function extractTextContent(response: unknown): string {
+  if (typeof response !== 'object' || response === null) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'anthropic response was not an object',
+    });
+  }
+  const record = response as Record<string, unknown>;
+  const content = record.content;
+  if (!Array.isArray(content)) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'anthropic response missing content array',
+    });
+  }
+  const text = content
+    .filter(isTextBlock)
+    .map((block) => block.text)
+    .join('\n')
+    .trim();
+  if (text.length === 0) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'anthropic response contained no text content',
+    });
+  }
+  return text;
 }
 
 function extractToolUseInput(response: unknown, toolName: string): unknown {
@@ -232,6 +279,75 @@ export class AnthropicProvider implements Provider {
       throw new ProviderErrorThrowable({
         kind: 'schema_validation',
         message: 'anthropic tool_use input failed ProviderReviewOutput schema',
+        zod_issues: parsed.error.issues.map((issue) => issue.message),
+      });
+    }
+    return parsed.data;
+  }
+
+  /**
+   * `respond()` — reviewer-interaction entry point (`@bot ask <message>`).
+   * Unlike `review()`, no tool/JSON-schema is involved: a plain-text
+   * completion is requested and the assistant's text content is returned as
+   * `reply_markdown`. Error mapping mirrors `review()`.
+   *
+   * The token-budget guard uses a simple chars/4 estimate (the same
+   * cost-ceiling-proxy heuristic `review()` used before the unified
+   * estimator existed) rather than `estimatePromptTokens`/`serializeForEstimate`,
+   * which are typed specifically for `ProviderReviewInput`'s diff-hunk shape.
+   * This is safe because `ProviderRespondInput` is already hard-capped
+   * (`MAX_RESPOND_FINDINGS`/`MAX_RESPOND_FINDING_BODY_BYTES`/
+   * `MAX_RESPOND_SUMMARY_BYTES`/`MAX_RESPOND_THREAD_BYTES`) by the caller
+   * before this schema is constructed, so a rough estimate is sufficient.
+   */
+  async respond(input: ProviderRespondInput): Promise<ProviderRespondOutput> {
+    if (this.maxTokensPerCall !== undefined) {
+      const estimate = Math.ceil(JSON.stringify(input).length / 4);
+      if (estimate > this.maxTokensPerCall) {
+        throw new ProviderErrorThrowable({
+          kind: 'over_budget',
+          estimated_tokens: estimate,
+          hard_cap_in: this.maxTokensPerCall,
+          message: `request exceeds per-call token budget: estimated ${estimate} tokens, cap ${this.maxTokensPerCall}`,
+        });
+      }
+    }
+
+    const prompt = buildRespondPrompt(input);
+
+    let response: unknown;
+    try {
+      response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: this.maxOutputTokens,
+        system: prompt.system,
+        messages: prompt.messages,
+      });
+    } catch (err) {
+      if (err instanceof ProviderErrorThrowable) {
+        throw err;
+      }
+      throw new ProviderErrorThrowable(mapAnthropicError(err));
+    }
+
+    if (
+      typeof response === 'object' &&
+      response !== null &&
+      (response as Record<string, unknown>).stop_reason === 'max_tokens'
+    ) {
+      throw new ProviderErrorThrowable({
+        kind: 'output_truncated',
+        message: `anthropic respond output truncated: stop_reason is 'max_tokens' (max_tokens: ${this.maxOutputTokens})`,
+        requested_max_tokens: this.maxOutputTokens,
+      });
+    }
+
+    const text = extractTextContent(response);
+    const parsed = ProviderRespondOutputSchema.safeParse({ reply_markdown: text });
+    if (!parsed.success) {
+      throw new ProviderErrorThrowable({
+        kind: 'schema_validation',
+        message: 'anthropic respond output failed ProviderRespondOutput schema',
         zod_issues: parsed.error.issues.map((issue) => issue.message),
       });
     }
