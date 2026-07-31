@@ -169,6 +169,52 @@ The provider adapter is the only place a vendor SDK is imported. The first refer
 
 - **Invariant.** No vendor SDK type leaks into or out of `review`. The adapter at `packages/providers/anthropic` exports only the `Provider` interface and the Phase-2/Phase-1 schemas; no Anthropic SDK type, response shape, or error class crosses the package boundary.
 
+### `respond()` — reviewer interaction (`@bot ask <message>`)
+
+Amendment to ADR-002 (see `docs/architecture-decision-records/adr-002-provider-abstraction.md`
+§ Amendment): `Provider` gained a second **mandatory** method, `respond()`, for
+the reviewer-interaction feature. Chosen over a capability-gated optional
+method because every adapter can produce plain markdown and a mandatory
+method keeps the pipeline free of runtime capability branching.
+
+- **Signature.**
+
+  ```ts
+  interface Provider {
+    review(input: ProviderReviewInput): Promise<ProviderReviewOutput>;
+    respond(input: ProviderRespondInput): Promise<ProviderRespondOutput>;
+    capabilities: ProviderCapabilities;
+  }
+  ```
+
+- **`ProviderRespondInput`** (`packages/shared/src/schemas/provider.ts`, `.strict()`):
+  `pr` (title/description/base_ref/head_ref/head_sha), `review_context`
+  (`round`, `summary_markdown`, `findings: RespondFinding[]` — `file`, `line`,
+  `severity`, `category`, `title`, `body`), `thread: RespondExchange[]` (prior
+  exchanges this round, oldest→newest; empty when this is the first exchange
+  of the round or `interactions.max_per_review <= 1`), `message`
+  (`author_login`, `text`), optional `guidance`, optional `generation`. Every
+  size-sensitive field is hard-capped by the caller before this schema is
+  constructed (`MAX_RESPOND_FINDINGS`, `MAX_RESPOND_FINDING_BODY_BYTES`,
+  `MAX_RESPOND_SUMMARY_BYTES`, `MAX_RESPOND_THREAD_EXCHANGES`,
+  `MAX_RESPOND_THREAD_BYTES` — single source of truth in
+  `packages/shared/src/schemas/provider.ts`, mirroring the `guidance.ts` cap
+  convention).
+
+- **`ProviderRespondOutput`.** `{ reply_markdown: string }` (non-empty). No
+  tool/JSON-schema contract is involved — every adapter requests a plain-text
+  completion (no `tools`); the worker truncates the rendered reply comment to
+  the 64 KiB issue-comment ceiling before posting.
+
+- **Error union.** Identical to `review()` — adapters map vendor failures to
+  the same five `ProviderError` variants and throw `ProviderErrorThrowable`.
+  A failed `respond()` call never posts an interaction marker (no budget is
+  consumed on failure).
+
+- **Invariant.** No vendor SDK type leaks into or out of `respond()`, same as
+  `review()`. Adapters never log `ProviderRespondInput`/`ProviderRespondOutput`
+  bodies.
+
 ## Validator contract
 
 The validator consumes `ProviderReviewOutput` and produces a list of `NormalizedFinding` plus a list of `RejectionLogEntry`.

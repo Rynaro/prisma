@@ -1,0 +1,82 @@
+id: ask-disabled
+name: "Reviewer interaction: disabled (default off)"
+description: >-
+  interactions is not configured (default: enabled=false). An `ask` comment
+  MUST get a friendly opt-in reply and MUST NOT call the provider — the
+  disabled gate is checked before any harvest I/O (spec § 7 step 1), so this
+  scenario also regression-guards the "no round published yet" fixture data
+  below never being consulted.
+
+  Per spec § 9 acceptance: "AS a repo owner, WHEN I don't opt in, `ask`
+  never calls the provider."
+
+  Note: routed to the ask runner (`ask_request` present); the
+  `provider_script`/most of `expectations` below are unused placeholders.
+
+config_overrides: {}
+
+pr_payload:
+  action: opened
+  installation:
+    id: 3002
+  repository:
+    id: 4002
+    full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
+  pull_request:
+    number: 303
+    head:
+      sha: "5555555555555555555555555555555555555e"
+
+octokit_responses:
+  pulls_get:
+    number: 303
+    head:
+      sha: "5555555555555555555555555555555555555e"
+      ref: fix/payment-race
+    base:
+      sha: "6666666666666666666666666666666666666f"
+      ref: main
+    title: "Fix payment race condition"
+    body: null
+  pulls_list_files: []
+
+provider_script: []
+
+expectations:
+  prefilter:
+    outcome: all-excluded
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 0
+  provider:
+    calls: 0
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    expected_categories: []
+    rejection_reasons: []
+    approvals_submitted: 0
+    approval_dismissals: 0
+
+metrics:
+  - comment_usefulness
+
+ask_request:
+  commenter_login: dave
+  message: "why did you flag this?"
+
+ask_expectations:
+  kind: disabled
+  reply_contains: []
+  reply_not_contains: []
+  provider_calls: 0

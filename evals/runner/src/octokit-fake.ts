@@ -41,6 +41,10 @@ export interface FakeOctokitCallCounts {
   pr_reviews_list: number;
   /** `pulls.dismissReview` calls (S8 — stale-approval dismissals). */
   pr_reviews_dismiss: number;
+  /** `issues.createComment` calls (reviewer-interaction — `ask` replies). */
+  issue_comments_create: number;
+  /** `issues.listComments` calls (reviewer-interaction — interaction-ledger harvest). */
+  issue_comments_list: number;
 }
 
 export interface FakeOctokitHandle {
@@ -58,6 +62,8 @@ export interface FakeOctokitHandle {
   submittedReviews: Array<{ event: string; body: string; commit_id: string }>;
   /** PR reviews dismissed this run via `pulls.dismissReview` (S8). */
   dismissedReviews: Array<{ review_id: number; message: string }>;
+  /** Issue/PR conversation comments posted via `issues.createComment` (reviewer-interaction replies). */
+  postedIssueComments: Array<{ body: string }>;
 }
 
 const normaliseInputStatus = (
@@ -77,6 +83,8 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
     pr_reviews_create: 0,
     pr_reviews_list: 0,
     pr_reviews_dismiss: 0,
+    issue_comments_create: 0,
+    issue_comments_list: 0,
   };
   const postedInlineComments: Array<{ path: string; line: number; body: string }> = [];
   const checkRunUpdates: Array<{
@@ -86,9 +94,11 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
   }> = [];
   const submittedReviews: Array<{ event: string; body: string; commit_id: string }> = [];
   const dismissedReviews: Array<{ review_id: number; message: string }> = [];
+  const postedIssueComments: Array<{ body: string }> = [];
 
   let nextCheckRunId = 1;
   let nextReviewId = 9001;
+  let nextIssueCommentId = 20001;
 
   const pullsGetData: PullsGetData = options.responses.pulls_get;
   const allFiles: ChangedFileEntry[] = options.filesPayload;
@@ -96,6 +106,7 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
   const priorCheckRuns = options.responses.prior_check_runs ?? [];
   const reposGetContentMap = options.responses.repos_get_content ?? {};
   const priorReviews = options.responses.prior_reviews ?? [];
+  const priorIssueComments = options.responses.prior_issue_comments ?? [];
 
   const octokit: OctokitLike = {
     rest: {
@@ -194,7 +205,12 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
                 status: 'completed',
                 conclusion: run.conclusion,
                 output: { title: null, summary: run.output_summary, text: null },
-                app: { id: null },
+                // Matches `REPO_IDENTITY.app_id` (pipeline-runner.ts / ask-runner.ts,
+                // both 999) so `CheckRunsClient.listOurs`'s `run.app.id === app_id`
+                // filter recognizes these as "our" runs — required for the
+                // round-marker harvest (`harvestPriorRound` / `harvestLatestRoundSummary`)
+                // to see `prior_check_runs` fixture entries at all.
+                app: { id: 999 },
               })),
             },
           };
@@ -270,8 +286,26 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
         },
       },
       issues: {
-        createComment: async () => ({ data: { id: 1, body: null, user: null } }),
+        createComment: async (params) => {
+          calls.issue_comments_create += 1;
+          postedIssueComments.push({ body: params.body });
+          const id = nextIssueCommentId;
+          nextIssueCommentId += 1;
+          return {
+            data: { id, body: params.body, user: { login: 'prisma-bot[bot]', type: 'Bot' } },
+          };
+        },
         getComment: async () => ({ data: { id: 1, body: null, user: null } }),
+        listComments: async () => {
+          calls.issue_comments_list += 1;
+          return {
+            data: priorIssueComments.map((c) => ({
+              id: c.id,
+              body: c.body,
+              user: { login: 'prisma-bot[bot]', type: 'Bot' },
+            })),
+          };
+        },
       },
       reactions: {
         createForIssueComment: async () => ({ data: { id: 1 } }),
@@ -286,5 +320,6 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
     checkRunUpdates,
     submittedReviews,
     dismissedReviews,
+    postedIssueComments,
   };
 };

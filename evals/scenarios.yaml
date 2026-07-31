@@ -79,3 +79,15 @@ scenarios:
     name: "dry-run never approves, never celebrates, and never flips the conclusion"
     fixture: fixtures/dry-run-never-approves.yaml
     tags: ["comment_usefulness"]
+  - id: ask-happy-path
+    name: "Reviewer interaction: ask happy path"
+    fixture: fixtures/ask-happy-path.yaml
+    tags: ["comment_usefulness"]
+  - id: ask-cap-exceeded
+    name: "Reviewer interaction: cap exceeded"
+    fixture: fixtures/ask-cap-exceeded.yaml
+    tags: ["comment_usefulness"]
+  - id: ask-disabled
+    name: "Reviewer interaction: disabled (default off)"
+    fixture: fixtures/ask-disabled.yaml
+    tags: ["comment_usefulness"]
