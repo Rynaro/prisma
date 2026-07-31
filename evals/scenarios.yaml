@@ -59,3 +59,23 @@ scenarios:
     name: "Reasoning model (gpt-5.4-nano) returns empty findings — model-aware notice emitted"
     fixture: fixtures/reasoning-model-empty-review.yaml
     tags: ["reasoning_model_compatibility", "false_positive_rate"]
+  - id: positive-feedback-highlights
+    name: "Positive feedback: highlights capped at max_items"
+    fixture: fixtures/positive-feedback-highlights.yaml
+    tags: ["comment_usefulness"]
+  - id: clean-review-approval-message
+    name: "Clean review: celebrate_clean replaces _No findings._ with an approval message"
+    fixture: fixtures/clean-review-approval-message.yaml
+    tags: ["comment_usefulness"]
+  - id: clean-review-approve-on-clean
+    name: "Clean review: approve_on_clean submits a real GitHub approval"
+    fixture: fixtures/clean-review-approve-on-clean.yaml
+    tags: ["comment_usefulness"]
+  - id: approve-on-clean-idempotent
+    name: "approve_on_clean is idempotent: an existing approval is not duplicated"
+    fixture: fixtures/approve-on-clean-idempotent.yaml
+    tags: ["comment_usefulness"]
+  - id: dry-run-never-approves
+    name: "dry-run never approves, never celebrates, and never flips the conclusion"
+    fixture: fixtures/dry-run-never-approves.yaml
+    tags: ["comment_usefulness"]

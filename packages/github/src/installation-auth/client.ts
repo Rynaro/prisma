@@ -29,6 +29,12 @@ import { Octokit } from '@octokit/rest';
  *                                 → octokit.rest.pulls.createReviewComment
  *   - rest.pulls_reviews.listReviewComments
  *                                 → octokit.rest.pulls.listReviewComments
+ *   - rest.pulls_reviews.createReview
+ *                                 → octokit.rest.pulls.createReview
+ *   - rest.pulls_reviews.listReviews
+ *                                 → octokit.rest.pulls.listReviews
+ *   - rest.pulls_reviews.dismissReview
+ *                                 → octokit.rest.pulls.dismissReview
  *   - rest.issues.createComment   → octokit.rest.issues.createComment
  *   - rest.issues.getComment      → octokit.rest.issues.getComment
  *   - rest.reactions.createForIssueComment
@@ -153,6 +159,38 @@ export interface PullsReviewCommentData {
   user: { login: string; type: string } | null;
 }
 
+export interface PullsCreateReviewParams {
+  owner: string;
+  repo: string;
+  pull_number: number;
+  /**
+   * Fixed at the seam. This App submits approvals only; `REQUEST_CHANGES` and
+   * `COMMENT` are deliberately not expressible through this type.
+   */
+  event: 'APPROVE';
+  body: string;
+  /** Pin the approval to the exact commit that was reviewed. */
+  commit_id: string;
+}
+
+export interface PullsReviewData {
+  id: number;
+  /** 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED' | 'PENDING' */
+  state: string;
+  body: string | null;
+  user: { login: string; type: string } | null;
+  commit_id?: string | null;
+  submitted_at?: string | null;
+}
+
+export interface PullsDismissReviewParams {
+  owner: string;
+  repo: string;
+  pull_number: number;
+  review_id: number;
+  message: string;
+}
+
 export interface OctokitLike {
   rest: {
     pulls: {
@@ -206,6 +244,15 @@ export interface OctokitLike {
         per_page?: number;
         page?: number;
       }): Promise<{ data: PullsReviewCommentData[] }>;
+      createReview(params: PullsCreateReviewParams): Promise<{ data: PullsReviewData }>;
+      listReviews(params: {
+        owner: string;
+        repo: string;
+        pull_number: number;
+        per_page?: number;
+        page?: number;
+      }): Promise<{ data: PullsReviewData[] }>;
+      dismissReview(params: PullsDismissReviewParams): Promise<{ data: PullsReviewData }>;
     };
     issues: {
       createComment(params: IssuesCreateCommentParams): Promise<{ data: IssueCommentData }>;
@@ -272,6 +319,18 @@ export const createDefaultOctokit = (token: string): OctokitLike => {
           inner.rest.pulls.listReviewComments(params) as unknown as Promise<{
             data: PullsReviewCommentData[];
           }>,
+        createReview: (params) =>
+          inner.rest.pulls.createReview(
+            params as unknown as Parameters<typeof inner.rest.pulls.createReview>[0],
+          ) as unknown as Promise<{ data: PullsReviewData }>,
+        listReviews: (params) =>
+          inner.rest.pulls.listReviews(params) as unknown as Promise<{
+            data: PullsReviewData[];
+          }>,
+        dismissReview: (params) =>
+          inner.rest.pulls.dismissReview(
+            params as unknown as Parameters<typeof inner.rest.pulls.dismissReview>[0],
+          ) as unknown as Promise<{ data: PullsReviewData }>,
       },
       issues: {
         createComment: (params) =>

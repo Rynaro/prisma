@@ -46,6 +46,13 @@ const buildFake = (): FakeOctokit => {
         data: { id: 1, body: '', path: '', line: null, user: null },
       }),
       listReviewComments: async () => ({ data: [] }),
+      createReview: async () => ({
+        data: { id: 1, state: 'APPROVED', body: '', user: null },
+      }),
+      listReviews: async () => ({ data: [] }),
+      dismissReview: async () => ({
+        data: { id: 1, state: 'DISMISSED', body: '', user: null },
+      }),
     },
     issues: {
       createComment: async (params) => {

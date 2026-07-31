@@ -118,6 +118,79 @@ describe('ScenarioFixtureSchema', () => {
     const fixture = validFixture({ unexpected_top_level_key: true });
     expect(() => ScenarioFixtureSchema.parse(fixture)).toThrow();
   });
+
+  // --- S8: highlights, prior_reviews, publisher expectation fields ---
+
+  it('accepts an optional highlights array on a provider_script output step', () => {
+    const fixture = validFixture({
+      provider_script: [
+        {
+          kind: 'output',
+          output: {
+            findings: [],
+            highlights: [
+              {
+                path: 'src/db/query.ts',
+                message: 'Good parameterization',
+                rationale: 'Avoids SQLi',
+              },
+              { message: 'Clear naming', rationale: 'Easier to follow' },
+            ],
+          },
+        },
+      ],
+    });
+    const parsed = ScenarioFixtureSchema.parse(fixture);
+    expect(parsed.provider_script[0]).toMatchObject({ kind: 'output' });
+    if (parsed.provider_script[0]?.kind === 'output') {
+      expect(parsed.provider_script[0].output.highlights).toHaveLength(2);
+    }
+  });
+
+  it('accepts octokit_responses.prior_reviews (S8)', () => {
+    const fixture = validFixture({
+      octokit_responses: {
+        ...(validFixture().octokit_responses as Record<string, unknown>),
+        prior_reviews: [
+          {
+            id: 555,
+            state: 'APPROVED',
+            user: { login: 'prisma-bot[bot]', type: 'Bot' },
+            commit_id: 'a'.repeat(40),
+          },
+        ],
+      },
+    });
+    const parsed = ScenarioFixtureSchema.parse(fixture);
+    expect(parsed.octokit_responses.prior_reviews).toHaveLength(1);
+  });
+
+  it('publisher expectations default approvals_submitted / approval_dismissals to 0 and summary_not_contains to []', () => {
+    const parsed = ScenarioFixtureSchema.parse(validFixture());
+    expect(parsed.expectations.publisher.approvals_submitted).toBe(0);
+    expect(parsed.expectations.publisher.approval_dismissals).toBe(0);
+    expect(parsed.expectations.publisher.summary_not_contains).toEqual([]);
+    expect(parsed.expectations.publisher.check_conclusion).toBeUndefined();
+  });
+
+  it('accepts an explicit check_conclusion / approvals_submitted / approval_dismissals / summary_not_contains block', () => {
+    const fixture = validFixture({
+      expectations: {
+        ...(validFixture().expectations as Record<string, unknown>),
+        publisher: {
+          ...(validFixture().expectations as { publisher: Record<string, unknown> }).publisher,
+          check_conclusion: 'success',
+          approvals_submitted: 1,
+          approval_dismissals: 0,
+          summary_not_contains: ['_No findings._'],
+        },
+      },
+    });
+    const parsed = ScenarioFixtureSchema.parse(fixture);
+    expect(parsed.expectations.publisher.check_conclusion).toBe('success');
+    expect(parsed.expectations.publisher.approvals_submitted).toBe(1);
+    expect(parsed.expectations.publisher.summary_not_contains).toEqual(['_No findings._']);
+  });
 });
 
 describe('ScenarioIndexSchema', () => {

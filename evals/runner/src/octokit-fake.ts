@@ -10,6 +10,7 @@ import type { ChangedFileEntry, PullsGetData, ScenarioOctokitResponses } from '.
  *   - rest.pulls.listFiles (pagination supported via per_page / page)
  *   - rest.checks.create / rest.checks.update / rest.checks.listForRef
  *   - rest.pulls_reviews.createReviewComment / listReviewComments
+ *   - rest.pulls_reviews.createReview / listReviews / dismissReview (S8)
  *
  * Every method increments a per-method call counter so the harness can assert
  * on observed traffic without mocking individual functions.
@@ -34,6 +35,12 @@ export interface FakeOctokitCallCounts {
   checks_list_for_ref: number;
   review_comments_create: number;
   review_comments_list: number;
+  /** `pulls.createReview` calls (S8 — approval submissions). */
+  pr_reviews_create: number;
+  /** `pulls.listReviews` calls (S8 — `findOurApproval` lookups). */
+  pr_reviews_list: number;
+  /** `pulls.dismissReview` calls (S8 — stale-approval dismissals). */
+  pr_reviews_dismiss: number;
 }
 
 export interface FakeOctokitHandle {
@@ -47,6 +54,10 @@ export interface FakeOctokitHandle {
     conclusion: string | undefined;
     summary: string | undefined;
   }>;
+  /** PR reviews submitted this run via `pulls.createReview` (S8). */
+  submittedReviews: Array<{ event: string; body: string; commit_id: string }>;
+  /** PR reviews dismissed this run via `pulls.dismissReview` (S8). */
+  dismissedReviews: Array<{ review_id: number; message: string }>;
 }
 
 const normaliseInputStatus = (
@@ -63,6 +74,9 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
     checks_list_for_ref: 0,
     review_comments_create: 0,
     review_comments_list: 0,
+    pr_reviews_create: 0,
+    pr_reviews_list: 0,
+    pr_reviews_dismiss: 0,
   };
   const postedInlineComments: Array<{ path: string; line: number; body: string }> = [];
   const checkRunUpdates: Array<{
@@ -70,14 +84,18 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
     conclusion: string | undefined;
     summary: string | undefined;
   }> = [];
+  const submittedReviews: Array<{ event: string; body: string; commit_id: string }> = [];
+  const dismissedReviews: Array<{ review_id: number; message: string }> = [];
 
   let nextCheckRunId = 1;
+  let nextReviewId = 9001;
 
   const pullsGetData: PullsGetData = options.responses.pulls_get;
   const allFiles: ChangedFileEntry[] = options.filesPayload;
   const priorReviewComments = options.responses.prior_review_comments ?? [];
   const priorCheckRuns = options.responses.prior_check_runs ?? [];
   const reposGetContentMap = options.responses.repos_get_content ?? {};
+  const priorReviews = options.responses.prior_reviews ?? [];
 
   const octokit: OctokitLike = {
     rest: {
@@ -212,6 +230,44 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
             })),
           };
         },
+        createReview: async (params) => {
+          calls.pr_reviews_create += 1;
+          const id = nextReviewId;
+          nextReviewId += 1;
+          submittedReviews.push({
+            event: params.event,
+            body: params.body,
+            commit_id: params.commit_id,
+          });
+          return {
+            data: {
+              id,
+              state: 'APPROVED',
+              body: params.body,
+              user: null,
+              commit_id: params.commit_id,
+            },
+          };
+        },
+        listReviews: async () => {
+          calls.pr_reviews_list += 1;
+          return {
+            data: priorReviews.map((r) => ({
+              id: r.id,
+              state: r.state,
+              body: r.body ?? null,
+              user: r.user,
+              commit_id: r.commit_id ?? null,
+            })),
+          };
+        },
+        dismissReview: async (params) => {
+          calls.pr_reviews_dismiss += 1;
+          dismissedReviews.push({ review_id: params.review_id, message: params.message });
+          return {
+            data: { id: params.review_id, state: 'DISMISSED', body: null, user: null },
+          };
+        },
       },
       issues: {
         createComment: async () => ({ data: { id: 1, body: null, user: null } }),
@@ -223,5 +279,12 @@ export const buildFakeOctokit = (options: FakeOctokitOptions): FakeOctokitHandle
     },
   };
 
-  return { octokit, calls, postedInlineComments, checkRunUpdates };
+  return {
+    octokit,
+    calls,
+    postedInlineComments,
+    checkRunUpdates,
+    submittedReviews,
+    dismissedReviews,
+  };
 };

@@ -1,6 +1,7 @@
 import { type NormalizedFinding, type RepoConfig, RepoConfigSchema } from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
 import type { CheckRunsClient } from '../../src/check-runs/index.js';
+import type { PrReviewsClient } from '../../src/pr-reviews/index.js';
 import {
   type PublishContext,
   type PublisherDeps,
@@ -95,6 +96,53 @@ const buildFakes = (): { checks: FakeChecks; comments: FakeComments } => {
   comments.listOurs = async () => listResults;
 
   return { checks: checks as FakeChecks, comments: comments as FakeComments };
+};
+
+interface FakePrReviews extends PrReviewsClient {
+  approveCalls: Array<{
+    owner: string;
+    repo: string;
+    pull_number: number;
+    commit_id: string;
+    body: string;
+  }>;
+  dismissCalls: Array<{
+    owner: string;
+    repo: string;
+    pull_number: number;
+    review_id: number;
+    message: string;
+  }>;
+  setExistingApproval: (approval: { id: number; commit_id?: string | null } | null) => void;
+  setApproveError: (err: unknown) => void;
+}
+
+const buildPrReviewsFake = (): FakePrReviews => {
+  let existing: { id: number; commit_id?: string | null } | null = null;
+  let approveError: unknown;
+  const fake: Partial<FakePrReviews> = {};
+  fake.approveCalls = [];
+  fake.dismissCalls = [];
+  fake.setExistingApproval = (approval) => {
+    existing = approval;
+  };
+  fake.setApproveError = (err) => {
+    approveError = err;
+  };
+  fake.findOurApproval = async () => existing;
+  fake.approve = async (args) => {
+    if (approveError !== undefined) {
+      const err = approveError;
+      approveError = undefined;
+      throw err;
+    }
+    fake.approveCalls?.push(args);
+    return { review_id: 9001 };
+  };
+  fake.dismiss = async (args) => {
+    fake.dismissCalls?.push(args);
+  };
+  return fake as FakePrReviews;
 };
 
 const finding = (overrides: Partial<NormalizedFinding> & { id: string }): NormalizedFinding => ({
@@ -336,5 +384,91 @@ describe('publish', () => {
     const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
     const round = await harvestPriorRound(deps, ctx);
     expect(round).toBe(5);
+  });
+
+  // --- S6: conclusion switch + approval sync (AC-022 ... AC-028) ---
+
+  it('publishes a success conclusion for a clean review', async () => {
+    const { checks, comments } = buildFakes();
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments };
+    const cleanCfg = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      approval: { clean_conclusion: 'success' },
+    });
+    const result = await publish([], cleanCfg, ctx, deps, 'incremental', undefined, {
+      clean_review: true,
+    });
+    expect(checks.finalizeCalls[0]?.conclusion).toBe('success');
+    expect(result.checks_run_id).not.toBe('');
+  });
+
+  it('submits exactly one approving review', async () => {
+    const { checks, comments } = buildFakes();
+    const prReviews = buildPrReviewsFake();
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments, prReviews };
+    const cleanCfg = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      approval: { approve_on_clean: true },
+    });
+    await publish([], cleanCfg, ctx, deps, 'incremental', undefined, { clean_review: true });
+    expect(prReviews.approveCalls).toHaveLength(1);
+    expect(prReviews.approveCalls[0]?.commit_id).toBe(ctx.head_sha);
+  });
+
+  it('does not re-approve when an approval already exists', async () => {
+    const { checks, comments } = buildFakes();
+    const prReviews = buildPrReviewsFake();
+    prReviews.setExistingApproval({ id: 555, commit_id: 'priorsha' });
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments, prReviews };
+    const cleanCfg = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      approval: { approve_on_clean: true },
+    });
+    await publish([], cleanCfg, ctx, deps, 'incremental', undefined, { clean_review: true });
+    expect(prReviews.approveCalls).toHaveLength(0);
+  });
+
+  it('never approves in dry-run', async () => {
+    const { checks, comments } = buildFakes();
+    const prReviews = buildPrReviewsFake();
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments, prReviews };
+    const dryCfg = RepoConfigSchema.parse({
+      mode: 'dry-run',
+      approval: { approve_on_clean: true, celebrate_clean: true },
+    });
+    await publish([], dryCfg, ctx, deps, 'incremental', undefined, { clean_review: true });
+    expect(prReviews.approveCalls).toHaveLength(0);
+  });
+
+  it('dismisses a stale approval when findings appear', async () => {
+    const { checks, comments } = buildFakes();
+    const prReviews = buildPrReviewsFake();
+    prReviews.setExistingApproval({ id: 777, commit_id: 'priorsha' });
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments, prReviews };
+    const managedCfg = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      approval: { approve_on_clean: true },
+    });
+    const ranked = [finding({ id: 'A' })];
+    // Not a clean review: findings are present, so no clean_review assertion.
+    await publish(ranked, managedCfg, ctx, deps, 'incremental');
+    expect(prReviews.dismissCalls).toHaveLength(1);
+    expect(prReviews.dismissCalls[0]?.review_id).toBe(777);
+  });
+
+  it('approval failure never fails check publication', async () => {
+    const { checks, comments } = buildFakes();
+    const prReviews = buildPrReviewsFake();
+    prReviews.setApproveError(new Error('approval-api-down'));
+    const deps: PublisherDeps = { checkRuns: checks, reviewComments: comments, prReviews };
+    const cleanCfg = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      approval: { approve_on_clean: true },
+    });
+    const result = await publish([], cleanCfg, ctx, deps, 'incremental', undefined, {
+      clean_review: true,
+    });
+    expect(result.checks_run_id).not.toBe('');
+    expect(result.rejections.some((r) => r.reason_code === 'github.api_error')).toBe(true);
   });
 });

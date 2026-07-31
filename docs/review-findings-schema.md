@@ -140,6 +140,40 @@ Identifiers reused verbatim from Phase 1: `ProviderReviewInput`, `ProviderReview
 - **Validation rule (plain English).** When present, every entry is a non-empty string. Validator-emitted commentary (e.g., "evidence references hunk H3").
 - **Audit purpose.** Explains validator decisions in the structured log without changing the finding's user-visible content.
 
+## Highlights
+
+A highlight is a provider-reported "good decision" visible in the diff. **A
+highlight is not a finding** — it deliberately carries none of a finding's
+audit apparatus: no `line_start`/`line_end` anchor, no `severity`, no
+`category`, no `dedupe_key`, no ranking, no inline comment, no participation
+in `comment_cap`. It never appears in `PublicationResult.published_inline`,
+`published_summary`, or `dropped` — the publisher's partition invariant over
+findings is entirely unaffected by highlights.
+
+Highlights are opt-in (`positive_feedback.enabled`, `config-spec.md` §
+`positive_feedback`) and, when the repo has opted in, are validated,
+deduped, and deterministically capped before rendering.
+
+### Highlight field reference
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `path` | String | Optional | When present, MUST be one of the input files; the validator drops (reason code `highlight_path_not_in_diff`) any highlight naming a file outside the analyzable diff. |
+| `message` | String | Required | One line naming the good decision. Max 200 characters after normalization (trim + collapse whitespace); over-length is dropped (`highlight_too_long`), not truncated. |
+| `rationale` | String | Required | Why the decision is good, grounded in the supplied hunks. Max 500 characters after normalization; over-length is dropped (`highlight_too_long`). |
+
+### Validator rules (ordered; every drop logged)
+
+1. `positive_feedback.enabled !== true` → the entire `highlights` array is ignored without inspection (no rejection logged — a provider that emits highlights anyway is silently ignored).
+2. Normalize `message` and `rationale` (trim + collapse whitespace runs).
+3. Either normalized string empty → drop (`highlight_blank`).
+4. Over the length cap → drop (`highlight_too_long`).
+5. `path` present and not an analyzable file → drop (`highlight_path_not_in_diff`).
+6. Normalized `message` (lowercased) already seen → drop (`highlight_duplicate`). Dedupe happens **before** the cap, so duplicates never consume a cap slot.
+7. Survivor index at or beyond `positive_feedback.max_items` → drop (`highlight_over_cap`).
+
+Survivors keep provider order. Every drop is logged as a `RejectionLogEntry` with `stage: 'validator'`, `finding_id: null`, and one of the `reason_code` values above — the same rejection-log shape findings use (§ Rejection log entry shape below), so highlight drops are auditable exactly like finding drops even though highlights are not findings.
+
 ## Vocabularies
 
 ### Severity vocabulary

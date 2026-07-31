@@ -16,4 +16,4 @@ export type {
 export { CLEAN_APPROVAL_MESSAGE, planPublication } from './planner.js';
 
 export type { PublishContext, PublisherDeps } from './effects.js';
-export { harvestPriorRound, publish } from './effects.js';
+export { STALE_APPROVAL_DISMISS_MESSAGE, harvestPriorRound, publish } from './effects.js';

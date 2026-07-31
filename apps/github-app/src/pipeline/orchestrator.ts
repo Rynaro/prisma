@@ -14,9 +14,11 @@ import {
   type ContentFetcher,
   type InstallationAuth,
   type OctokitLike,
+  type PublicationExtras,
   type PublishContext,
   type PublisherDeps,
   buildCheckRunsClient,
+  buildPrReviewsClient,
   buildReviewCommentsClient,
   publish as defaultPublish,
 } from '@prisma-bot/github';
@@ -33,6 +35,7 @@ import {
   ProviderErrorThrowable,
   type ProviderReviewInput,
   type ProviderReviewOutput,
+  type ProviderReviewOutputHighlight,
   type PublicationResult,
   type RankedFindings,
   type RejectionLogEntry,
@@ -145,6 +148,7 @@ export interface OrchestratorHooks {
     deps: PublisherDeps,
     roundIntent?: 'incremental' | 'full',
     notice?: string,
+    extras?: PublicationExtras,
   ) => Promise<PublicationResult>;
 }
 
@@ -498,6 +502,13 @@ const buildProviderInput = (
   if (guidance !== undefined) {
     input.custom_guidance = guidance;
   }
+
+  // Positive feedback (§ A.3): presence == enabled. Absent when the repo has
+  // not opted in — zero prompt bytes, zero tool-schema bytes (AC-001/AC-002).
+  if (cfg.positive_feedback.enabled) {
+    input.positive_feedback = { max_items: cfg.positive_feedback.max_items };
+  }
+
   return input;
 };
 
@@ -522,6 +533,7 @@ const buildPublishContext = (
 const publisherDepsFor = (octokit: OctokitLike): PublisherDeps => ({
   checkRuns: buildCheckRunsClient(octokit),
   reviewComments: buildReviewCommentsClient(octokit),
+  prReviews: buildPrReviewsClient(octokit),
 });
 
 interface FailureSummaryArgs {
@@ -888,6 +900,11 @@ export const runPipeline = async (
     // batches can be split into two halves and re-enqueued without an extra
     // outer loop (chunking-stability-spec.md § Phase 1 "Data-flow change").
     const allFindings: ProviderReviewOutput['findings'] = [];
+    // Cross-batch highlight accumulation (§ D.5). Order is batch order, so
+    // the validator's downstream cap (`positive_feedback.max_items`) is
+    // deterministic. Empty when `positive_feedback` is disabled (adapters
+    // never emit `highlights` without the tool-schema branch enabling it).
+    const allHighlights: ProviderReviewOutputHighlight[] = [];
     const failedBatches: number[] = [];
     const truncatedFiles: string[] = [];
 
@@ -970,6 +987,7 @@ export const runPipeline = async (
           findings_count: batchOutput.findings.length,
         });
         allFindings.push(...batchOutput.findings);
+        if (batchOutput.highlights !== undefined) allHighlights.push(...batchOutput.highlights);
       } catch (batchErr) {
         if (batchErr instanceof ProviderErrorThrowable) {
           const kind = batchErr.value.kind;
@@ -1234,7 +1252,10 @@ export const runPipeline = async (
     // the validator so dedupe, ranking, and caps apply to the full PR.
     // The dedupe key is (path, category) — batch-, line- and wording-agnostic —
     // so merging before the validator gives cross-batch dedup for free.
-    const mergedProviderOutput: ProviderReviewOutput = { findings: allFindings };
+    const mergedProviderOutput: ProviderReviewOutput = {
+      findings: allFindings,
+      ...(allHighlights.length > 0 ? { highlights: allHighlights } : {}),
+    };
 
     // Build a notice describing the chunked run. Prepended to the check-run
     // summary via the existing v0.7.0 `notice` param (does NOT alter the
@@ -1309,6 +1330,20 @@ export const runPipeline = async (
     const publishFnChunked = hooks.runPublish ?? defaultPublish;
     const ctxChunked = buildPublishContext(payload, identity, deps.resolvedHeadSha);
     const publisherDepsChunked = publisherDepsFor(octokit);
+    // § C: a chunked review is "clean" only when the merged output carried
+    // zero findings AND zero validated findings AND every batch fully
+    // succeeded — a partial review (any failed/truncated/not-reviewed/
+    // skipped file) is never clean (the safety property for large PRs).
+    const extrasChunked: PublicationExtras = {
+      highlights: validatorResultChunked.highlights,
+      clean_review:
+        allFindings.length === 0 &&
+        validatorResultChunked.findings.length === 0 &&
+        failedBatches.length === 0 &&
+        truncatedFiles.length === 0 &&
+        notReviewedFiles.length === 0 &&
+        batchPlan.skippedFiles.length === 0,
+    };
     const publicationChunked = await publishFnChunked(
       rankedChunked,
       deps.config,
@@ -1316,6 +1351,7 @@ export const runPipeline = async (
       publisherDepsChunked,
       deps.roundIntent ?? 'incremental',
       chunkedNoticeFull,
+      extrasChunked,
     );
 
     if (publicationChunked.dropped.length > 0) {
@@ -1538,6 +1574,12 @@ export const runPipeline = async (
     providerOutput.findings.length,
     validatorResult.findings.length,
   );
+  // § C: the caller assertion half of "clean" — the provider AND the
+  // validator both produced zero findings on this real review.
+  const extras: PublicationExtras = {
+    highlights: validatorResult.highlights,
+    clean_review: providerOutput.findings.length === 0 && validatorResult.findings.length === 0,
+  };
   const publication = await publishFn(
     ranked,
     deps.config,
@@ -1545,6 +1587,7 @@ export const runPipeline = async (
     publisherDeps,
     deps.roundIntent ?? 'incremental',
     emptyNotice.length > 0 ? emptyNotice : undefined,
+    extras,
   );
 
   if (publication.dropped.length > 0) {

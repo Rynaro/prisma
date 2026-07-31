@@ -29,6 +29,7 @@ Override semantics live in `config-spec.md` § Resolution order; this document d
 - **Per-PR cap applied.** `comment_cap.per_pr` is computed for audit but not enforced.
 - **Per-file cap applied.** `comment_cap.per_file` is computed for audit but not enforced.
 - **Dedupe behavior reference.** See § Dedupe behavior. Dedupe is computed (within-run and across-run) and recorded in the structured log so a debugger can confirm what would have been suppressed in a publishing mode.
+- **Clean-review conclusion and approval.** Never applied. `dry-run` remains "nothing PR-visible" in full: even with `approval.celebrate_clean` and `approval.approve_on_clean` both set, the dry `_No findings._` body is preserved, the conclusion stays `neutral`, and no PR review is ever submitted.
 
 ### summary-only
 
@@ -49,6 +50,7 @@ Override semantics live in `config-spec.md` § Resolution order; this document d
 - **Per-PR cap applied.** `comment_cap.per_pr` is enforced against inline-eligible findings in ranker order, after the per-file cap.
 - **Per-file cap applied.** `comment_cap.per_file` is enforced first against inline-eligible findings in ranker order, before the per-PR cap.
 - **Dedupe behavior reference.** See § Dedupe behavior. Both within-run and across-run dedupe apply.
+- **Clean-review conclusion and approval (opt-in).** In a non-dry-run mode (`summary-only` or `summary-plus-inline`), a review that is *genuinely clean* — the provider AND the validator both produced zero findings on a complete, non-partial run — may publish `success` instead of the default `neutral` check-run conclusion when `approval.clean_conclusion: success` is set, and may publish exactly one approving PR review (`pulls.createReview`, `event: APPROVE`, never `REQUEST_CHANGES`) when `approval.approve_on_clean: true` is set. "Clean" is a caller assertion computed alongside `ranked.length === 0`, never inferred from the rendered summary — an oversized, provider-unavailable, malformed-output, or partially-failed-chunked outcome is never eligible, no matter how empty its summary looks. A stale approval (one submitted on an earlier, since-regressed commit) is dismissed on the next non-clean managed run. Both keys default off; see `config-spec.md` § `approval`.
 
 ## Threshold and cap application order
 

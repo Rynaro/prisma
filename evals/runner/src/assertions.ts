@@ -53,6 +53,17 @@ const substringFailure = (path: string, needle: string, haystack: string): Asser
   message: `expected ${path} to include substring ${JSON.stringify(needle)}`,
 });
 
+const negatedSubstringFailure = (
+  path: string,
+  needle: string,
+  haystack: string,
+): AssertionFailure => ({
+  path,
+  expected: `NOT ${needle}`,
+  actual: haystack,
+  message: `expected ${path} to NOT include substring ${JSON.stringify(needle)}`,
+});
+
 const computeMissing = (expected: readonly string[], actual: readonly string[]): string[] => {
   const actualSet = new Set(actual);
   return expected.filter((e) => !actualSet.has(e));
@@ -214,6 +225,47 @@ export const evaluateExpectations = (
         ),
       );
     }
+  }
+  for (const needle of expectations.publisher.summary_not_contains) {
+    if (outcome.publisher.summary_artifact.includes(needle)) {
+      failures.push(
+        negatedSubstringFailure(
+          'expectations.publisher.summary_not_contains',
+          needle,
+          outcome.publisher.summary_artifact,
+        ),
+      );
+    }
+  }
+  if (
+    expectations.publisher.check_conclusion !== undefined &&
+    outcome.publisher.check_conclusion !== expectations.publisher.check_conclusion
+  ) {
+    failures.push(
+      equalityFailure(
+        'expectations.publisher.check_conclusion',
+        expectations.publisher.check_conclusion,
+        outcome.publisher.check_conclusion,
+      ),
+    );
+  }
+  if (outcome.publisher.approvals_submitted !== expectations.publisher.approvals_submitted) {
+    failures.push(
+      equalityFailure(
+        'expectations.publisher.approvals_submitted',
+        expectations.publisher.approvals_submitted,
+        outcome.publisher.approvals_submitted,
+      ),
+    );
+  }
+  if (outcome.publisher.approval_dismissals !== expectations.publisher.approval_dismissals) {
+    failures.push(
+      equalityFailure(
+        'expectations.publisher.approval_dismissals',
+        expectations.publisher.approval_dismissals,
+        outcome.publisher.approval_dismissals,
+      ),
+    );
   }
   {
     const missing = computeMissing(

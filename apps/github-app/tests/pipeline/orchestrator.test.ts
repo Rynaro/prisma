@@ -1,4 +1,4 @@
-import type { InstallationAuth, OctokitLike } from '@prisma-bot/github';
+import type { InstallationAuth, OctokitLike, PublicationExtras } from '@prisma-bot/github';
 import { FakeProvider, makeFindingFixture } from '@prisma-bot/provider-fake';
 import {
   type JobPayload,
@@ -119,6 +119,13 @@ const buildOctokitSpy = (): OctokitSpy => {
           };
         },
         listReviewComments: async () => ({ data: [] }),
+        createReview: async () => ({
+          data: { id: 1, state: 'APPROVED', body: '', user: null },
+        }),
+        listReviews: async () => ({ data: [] }),
+        dismissReview: async () => ({
+          data: { id: 1, state: 'DISMISSED', body: '', user: null },
+        }),
       },
       issues: {
         createComment: async () => ({ data: { id: 1, body: null, user: null } }),
@@ -2083,5 +2090,213 @@ describe('runPipeline — no_findings reasoning model hint', () => {
     // Check-run was still published (summary-only path).
     expect(spy.checksCreate).toHaveLength(1);
     expect(spy.checksUpdate).toHaveLength(1);
+  });
+});
+
+describe('runPipeline — positive feedback + clean-review threading (S7)', () => {
+  const cfgWithPositiveFeedback = (maxItems: number): RepoConfig =>
+    RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      positive_feedback: { enabled: true, max_items: maxItems },
+    });
+
+  it('positive_feedback disabled (default config): providerInput carries no positive_feedback key', async () => {
+    const provider = new FakeProvider({ script: [{ kind: 'output', output: { findings: [] } }] });
+    const spy = buildOctokitSpy();
+    await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy }));
+    expect(provider.calls[0]?.positive_feedback).toBeUndefined();
+  });
+
+  it('positive_feedback enabled: single-call providerInput carries { max_items }', async () => {
+    const provider = new FakeProvider({ script: [{ kind: 'output', output: { findings: [] } }] });
+    const spy = buildOctokitSpy();
+    const config = cfgWithPositiveFeedback(2);
+    await runPipeline(makePayload(), buildDeps({ provider, octokitSpy: spy, config }));
+    expect(provider.calls[0]?.positive_feedback).toEqual({ max_items: 2 });
+  });
+
+  it('positive_feedback enabled: every chunked batch providerInput carries { max_items }', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        { kind: 'output', output: { findings: [] } },
+        { kind: 'output', output: { findings: [] } },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      positive_feedback: { enabled: true, max_items: 4 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+      },
+    });
+    await runPipeline(
+      makePayload(),
+      buildDeps({ provider, octokitSpy: spy, snapshot: snap, config }),
+    );
+    expect(provider.calls).toHaveLength(2);
+    for (const call of provider.calls) {
+      expect(call.positive_feedback).toEqual({ max_items: 4 });
+    }
+  });
+
+  it('single-call clean review (0 provider findings, 0 validated findings): extras.clean_review is true and highlights are threaded', async () => {
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'output',
+          output: {
+            findings: [],
+            highlights: [{ message: 'Clear naming', rationale: 'Improves readability.' }],
+          },
+        },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const config = cfgWithPositiveFeedback(3);
+    const capturedExtras: Array<PublicationExtras | undefined> = [];
+    const deps = buildDeps({ provider, octokitSpy: spy, config });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras) => {
+        capturedExtras.push(extras);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras);
+      },
+    };
+
+    await runPipeline(makePayload(), deps);
+    expect(capturedExtras[0]?.clean_review).toBe(true);
+    expect(capturedExtras[0]?.highlights).toHaveLength(1);
+  });
+
+  it('single-call dirty review (findings present): extras.clean_review is false', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: validOutputForExampleFile() }],
+    });
+    const spy = buildOctokitSpy();
+    const capturedExtras: Array<PublicationExtras | undefined> = [];
+    const deps = buildDeps({ provider, octokitSpy: spy });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras) => {
+        capturedExtras.push(extras);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras);
+      },
+    };
+
+    await runPipeline(makePayload(), deps);
+    expect(capturedExtras[0]?.clean_review).toBe(false);
+  });
+
+  it('chunked review with all batches succeeding and zero findings: extras.clean_review is true', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        { kind: 'output', output: { findings: [] } },
+        { kind: 'output', output: { findings: [] } },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+      },
+    });
+    const capturedExtras: Array<PublicationExtras | undefined> = [];
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: snap, config });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras) => {
+        capturedExtras.push(extras);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras);
+      },
+    };
+
+    await runPipeline(makePayload(), deps);
+    expect(capturedExtras[0]?.clean_review).toBe(true);
+  });
+
+  it('chunked review with a partial (failed) batch and zero surviving findings: extras.clean_review is false (a partial review is never clean)', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        { kind: 'output', output: { findings: [] } },
+        { kind: 'error', error: { kind: 'schema_validation', message: 'truncated' } },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+      },
+    });
+    const capturedExtras: Array<PublicationExtras | undefined> = [];
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: snap, config });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras) => {
+        capturedExtras.push(extras);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras);
+      },
+    };
+
+    await runPipeline(makePayload(), deps);
+    expect(capturedExtras[0]?.clean_review).toBe(false);
+  });
+
+  it('publishSummaryOnly (oversized) never asserts clean: runPublish receives no extras', async () => {
+    const provider = new FakeProvider({ script: [] });
+    // 300 files → oversized short-circuit; provider is never called.
+    const oversizedSnap: PrSnapshot = {
+      installation_id: 100,
+      repository_id: 200,
+      pull_request_number: 7,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      default_branch: 'main',
+      total_changed_lines: 1200,
+      files: Array.from({ length: 300 }, (_, i) => ({
+        path: `src/f${i}.ts`,
+        status: 'modified' as const,
+        additions: 4,
+        deletions: 0,
+        hunks: [{ new_start: 1, new_lines: 4, old_start: 1, old_lines: 0 }],
+        is_binary: false,
+      })),
+    };
+    const spy = buildOctokitSpy();
+    const capturedExtras: Array<PublicationExtras | undefined> = [];
+    const deps = buildDeps({ provider, octokitSpy: spy, snapshot: oversizedSnap });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras) => {
+        capturedExtras.push(extras);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice, extras);
+      },
+    };
+
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.outcome?.kind).toBe('oversized');
+    expect(capturedExtras[0]).toBeUndefined();
   });
 });

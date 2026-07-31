@@ -12,9 +12,9 @@
  */
 
 import type { OctokitLike } from '@prisma-bot/github';
-import { DEFAULT_REPO_CONFIG } from '@prisma-bot/shared';
+import { DEFAULT_REPO_CONFIG, RepoConfigSchema } from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
-import { fetchRepoConfig } from '../../src/repo-config.js';
+import { fetchRepoConfig, resolvePrivilegedApproval } from '../../src/repo-config.js';
 
 const toBase64 = (text: string): string => Buffer.from(text, 'utf8').toString('base64');
 
@@ -125,5 +125,105 @@ describe('fetchRepoConfig', () => {
     const parseErrorLog = calls.find((c) => c.event === 'worker.config.parse_error');
     expect(parseErrorLog).toBeDefined();
     expect(parseErrorLog?.payload?.salvaged).toBe(false);
+  });
+});
+
+describe('resolvePrivilegedApproval', () => {
+  it('is a no-op (no I/O) when approve_on_clean is not set on the head-ref config', async () => {
+    const headConfig = RepoConfigSchema.parse({});
+    const octokit = buildStubOctokit(''); // any getContent call would 404-ish; asserting no call happens
+    const { log } = makeLogSpy();
+    const { config, notes } = await resolvePrivilegedApproval(
+      octokit,
+      'owner',
+      'repo',
+      headConfig,
+      'abc123headsha',
+      log,
+    );
+    expect(config).toBe(headConfig);
+    expect(notes).toEqual([]);
+  });
+
+  it('is a no-op when the head ref IS already the default branch (ref === HEAD)', async () => {
+    const headConfig = RepoConfigSchema.parse({ approval: { approve_on_clean: true } });
+    const octokit = buildStubOctokit('');
+    const { log } = makeLogSpy();
+    const { config, notes } = await resolvePrivilegedApproval(
+      octokit,
+      'owner',
+      'repo',
+      headConfig,
+      'HEAD',
+      log,
+    );
+    expect(config).toBe(headConfig);
+    expect(notes).toEqual([]);
+  });
+
+  it('ignores approve_on_clean set only on the PR head ref', async () => {
+    const headConfig = RepoConfigSchema.parse({ approval: { approve_on_clean: true } });
+    // Default-branch config (fetched at ref 'HEAD') does NOT enable approve_on_clean.
+    const defaultBranchYaml = 'approval:\n  approve_on_clean: false\n';
+    const octokit = buildStubOctokit(defaultBranchYaml);
+    const { log } = makeLogSpy();
+    const { config, notes } = await resolvePrivilegedApproval(
+      octokit,
+      'owner',
+      'repo',
+      headConfig,
+      'a'.repeat(40),
+      log,
+    );
+    expect(config.approval.approve_on_clean).toBe(false);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('default branch');
+  });
+
+  it('keeps approve_on_clean true when the default-branch config also enables it', async () => {
+    const headConfig = RepoConfigSchema.parse({ approval: { approve_on_clean: true } });
+    const defaultBranchYaml = 'approval:\n  approve_on_clean: true\n';
+    const octokit = buildStubOctokit(defaultBranchYaml);
+    const { log } = makeLogSpy();
+    const { config, notes } = await resolvePrivilegedApproval(
+      octokit,
+      'owner',
+      'repo',
+      headConfig,
+      'a'.repeat(40),
+      log,
+    );
+    expect(config.approval.approve_on_clean).toBe(true);
+    expect(notes).toEqual([]);
+  });
+
+  it('fails closed when the default-branch config cannot be read', async () => {
+    const headConfig = RepoConfigSchema.parse({ approval: { approve_on_clean: true } });
+    const throwingOctokit: OctokitLike = {
+      rest: {
+        pulls: {} as OctokitLike['rest']['pulls'],
+        repos: {
+          getContent: async () => {
+            throw new Error('network down');
+          },
+        },
+        checks: {} as OctokitLike['rest']['checks'],
+        pulls_reviews: {} as OctokitLike['rest']['pulls_reviews'],
+        issues: {} as OctokitLike['rest']['issues'],
+        reactions: {} as OctokitLike['rest']['reactions'],
+      },
+    };
+    const { log } = makeLogSpy();
+    const { config, notes } = await resolvePrivilegedApproval(
+      throwingOctokit,
+      'owner',
+      'repo',
+      headConfig,
+      'a'.repeat(40),
+      log,
+    );
+    expect(config.approval.approve_on_clean).toBe(false);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('default branch');
   });
 });

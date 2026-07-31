@@ -1,0 +1,85 @@
+id: dry-run-never-approves
+name: "dry-run never approves, never celebrates, and never flips the conclusion"
+description: >-
+  approval.approve_on_clean and approval.celebrate_clean are both enabled,
+  but mode is dry-run. Per spec § C.1, dry-run is never approval-eligible:
+  no PR review is submitted, the bare "_No findings._" body is preserved,
+  and the check-run conclusion stays neutral.
+
+config_overrides:
+  mode: dry-run
+  approval:
+    celebrate_clean: true
+    clean_conclusion: success
+    approve_on_clean: true
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
+  pull_request:
+    number: 205
+    head:
+      sha: "dddddddddddddddddddddddddddddddddddddddd"
+
+octokit_responses:
+  pulls_get:
+    number: 205
+    head:
+      sha: "dddddddddddddddddddddddddddddddddddddddd"
+      ref: feature/dry-run-clean
+    base:
+      sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      ref: main
+  pulls_list_files:
+    - filename: src/util/tidy3.ts
+      status: modified
+      additions: 1
+      deletions: 1
+      patch: |
+        @@ -1,3 +1,3 @@
+        -export const a = (s) => s;
+        +export const tidy3 = (s) => s;
+         export const b = (s) => s;
+
+provider_script:
+  - kind: output
+    output:
+      findings: []
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains:
+      - "_No findings._"
+    summary_not_contains:
+      - "Prisma reviewed this PR and found no issues"
+    expected_categories: []
+    rejection_reasons: []
+    check_conclusion: neutral
+    approvals_submitted: 0
+    approval_dismissals: 0
+
+metrics:
+  - comment_usefulness

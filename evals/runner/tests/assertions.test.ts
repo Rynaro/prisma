@@ -21,6 +21,8 @@ const baseOutcome = (overrides: Partial<RunOutcome> = {}): RunOutcome => ({
     summary_artifact: 'this summary mentions security and dedupe_collapsed',
     rejection_reasons: ['dedupe_collapsed'],
     expected_categories: ['security'],
+    approvals_submitted: 0,
+    approval_dismissals: 0,
   },
   ...overrides,
 });
@@ -43,6 +45,9 @@ const baseExpectations = (overrides: Partial<ScenarioExpectations> = {}): Scenar
     summary_contains: [],
     expected_categories: [],
     rejection_reasons: [],
+    approvals_submitted: 0,
+    approval_dismissals: 0,
+    summary_not_contains: [],
   },
   ...overrides,
 });
@@ -143,6 +148,74 @@ describe('evaluateExpectations', () => {
         prefilter: {
           ...baseExpectations().prefilter,
           skipped_reasons: ['lockfile'],
+        },
+      }),
+    );
+    expect(report.status).toBe('pass');
+  });
+
+  // --- S8: check_conclusion / approvals_submitted / approval_dismissals / summary_not_contains ---
+
+  it('passes when check_conclusion matches', () => {
+    const report = evaluateExpectations(
+      baseOutcome({ publisher: { ...baseOutcome().publisher, check_conclusion: 'success' } }),
+      baseExpectations({
+        publisher: { ...baseExpectations().publisher, check_conclusion: 'success' },
+      }),
+    );
+    expect(report.status).toBe('pass');
+  });
+
+  it('fails when check_conclusion mismatches', () => {
+    const report = evaluateExpectations(
+      baseOutcome({ publisher: { ...baseOutcome().publisher, check_conclusion: 'neutral' } }),
+      baseExpectations({
+        publisher: { ...baseExpectations().publisher, check_conclusion: 'success' },
+      }),
+    );
+    expect(report.status).toBe('fail');
+    expect(report.failures[0]?.path).toBe('expectations.publisher.check_conclusion');
+  });
+
+  it('fails when approvals_submitted mismatches the schema default of 0', () => {
+    const report = evaluateExpectations(
+      baseOutcome({ publisher: { ...baseOutcome().publisher, approvals_submitted: 1 } }),
+      baseExpectations(),
+    );
+    expect(report.status).toBe('fail');
+    expect(report.failures[0]?.path).toBe('expectations.publisher.approvals_submitted');
+  });
+
+  it('fails when approval_dismissals mismatches', () => {
+    const report = evaluateExpectations(
+      baseOutcome({ publisher: { ...baseOutcome().publisher, approval_dismissals: 1 } }),
+      baseExpectations(),
+    );
+    expect(report.status).toBe('fail');
+    expect(report.failures[0]?.path).toBe('expectations.publisher.approval_dismissals');
+  });
+
+  it('fails when summary_not_contains finds a forbidden substring present', () => {
+    const report = evaluateExpectations(
+      baseOutcome(),
+      baseExpectations({
+        publisher: {
+          ...baseExpectations().publisher,
+          summary_not_contains: ['security'],
+        },
+      }),
+    );
+    expect(report.status).toBe('fail');
+    expect(report.failures[0]?.path).toBe('expectations.publisher.summary_not_contains');
+  });
+
+  it('passes when summary_not_contains substring is absent', () => {
+    const report = evaluateExpectations(
+      baseOutcome(),
+      baseExpectations({
+        publisher: {
+          ...baseExpectations().publisher,
+          summary_not_contains: ['this-substring-does-not-exist'],
         },
       }),
     );
