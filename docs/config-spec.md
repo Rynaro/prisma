@@ -518,6 +518,65 @@ To restore pre-v0.12.0 behavior (e.g., `call_token_budget: 60000` was the old de
 set it in your config — the effective budget will cap at that value regardless of
 the provider's window.
 
+### positive_feedback
+
+- **Type.** Object: `{ enabled: boolean, max_items: integer }`.
+- **Required.** Optional.
+- **Default.** `{ enabled: false, max_items: 3 }`.
+- **Validation rule.** `max_items` must be an integer in `[1, 5]`. Like every
+  other bounded numeric in this schema, an out-of-range value **rejects the
+  entire file** and falls back to full defaults rather than clamping (see §
+  Failure modes — "Type mismatch on a known key"). "Clamp" instead refers to
+  the validator's deterministic capping of the highlight *list* to
+  `max_items` at runtime, not to silent coercion of this number.
+- **Example.**
+  ```yaml
+  positive_feedback:
+    enabled: true
+    max_items: 3
+  ```
+
+Opt-in "highlights": up to `max_items` concrete good decisions the model can
+point to in the current diff, validated, deduped, and rendered as a `###
+Highlights` section of the check-run summary. Absent, or present with
+`enabled: false`, produces byte-identical output to a build without this
+feature — zero prompt bytes, zero tool-schema bytes, zero rendered section.
+Highlights are never findings: no line anchor, no severity, no category, and
+they never occupy an inline-comment slot or participate in `comment_cap`.
+
+### approval
+
+- **Type.** Object: `{ celebrate_clean: boolean, clean_conclusion: 'neutral' | 'success', approve_on_clean: boolean }`.
+- **Required.** Optional.
+- **Default.** `{ celebrate_clean: false, clean_conclusion: 'neutral', approve_on_clean: false }`
+  — today's behavior, exactly: a dry `_No findings._` body, `neutral`
+  check-run conclusion, no PR review submitted.
+- **Validation rule.** `clean_conclusion` is a closed two-value enum
+  (`neutral` or `success`); any other value rejects the entire file and falls
+  back to full defaults.
+- **Example.**
+  ```yaml
+  approval:
+    celebrate_clean: true
+    clean_conclusion: success
+    approve_on_clean: true
+  ```
+
+Governs what happens on a **genuinely clean review** — the provider and the
+validator both produced zero findings on a real (non-partial, non-oversized,
+non-malformed) run; this is never inferred from the rendered summary alone.
+`celebrate_clean` swaps the dry `_No findings._` body for a short positive
+approval message. `clean_conclusion` separately controls whether the
+check-run conclusion is `neutral` (default; `neutral` already passes required
+status checks) or `success` — kept as a distinct key from `celebrate_clean` so
+a text-only opt-in never silently changes a machine-readable signal.
+`approve_on_clean` submits a real, idempotent GitHub `APPROVE` review via
+`pulls.createReview` — this integration never submits `REQUEST_CHANGES` — and
+dismisses that approval if a later commit is no longer clean. All three keys
+are inert in `dry-run` (nothing PR-visible is ever published in dry-run,
+approval included). **`approval.approve_on_clean` is honored only when
+resolved from the repository's default branch** — see § Failure modes below.
+
 ## Precedence matrix
 
 The following table declares how filtering keys interact. Rows are the filtering key in question; the cell describes its resolution rule against the named other key. "Applies first" means evaluated before; "applies last" means evaluated after.
@@ -614,6 +673,17 @@ chunking:
   # safety_fraction: 0.07             # window safety margin as fraction (default: 0.07)
   # hunk_context_lines: 10            # forward-compat: context lines per hunk (default: 10, unused)
   # min_hunk_split_tokens: 0          # min estimate before hunk-split is attempted (default: 0)
+# Optional: positive feedback ("highlights") on a clean-looking diff.
+# Default off; see § positive_feedback.
+positive_feedback:
+  enabled: false
+  max_items: 3
+# Optional: clean-review approval behavior. Default off; see § approval.
+# approve_on_clean is honored only from the repository's default branch.
+approval:
+  celebrate_clean: false
+  clean_conclusion: neutral
+  approve_on_clean: false
 ```
 
 ### Migration from legacy `provider:` + `model:` form
@@ -640,5 +710,7 @@ Remove the `provider:` key and encode the provider in the `model:` slug. The sch
 **Unknown keys.** The file contains keys not listed in this document. Unknown top-level keys and unknown sub-keys are warned (a structured log entry is emitted) and ignored. They do not reject the file, and they do not fall back to defaults; the rest of the configuration is honored.
 
 **Type mismatch on a known key.** The file contains a known key with a value of the wrong type or out of range (e.g., `comment_cap.per_pr: -1`, `mode: review`, `confidence_floor.inline: 1.5`). The worker rejects the entire file and falls back to built-in defaults — partial acceptance is not permitted. A structured log entry is emitted naming the offending key and its expected validation rule. The publisher emits a Checks run with `neutral` conclusion explaining the rejection in category terms.
+
+**`approval.approve_on_clean` is honored only from the default branch.** The effective config for a pull request is normally resolved at the PR's head ref, which the PR's own author controls — harmless for every other key, but a privilege-escalation vector for a key that can produce a real GitHub approval. Before `approve_on_clean` is ever honored, the worker re-resolves that single key against the repository's default branch (`ref: 'HEAD'`). If the default-branch config does not also enable it, or if the re-resolution fetch or parse fails for any reason, `approve_on_clean` is forced to `false` for that run and a note is added to the check-run summary: `` `approval.approve_on_clean` is only honored from the repository's default branch; it was ignored for this run. `` This fails **closed** — any doubt disables the flag rather than allowing it. `celebrate_clean` and `clean_conclusion` are not privileged and are resolved from the head ref as usual, since they change only rendered text and a passing-vs-passing conclusion.
 
 **`review_guidance`-only violation.** As a single exception to whole-file rejection: when *every* validation error is confined to `review_guidance.*` (e.g., `instructions` exceeds its 2,048-byte cap, or `context_files` has more than 5 entries, or a `path_instructions[]` block is over-long), the worker drops **only** the guidance block — it is reset to its empty default (`has_guidance` becomes false) — and honors every other key in the file (`model`, `max_files`, `comment_cap`, `path_rules.exclude`, `nickname`, `command_marker`, floors, etc.). This prevents a small guidance mistake from silently reverting the entire configuration to defaults. Degradation is never silent: a `worker.config.parse_error` log entry (with `salvaged: true`) is emitted and a note is added to the check-run summary naming the dropped field. If even one validation error falls outside `review_guidance` (or the YAML is malformed), the whole-file rejection above still applies.

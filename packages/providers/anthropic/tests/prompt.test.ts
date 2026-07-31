@@ -1,5 +1,5 @@
 import type { ProviderReviewInput } from '@prisma-bot/shared';
-import { IMMUTABLE_SYSTEM_PROMPT } from '@prisma-bot/shared';
+import { IMMUTABLE_SYSTEM_PROMPT, renderUserMessage } from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
 import { buildPrompt } from '../src/prompt.js';
 
@@ -92,5 +92,27 @@ describe('buildPrompt', () => {
     const guidanceIdx = userMsg?.content.indexOf('<<<BEGIN_REPO_GUIDANCE') ?? -1;
     expect(filesIdx).toBeGreaterThanOrEqual(0);
     expect(guidanceIdx).toBeGreaterThan(filesIdx);
+  });
+
+  // ── Positive feedback (highlights) — S2 ───────────────────────────────────
+
+  it('user message is unchanged without positive feedback', () => {
+    const prompt = buildPrompt(inputBase);
+    const userMsg = prompt.messages.find((m) => m.role === 'user');
+    expect(userMsg?.content).toBe(renderUserMessage(inputBase));
+  });
+
+  it('GIVEN positive_feedback WHEN built THEN the instruction block is appended and the tool schema declares highlights', () => {
+    const input: ProviderReviewInput = {
+      ...inputBase,
+      positive_feedback: { max_items: 2 },
+    };
+    const prompt = buildPrompt(input);
+    const userMsg = prompt.messages.find((m) => m.role === 'user');
+    expect(userMsg?.content).toContain('## Positive feedback (optional)');
+    const schema = prompt.tool.input_schema as {
+      properties: { highlights?: { maxItems: number } };
+    };
+    expect(schema.properties.highlights?.maxItems).toBe(2);
   });
 });

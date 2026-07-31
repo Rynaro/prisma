@@ -82,6 +82,12 @@ export interface RunOutcome {
     summary_artifact: string;
     rejection_reasons: string[];
     expected_categories: string[];
+    /** The check-run conclusion recorded via `checks.update` (S8), if any. */
+    check_conclusion?: 'success' | 'neutral' | 'failure';
+    /** Count of `pulls.createReview` calls observed this run (S8). */
+    approvals_submitted: number;
+    /** Count of `pulls.dismissReview` calls observed this run (S8). */
+    approval_dismissals: number;
   };
   /** Notes from config-fetch / augmentation surfaced by the orchestrator. */
   config_notes?: string[];
@@ -110,11 +116,17 @@ const buildJobPayloadFromFixture = (fixture: ScenarioFixture): JobPayload => {
 
 const toFakeStep = (step: ProviderScriptStep): FakeStep => {
   if (step.kind === 'output') {
-    const output: ProviderReviewOutput = { findings: step.output.findings };
+    const output: ProviderReviewOutput = {
+      findings: step.output.findings,
+      ...(step.output.highlights !== undefined ? { highlights: step.output.highlights } : {}),
+    };
     return { kind: 'output', output };
   }
   if (step.kind === 'output_lazy') {
-    const output: ProviderReviewOutput = { findings: step.output.findings };
+    const output: ProviderReviewOutput = {
+      findings: step.output.findings,
+      ...(step.output.highlights !== undefined ? { highlights: step.output.highlights } : {}),
+    };
     return { kind: 'output', output };
   }
   // step.kind === 'error'
@@ -318,6 +330,17 @@ export const runPipelineForFixture = async (
   const firstCallCustomGuidance = firstCall?.custom_guidance;
   const firstCallRequestShaping = firstCall?.request_shaping;
 
+  // The check-run conclusion actually recorded, and the approve/dismiss call
+  // counts observed on the primary octokit handle (S8).
+  const lastCheckRunUpdate = octokitHandle.checkRunUpdates.at(-1);
+  const checkConclusion = lastCheckRunUpdate?.conclusion as
+    | 'success'
+    | 'neutral'
+    | 'failure'
+    | undefined;
+  const approvalsSubmitted = octokitHandle.calls.pr_reviews_create;
+  const approvalDismissals = octokitHandle.calls.pr_reviews_dismiss;
+
   const outcome: RunOutcome = {
     prefilter: prefilterMirror,
     provider: {
@@ -342,6 +365,9 @@ export const runPipelineForFixture = async (
       summary_artifact: summaryArtifact,
       rejection_reasons: publisherRejectionReasons,
       expected_categories: expectedCategories,
+      ...(checkConclusion !== undefined ? { check_conclusion: checkConclusion } : {}),
+      approvals_submitted: approvalsSubmitted,
+      approval_dismissals: approvalDismissals,
     },
     ...(pipelineConfigNotes !== undefined && pipelineConfigNotes.length > 0
       ? { config_notes: pipelineConfigNotes }

@@ -536,4 +536,171 @@ describe('runValidator', () => {
     expect(first.line_start).toBe(13);
     expect(first.line_end).toBe(13);
   });
+
+  it('malformed provider output early return carries an empty highlights array', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const malformed = {
+      findings: [{ path: 'src/a.ts' }],
+    } as unknown as ProviderReviewOutput;
+    const result = runValidator(malformed, ctx(snap));
+    expect(result.highlights).toEqual([]);
+  });
+});
+
+// ── Positive feedback / highlights (S3) ─────────────────────────────────────
+
+describe('runValidator — highlights', () => {
+  const enabledConfig = (maxItems = 3) =>
+    RepoConfigSchema.parse({ positive_feedback: { enabled: true, max_items: maxItems } });
+
+  it('ignores provider highlights when disabled', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [
+        { message: 'Good naming', rationale: 'Clear intent.' },
+        { message: 'Nice test coverage', rationale: 'Covers edge cases.' },
+        { message: 'Clean extraction', rationale: 'Single responsibility.' },
+      ],
+    };
+    // config is the module-level RepoConfigSchema.parse({}) default: positive_feedback.enabled === false
+    const result = runValidator(output, ctx(snap));
+    expect(result.highlights).toEqual([]);
+    // Rule 0: silently ignored, no rejection noise.
+    expect(result.rejections).toEqual([]);
+  });
+
+  it('caps highlights at max_items', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [
+        { message: 'Highlight one', rationale: 'Reason one.' },
+        { message: 'Highlight two', rationale: 'Reason two.' },
+        { message: 'Highlight three', rationale: 'Reason three.' },
+        { message: 'Highlight four', rationale: 'Reason four.' },
+        { message: 'Highlight five', rationale: 'Reason five.' },
+      ],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig(2) }));
+    expect(result.highlights).toHaveLength(2);
+    expect(result.highlights.map((h) => h.message)).toEqual(['Highlight one', 'Highlight two']);
+    const overCap = result.rejections.filter((r) => r.reason_code === 'highlight_over_cap');
+    expect(overCap).toHaveLength(3);
+  });
+
+  it('drops a highlight whose path is not in the diff', () => {
+    const snap = snapshot([file({ path: 'src/in-diff.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [{ path: 'src/elsewhere.ts', message: 'Good call', rationale: 'Because.' }],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig() }));
+    expect(result.highlights).toEqual([]);
+    expect(result.rejections).toHaveLength(1);
+    expect(result.rejections[0]?.reason_code).toBe('highlight_path_not_in_diff');
+  });
+
+  it('accepts a highlight whose path is in the diff', () => {
+    const snap = snapshot([file({ path: 'src/in-diff.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [{ path: 'src/in-diff.ts', message: 'Good call', rationale: 'Because.' }],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig() }));
+    expect(result.highlights).toHaveLength(1);
+    expect(result.highlights[0]?.path).toBe('src/in-diff.ts');
+    expect(result.rejections).toEqual([]);
+  });
+
+  it('dedupes highlights by normalized message', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [
+        { message: 'Good   error handling', rationale: 'First reason.' },
+        { message: '  good error handling  ', rationale: 'Second reason.' },
+      ],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig() }));
+    expect(result.highlights).toHaveLength(1);
+    expect(result.highlights[0]?.message).toBe('Good error handling');
+    expect(result.rejections).toHaveLength(1);
+    expect(result.rejections[0]?.reason_code).toBe('highlight_duplicate');
+  });
+
+  it('dedupe happens before the cap: duplicates never consume a cap slot', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [
+        { message: 'Same message', rationale: 'First.' },
+        { message: 'Same message', rationale: 'Second (duplicate).' },
+        { message: 'Different message', rationale: 'Third.' },
+      ],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig(2) }));
+    expect(result.highlights).toHaveLength(2);
+    expect(result.highlights.map((h) => h.message)).toEqual(['Same message', 'Different message']);
+    const overCap = result.rejections.filter((r) => r.reason_code === 'highlight_over_cap');
+    expect(overCap).toHaveLength(0);
+  });
+
+  it('drops a blank highlight after normalization', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [{ message: '   ', rationale: 'Some reason.' }],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig() }));
+    expect(result.highlights).toEqual([]);
+    expect(result.rejections[0]?.reason_code).toBe('highlight_blank');
+  });
+
+  it('drops a highlight whose message or rationale exceeds the length cap', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [{ message: 'A'.repeat(201), rationale: 'Some reason.' }],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig() }));
+    expect(result.highlights).toEqual([]);
+    expect(result.rejections[0]?.reason_code).toBe('highlight_too_long');
+  });
+
+  it('logs a rejection for every dropped highlight', () => {
+    const snap = snapshot([file({ path: 'src/in.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [
+        { path: 'src/out.ts', message: 'Path outside diff', rationale: 'x' },
+        { message: '   ', rationale: 'blank message' },
+        { message: 'A'.repeat(300), rationale: 'too long message' },
+      ],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig() }));
+    expect(result.highlights).toEqual([]);
+    expect(result.rejections).toHaveLength(3);
+    for (const r of result.rejections) {
+      expect(r.reason_code.startsWith('highlight_')).toBe(true);
+      expect(r.stage).toBe('validator');
+      expect(r.finding_id).toBeNull();
+    }
+  });
+
+  it('preserves provider order among surviving highlights', () => {
+    const snap = snapshot([file({ path: 'src/a.ts' })]);
+    const output: ProviderReviewOutput = {
+      findings: [],
+      highlights: [
+        { message: 'Third in order but listed first', rationale: 'r1' },
+        { message: 'Second one', rationale: 'r2' },
+      ],
+    };
+    const result = runValidator(output, ctx(snap, { config: enabledConfig() }));
+    expect(result.highlights.map((h) => h.message)).toEqual([
+      'Third in order but listed first',
+      'Second one',
+    ]);
+  });
 });

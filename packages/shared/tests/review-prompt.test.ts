@@ -4,7 +4,9 @@ import {
   FINDING_JSON_SCHEMA,
   IMMUTABLE_SYSTEM_PROMPT,
   TOOL_DESCRIPTION,
+  buildToolInputSchema,
   renderCustomGuidance,
+  renderPositiveFeedback,
   renderUserMessage,
 } from '../src/index.js';
 
@@ -206,5 +208,78 @@ describe('renderCustomGuidance', () => {
     expect(rendered).toContain('### Global instructions');
     expect(rendered).toContain('### Path-scoped instructions');
     expect(rendered).toContain('### Reference material (from repository files)');
+  });
+});
+
+// ── Positive feedback (highlights) — S2 ─────────────────────────────────────
+
+describe('renderPositiveFeedback', () => {
+  it('returns null when positive feedback is absent', () => {
+    expect(renderPositiveFeedback(undefined)).toBeNull();
+  });
+
+  it('returns null when positive feedback is null', () => {
+    expect(renderPositiveFeedback(null)).toBeNull();
+  });
+
+  it('renders the instruction block naming max_items when present', () => {
+    const rendered = renderPositiveFeedback({ max_items: 3 });
+    expect(rendered).not.toBeNull();
+    expect(rendered).toContain('## Positive feedback (optional)');
+    expect(rendered).toContain('up to 3 concrete good decision(s)');
+    expect(rendered).toContain('`highlights`');
+    expect(rendered).toContain('submit_review_findings');
+  });
+});
+
+describe('buildToolInputSchema', () => {
+  it('tool input schema is byte-identical without positive feedback', () => {
+    const legacy = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['findings'],
+      properties: {
+        findings: {
+          type: 'array',
+          items: FINDING_JSON_SCHEMA,
+        },
+      },
+    };
+    expect(buildToolInputSchema(undefined)).toEqual(legacy);
+  });
+
+  it('is also byte-identical to the legacy literal when explicitly null', () => {
+    const legacy = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['findings'],
+      properties: {
+        findings: {
+          type: 'array',
+          items: FINDING_JSON_SCHEMA,
+        },
+      },
+    };
+    expect(buildToolInputSchema(null)).toEqual(legacy);
+  });
+
+  it('declares a capped highlights array when enabled', () => {
+    const schema = buildToolInputSchema({ max_items: 2 }) as {
+      properties: { highlights: { maxItems: number; type: string } };
+    };
+    expect(schema.properties.highlights.maxItems).toBe(2);
+    expect(schema.properties.highlights.type).toBe('array');
+  });
+
+  it('keeps findings required and unchanged when highlights is present', () => {
+    const schema = buildToolInputSchema({ max_items: 5 }) as {
+      required: string[];
+      properties: { findings: unknown };
+    };
+    expect(schema.required).toEqual(['findings']);
+    expect(schema.properties.findings).toEqual({
+      type: 'array',
+      items: FINDING_JSON_SCHEMA,
+    });
   });
 });

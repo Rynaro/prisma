@@ -1,4 +1,10 @@
-import type { Mode, NormalizedFinding, RankedFindings, RepoConfig } from '@prisma-bot/shared';
+import type {
+  Mode,
+  NormalizedFinding,
+  RankedFindings,
+  RepoConfig,
+  ReviewHighlight,
+} from '@prisma-bot/shared';
 
 /**
  * Pure planner for the publisher. Implements
@@ -63,6 +69,12 @@ export interface PublicationPlan {
     overflowed_per_file: number;
     overflowed_per_pr: number;
   };
+  /** Capped, validated highlights (possibly empty). Not part of the partition invariant. */
+  highlights: ReviewHighlight[];
+  /** Non-null only for a clean, non-dry-run review. */
+  clean_approval: PublicationCleanApproval | null;
+  /** True when this run must reconcile our approval state (approve or dismiss). */
+  approval_managed: boolean;
 }
 
 export interface PriorDedupeState {
@@ -74,6 +86,32 @@ export interface PriorDedupeState {
    */
   published_inline_dedupe_keys: ReadonlySet<string>;
 }
+
+/**
+ * Optional, additive per-publish inputs. A 5th positional parameter (7th on
+ * `publish`) rather than a signature refactor: existing call sites and the
+ * `OrchestratorHooks.runPublish` fakes stay assignable (a function taking
+ * fewer parameters is assignable to one taking more).
+ */
+export interface PublicationExtras {
+  /** Validated highlights from the validator. Rendered verbatim. */
+  highlights?: readonly ReviewHighlight[];
+  /** The caller asserts a provider review completed with zero findings. */
+  clean_review?: boolean;
+}
+
+export interface PublicationCleanApproval {
+  /** Body text — used both as the summary substitution and as the PR-review body. */
+  body: string;
+  /** Substitute `body` for `_No findings._` and suppress the caller's notice. */
+  celebrate: boolean;
+  /** Conclusion to publish for this clean review. */
+  conclusion: 'neutral' | 'success';
+  /** Submit a real APPROVE review. */
+  submit_review: boolean;
+}
+
+export const CLEAN_APPROVAL_MESSAGE = '✅ Prisma reviewed this PR and found no issues — nice work.';
 
 const SEVERITY_RANK: Record<NormalizedFinding['severity'], number> = {
   critical: 4,
@@ -265,6 +303,11 @@ const fmtFinding = (f: NormalizedFinding): string =>
 const fmtSummaryFinding = (entry: PublicationPlanDropEntry): string =>
   `- \`${entry.finding.path}:${entry.finding.line_start}\` — **${SEVERITY_LABELS[entry.finding.severity]}** (confidence ${entry.finding.confidence.toFixed(2)}) — ${entry.finding.title} _(${entry.reason_code})_`;
 
+const fmtHighlight = (h: ReviewHighlight): string =>
+  h.path !== undefined
+    ? `- \`${h.path}\` — **${h.message}** — ${h.rationale}`
+    : `- **${h.message}** — ${h.rationale}`;
+
 const SUMMARY_MAX_BYTES = 60 * 1024;
 const TRUNCATION_NOTICE = '\n\n_... summary truncated (size cap reached) ..._\n';
 
@@ -291,6 +334,10 @@ interface RenderInputs {
    * is required; adding an explanatory body is explicitly compatible.
    */
   notice?: string;
+  /** Capped, validated highlights (possibly empty). Rendered whether or not findings exist. */
+  highlights: ReviewHighlight[];
+  /** Non-null only for a clean, non-dry-run review. Drives the celebrate substitution. */
+  clean_approval: PublicationCleanApproval | null;
 }
 
 const renderSummary = (inputs: RenderInputs): string => {
@@ -300,8 +347,14 @@ const renderSummary = (inputs: RenderInputs): string => {
 
   // Prepend the optional notice/preamble (e.g. oversized explanation) before
   // the findings section. Inserted as-is; the caller is responsible for valid
-  // markdown. Separate from the findings body with a blank line.
-  if (inputs.notice !== undefined && inputs.notice.length > 0) {
+  // markdown. Separate from the findings body with a blank line. Suppressed
+  // when celebrating a clean review: a celebration and a "lower your floors"
+  // notice would contradict each other.
+  if (
+    inputs.clean_approval?.celebrate !== true &&
+    inputs.notice !== undefined &&
+    inputs.notice.length > 0
+  ) {
     lines.push(inputs.notice);
     lines.push('');
   }
@@ -326,7 +379,20 @@ const renderSummary = (inputs: RenderInputs): string => {
   }
 
   if (inputs.inline.length === 0 && summaryOnly.length === 0) {
-    lines.push('_No findings._');
+    lines.push(
+      inputs.clean_approval?.celebrate === true ? inputs.clean_approval.body : '_No findings._',
+    );
+    lines.push('');
+  }
+
+  // Highlights section: renders whether or not findings exist (including on a
+  // clean review, where it follows the approval line). Placed after every
+  // findings block and before the caps/floors footer so a pathological
+  // highlight can only cost the footer under byte-cap truncation — never an
+  // inline or summary-only finding.
+  if (inputs.highlights.length > 0) {
+    lines.push(`### Highlights (${inputs.highlights.length})`);
+    for (const h of inputs.highlights) lines.push(fmtHighlight(h));
     lines.push('');
   }
 
@@ -365,12 +431,37 @@ export const planPublication = (
    * plan partition invariant (inline + summary + dropped === ranked.length).
    */
   notice?: string,
+  /**
+   * Optional, additive per-publish inputs (highlights + the clean-review
+   * assertion). Absent → `highlights: []`, `clean_approval: null`,
+   * `approval_managed: false` — byte-identical to a build without this
+   * feature (AC-016).
+   */
+  extras?: PublicationExtras,
 ): PublicationPlan => {
   const mode = cfg.mode;
   const severityFloor = cfg.thresholds.severity_floor.inline;
   const confidenceFloor = cfg.thresholds.confidence_floor.inline;
   const perFileCap = cfg.comment_cap.per_file;
   const perPrCap = cfg.comment_cap.per_pr;
+
+  const highlights: ReviewHighlight[] =
+    extras?.highlights !== undefined ? [...extras.highlights] : [];
+
+  // § C — "clean" is a caller assertion, never inferred from the rendered
+  // plan: both halves (the caller's assertion AND ranked.length === 0) are
+  // required, and dry-run is never eligible (nothing PR-visible is ever
+  // published in dry-run, approval included).
+  const cleanEligible = extras?.clean_review === true && ranked.length === 0 && mode !== 'dry-run';
+  const clean_approval: PublicationCleanApproval | null = cleanEligible
+    ? {
+        body: CLEAN_APPROVAL_MESSAGE,
+        celebrate: cfg.approval.celebrate_clean,
+        conclusion: cfg.approval.clean_conclusion,
+        submit_review: cfg.approval.approve_on_clean,
+      }
+    : null;
+  const approval_managed = cfg.approval.approve_on_clean && mode !== 'dry-run';
 
   // Step 1: eligibility.
   const evaluations = evaluateEligibility(ranked, severityFloor, confidenceFloor);
@@ -446,6 +537,8 @@ export const planPublication = (
       perPrOverflowEntries: [],
       cfg,
       ...(notice !== undefined ? { notice } : {}),
+      highlights,
+      clean_approval,
     });
     return {
       inline: [],
@@ -455,6 +548,9 @@ export const planPublication = (
       mode_applied: mode,
       summary_markdown,
       counts,
+      highlights,
+      clean_approval,
+      approval_managed,
     };
   }
 
@@ -513,6 +609,8 @@ export const planPublication = (
     perPrOverflowEntries,
     cfg,
     ...(notice !== undefined ? { notice } : {}),
+    highlights,
+    clean_approval,
   });
 
   return {
@@ -523,5 +621,8 @@ export const planPublication = (
     mode_applied: mode,
     summary_markdown,
     counts,
+    highlights,
+    clean_approval,
+    approval_managed,
   };
 };

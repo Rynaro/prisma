@@ -276,6 +276,37 @@ export const ChunkingSchema = z
 export type ChunkingConfig = z.infer<typeof ChunkingSchema>;
 
 /**
+ * Positive feedback ("highlights"). Opt-in; when `enabled` is false the prompt
+ * bytes, the tool schema, and the rendered summary are byte-identical to a
+ * build without this feature.
+ */
+export const PositiveFeedbackSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    max_items: z.number().int().min(1).max(5).default(3),
+  })
+  .strict()
+  .default({ enabled: false, max_items: 3 });
+export type PositiveFeedbackConfig = z.infer<typeof PositiveFeedbackSchema>;
+
+/**
+ * Clean-review approval. Every key defaults to today's behavior:
+ * dry "_No findings._", `neutral` conclusion, no PR review submitted.
+ */
+export const ApprovalSchema = z
+  .object({
+    /** Replace `_No findings._` + the empty-review notice with an approval message. */
+    celebrate_clean: z.boolean().default(false),
+    /** Check-run conclusion for a clean, non-dry-run review. */
+    clean_conclusion: z.enum(['neutral', 'success']).default('neutral'),
+    /** Submit a real approving PR review. Honored only from the default branch. */
+    approve_on_clean: z.boolean().default(false),
+  })
+  .strict()
+  .default({ celebrate_clean: false, clean_conclusion: 'neutral', approve_on_clean: false });
+export type ApprovalConfig = z.infer<typeof ApprovalSchema>;
+
+/**
  * `language_overrides` is a map from a language tag to an object whose shape is a
  * subset of this top-level configuration (config-spec.md § language_overrides).
  * For Phase 5.1 we accept any subset of the public top-level keys; the validator
@@ -398,6 +429,15 @@ export const RepoConfigSchema = z
      * Spec: docs/_planning/config-dx/spec.md § 5.1, § 3.7, § 2 Group C.
      */
     provider_options: ProviderOptionsSchema,
+    /**
+     * Positive feedback ("highlights"). Opt-in; default-off. See
+     * `PositiveFeedbackSchema` above.
+     */
+    positive_feedback: PositiveFeedbackSchema,
+    /**
+     * Clean-review approval. Opt-in; default-off. See `ApprovalSchema` above.
+     */
+    approval: ApprovalSchema,
   })
   .describe('Repo-local .github/review-bot.yml configuration');
 

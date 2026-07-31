@@ -158,6 +158,9 @@ describe('runPipelineForFixture', () => {
           summary_contains: [],
           expected_categories: [],
           rejection_reasons: [],
+          approvals_submitted: 0,
+          approval_dismissals: 0,
+          summary_not_contains: [],
         },
       },
     });
@@ -209,6 +212,9 @@ describe('runPipelineForFixture', () => {
           summary_contains: [],
           expected_categories: [],
           rejection_reasons: [],
+          approvals_submitted: 0,
+          approval_dismissals: 0,
+          summary_not_contains: [],
         },
       },
     });

@@ -69,6 +69,7 @@ expectations:
     summary_contains: []
     expected_categories: []
     rejection_reasons: []
+    check_conclusion: neutral
 
 metrics:
   - false_positive_rate

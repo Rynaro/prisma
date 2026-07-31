@@ -28,7 +28,7 @@ import {
 import IORedis from 'ioredis';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
-import { fetchRepoConfig } from './repo-config.js';
+import { fetchRepoConfig, resolvePrivilegedApproval } from './repo-config.js';
 import { resolveRepoIdentity } from './repo-identity.js';
 
 /**
@@ -717,13 +717,27 @@ const start = async (): Promise<void> => {
           ? payload.head_sha
           : 'HEAD';
 
-      const { config, notes: configNotes } = await fetchRepoConfig(
+      const { config: headConfig, notes: fetchNotes } = await fetchRepoConfig(
         octokit,
         identity.owner,
         identity.repo,
         configRef,
         log,
       );
+
+      // Privilege boundary (spec § D.4): `approval.approve_on_clean` is a PR
+      // author-controlled key (configRef is the PR's head_sha) that can grant
+      // a real GitHub approval — re-resolve it against the default branch
+      // before it is ever honored. Zero extra API calls when the flag is off.
+      const { config, notes: privilegeNotes } = await resolvePrivilegedApproval(
+        octokit,
+        identity.owner,
+        identity.repo,
+        headConfig,
+        configRef,
+        log,
+      );
+      const configNotes = [...fetchNotes, ...privilegeNotes];
 
       log('worker.config.loaded', {
         idempotency_key: payload.idempotency_key,

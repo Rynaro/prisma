@@ -117,6 +117,25 @@ const PriorCheckRunSchema = z
   .strict();
 
 /**
+ * A pre-existing PR review to replay from `pulls.listReviews` (S8). Used by
+ * the `approve-on-clean-idempotent` scenario to simulate an already-approved
+ * PR: `findOurApproval` must observe this entry and skip a redundant
+ * `createReview` call.
+ */
+const PriorReviewSchema = z
+  .object({
+    id: z.number().int().nonnegative(),
+    state: z.enum(['APPROVED', 'DISMISSED', 'CHANGES_REQUESTED', 'COMMENTED', 'PENDING']),
+    user: z
+      .object({ login: z.string().min(1), type: z.string().min(1) })
+      .strict()
+      .nullable(),
+    body: z.string().nullable().optional(),
+    commit_id: z.string().min(1).nullable().optional(),
+  })
+  .strict();
+
+/**
  * Per-path fixture responses for `repos.getContent`.
  * Key: repo-relative path (e.g. 'docs/arch.md').
  * Value: `{ content_base64: string }` for a file hit,
@@ -139,6 +158,8 @@ export const ScenarioOctokitResponsesSchema = z
     prior_check_runs: z.array(PriorCheckRunSchema).optional(),
     /** Fixture responses for `repos.getContent` keyed by repo-relative path. */
     repos_get_content: ReposGetContentMapSchema.optional(),
+    /** Pre-existing PR reviews to replay from `pulls.listReviews` (S8). */
+    prior_reviews: z.array(PriorReviewSchema).optional(),
   })
   .strict();
 
@@ -157,9 +178,24 @@ const ProviderFindingFixtureSchema = z
   })
   .strict();
 
+/**
+ * A provider-reported "good decision" fixture (S8). Mirrors
+ * `ProviderReviewOutputHighlightSchema` (`packages/shared/src/schemas/provider.ts`):
+ * deliberately NOT a finding — no line anchor, no severity, no category.
+ */
+const ProviderHighlightFixtureSchema = z
+  .object({
+    path: z.string().min(1).optional(),
+    message: z.string().min(1),
+    rationale: z.string().min(1),
+  })
+  .strict();
+
 const ProviderOutputFixtureSchema = z
   .object({
     findings: z.array(ProviderFindingFixtureSchema),
+    /** Present only on scenarios exercising `positive_feedback` (S8). */
+    highlights: z.array(ProviderHighlightFixtureSchema).optional(),
   })
   .strict();
 
@@ -241,6 +277,25 @@ const PublisherExpectationsSchema = z
      * extension for `duplicate-issue-across-hunks` per spec § File 4.8.
      */
     rejection_reasons: z.array(z.string().min(1)).default([]),
+    /**
+     * The check-run conclusion actually recorded via `checks.update` (S8).
+     * Optional: most scenarios don't assert it and fall through unchecked.
+     */
+    check_conclusion: z.enum(['success', 'neutral', 'failure']).optional(),
+    /**
+     * Count of `pulls.createReview` calls observed this run (S8). Defaults to
+     * `0` so every pre-existing scenario becomes a regression guard for
+     * "default off" (AC-034).
+     */
+    approvals_submitted: z.number().int().nonnegative().default(0),
+    /** Count of `pulls.dismissReview` calls observed this run (S8). */
+    approval_dismissals: z.number().int().nonnegative().default(0),
+    /**
+     * Negated-substring assertions against `summary_artifact` (S8) — the
+     * complement of `summary_contains`. Used to assert that a dropped/capped
+     * highlight (or a suppressed notice) does NOT appear in the rendered body.
+     */
+    summary_not_contains: z.array(z.string()).default([]),
   })
   .strict();
 

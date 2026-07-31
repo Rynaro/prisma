@@ -11,6 +11,7 @@ import {
   NormalizedFindingSchema,
   ProviderOptionsSchema,
   ProviderReviewInputSchema,
+  ProviderReviewOutputHighlightSchema,
   ProviderReviewOutputSchema,
   RejectionLogEntrySchema,
   RepoConfigSchema,
@@ -948,6 +949,154 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
         expect(result.data.request_shaping?.generation?.max_output_tokens).toBe(8192);
         expect(result.data.request_shaping?.provider_options?.reasoning_effort).toBe('low');
       }
+    });
+  });
+
+  // ── Positive feedback / highlights + clean-review approval (S1) ───────────
+
+  describe('positive_feedback config', () => {
+    it('positive_feedback defaults to disabled', () => {
+      expect(DEFAULT_REPO_CONFIG.positive_feedback).toEqual({ enabled: false, max_items: 3 });
+    });
+
+    it('rejects max_items above the allowed range', () => {
+      const result = RepoConfigSchema.safeParse({
+        positive_feedback: { enabled: true, max_items: 9 },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects max_items below the allowed range', () => {
+      const result = RepoConfigSchema.safeParse({
+        positive_feedback: { enabled: true, max_items: 0 },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('accepts a fully-specified positive_feedback block', () => {
+      const result = RepoConfigSchema.safeParse({
+        positive_feedback: { enabled: true, max_items: 2 },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.positive_feedback).toEqual({ enabled: true, max_items: 2 });
+      }
+    });
+
+    it('rejects unknown keys in positive_feedback block (strict)', () => {
+      const result = RepoConfigSchema.safeParse({
+        positive_feedback: { enabled: true, max_items: 2, unknown_key: 'nope' },
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('approval config', () => {
+    it("approval defaults to today's behavior", () => {
+      expect(DEFAULT_REPO_CONFIG.approval).toEqual({
+        celebrate_clean: false,
+        clean_conclusion: 'neutral',
+        approve_on_clean: false,
+      });
+    });
+
+    it('accepts a fully-specified approval block', () => {
+      const result = RepoConfigSchema.safeParse({
+        approval: { celebrate_clean: true, clean_conclusion: 'success', approve_on_clean: true },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.approval).toEqual({
+          celebrate_clean: true,
+          clean_conclusion: 'success',
+          approve_on_clean: true,
+        });
+      }
+    });
+
+    it('rejects an invalid clean_conclusion value', () => {
+      const result = RepoConfigSchema.safeParse({
+        approval: { clean_conclusion: 'failure' },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects unknown keys in approval block (strict)', () => {
+      const result = RepoConfigSchema.safeParse({
+        approval: { celebrate_clean: true, unknown_key: 'nope' },
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('ProviderReviewOutput highlights', () => {
+    it('accepts an optional highlights array', () => {
+      const result = ProviderReviewOutputSchema.safeParse({
+        findings: [],
+        highlights: [
+          { message: 'Clear separation of concerns', rationale: 'Extracted a pure helper.' },
+          {
+            path: 'src/a.ts',
+            message: 'Good error handling',
+            rationale: 'Catches and logs the failure path.',
+          },
+        ],
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.highlights).toHaveLength(2);
+      }
+    });
+
+    it('omitting highlights parses identically to before (zero-config)', () => {
+      const result = ProviderReviewOutputSchema.safeParse({ findings: [] });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.highlights).toBeUndefined();
+      }
+    });
+
+    it('rejects unknown keys on a highlight', () => {
+      const result = ProviderReviewOutputHighlightSchema.safeParse({
+        message: 'Good decision',
+        rationale: 'Because reasons.',
+        line: 42,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a highlight missing message or rationale', () => {
+      expect(ProviderReviewOutputHighlightSchema.safeParse({ rationale: 'x' }).success).toBe(false);
+      expect(ProviderReviewOutputHighlightSchema.safeParse({ message: 'x' }).success).toBe(false);
+    });
+  });
+
+  describe('ProviderReviewInput positive_feedback', () => {
+    it('accepts input without positive_feedback (zero-config backward compat)', () => {
+      const result = ProviderReviewInputSchema.safeParse({ files: [] });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.positive_feedback).toBeUndefined();
+      }
+    });
+
+    it('accepts input with a valid positive_feedback request', () => {
+      const result = ProviderReviewInputSchema.safeParse({
+        files: [],
+        positive_feedback: { max_items: 3 },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.positive_feedback?.max_items).toBe(3);
+      }
+    });
+
+    it('rejects positive_feedback.max_items out of range', () => {
+      const result = ProviderReviewInputSchema.safeParse({
+        files: [],
+        positive_feedback: { max_items: 6 },
+      });
+      expect(result.success).toBe(false);
     });
   });
 });

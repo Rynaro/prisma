@@ -35,13 +35,17 @@ The App requires exactly the following repository permissions. Granting more is 
 
 | Permission | Access | Why |
 | --- | --- | --- |
-| `pull_requests` | Read & write | Create/update Check runs and inline review comments on PRs (per `packages/github/check-runs` and `packages/github/review-comments`). |
+| `pull_requests` | Read & write | Create/update Check runs and inline review comments on PRs (per `packages/github/check-runs` and `packages/github/review-comments`), and — when a repo opts in via `approval.approve_on_clean` — submit or dismiss an approving PR review on a genuinely clean run (`pulls.createReview` / `listReviews` / `dismissReview`, per `packages/github/pr-reviews`). |
 | `checks` | Read & write | Create/update Check runs on the PR `head_sha` (per ADR-001 § Rationale: Checks API richness). |
 | `contents` | Read | Fetch the PR diff and `.github/review-bot.yml` from the head ref (per `packages/core/snapshotter` and `packages/config/config-loader`). |
 | `issues` | Read & write | Post PR conversation reply comments and 👀/✅ reactions for the comment-command ack protocol (`packages/github/issue-comments`). PRs are issues in the GitHub data model; no separate `pull_requests` scope is required for conversation comments. Reactions require no additional scope beyond `issues:write`. |
 | `metadata` | Read | Required by every GitHub App; auto-granted. |
 
 No organization-level permissions are required for MVP. (Multi-installation routing is namespaced by `installation_id` per [`system-design.md` § Multitenancy posture](system-design.md).)
+
+**Real PR approval requires no new permission and no re-approval.** Submitting an approving review, listing reviews, and dismissing a review are all covered by the `pull_requests: Read & write` permission already listed above. Existing installations do **not** need to approve a permission upgrade to use the clean-review-approval feature (`approval.approve_on_clean` in `.github/review-bot.yml`); it is off by default and, when an operator opts in, works immediately on the App's existing grant.
+
+**Branch-protection caveat.** Whether an app-submitted `APPROVE` review satisfies a repository's *required approvals* rule (e.g., "1 human + prisma-bot") is a property of the organization's branch-protection ruleset, not of this integration — GitHub Apps can be included in or excluded from that count entirely at the org's discretion. Verify your ruleset before relying on the bot's approval to unblock merges. Separately, if you want a stale approval cleared automatically when new commits land, prisma dismisses its **own** approval on the next non-clean run, but you may also enable GitHub's built-in **"Dismiss stale pull request approvals when new commits are pushed"** branch-protection option as the operator-side alternative (or belt-and-suspenders companion) to that behavior.
 
 ### Subscribed events
 

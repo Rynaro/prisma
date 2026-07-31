@@ -1,12 +1,16 @@
 import { createHash } from 'node:crypto';
 import {
   FINDING_TITLE_MAX_LENGTH,
+  HIGHLIGHT_MESSAGE_MAX_LENGTH,
+  HIGHLIGHT_RATIONALE_MAX_LENGTH,
   type NormalizedFinding,
   type PrSnapshot,
   type ProviderReviewOutput,
+  type ProviderReviewOutputHighlight,
   ProviderReviewOutputSchema,
   type RejectionLogEntry,
   type RepoConfig,
+  type ReviewHighlight,
 } from '@prisma-bot/shared';
 
 /**
@@ -39,6 +43,8 @@ export interface ValidatorContext {
 export interface ValidatorResult {
   findings: NormalizedFinding[];
   rejections: RejectionLogEntry[];
+  /** Validated, deduped, deterministically capped. `[]` when disabled or none. */
+  highlights: ReviewHighlight[];
 }
 
 interface AnalyzableFile {
@@ -210,6 +216,115 @@ const excerptFor = (value: unknown): string => {
   }
 };
 
+/**
+ * Validate, dedupe and cap the provider's `highlights` array. Ordered rules
+ * (each drop logged with its own `reason_code`), per spec § A.5:
+ *   0. `positive_feedback.enabled !== true` → return empty, no rejections
+ *      logged (a provider that emits highlights anyway is silently ignored).
+ *   1. Normalize `message`/`rationale` (trim + collapse whitespace).
+ *   2. Either normalized string empty → `highlight_blank`.
+ *   3. `message` or `rationale` over its max length → `highlight_too_long`.
+ *   4. `path` present and not an analyzable file → `highlight_path_not_in_diff`.
+ *   5. Normalized `message` (lowercased) already seen → `highlight_duplicate`.
+ *   6. Survivor index ≥ `max_items` → `highlight_over_cap`.
+ *
+ * Dedupe happens BEFORE the cap, so duplicates cannot consume cap slots.
+ * Survivors keep provider order. Pure: no clock, no random, no I/O — the
+ * caller supplies `ranAt`.
+ */
+const validateHighlights = (
+  raw: ReadonlyArray<ProviderReviewOutputHighlight>,
+  analyzableFiles: ReadonlyMap<string, AnalyzableFile>,
+  cfg: RepoConfig,
+  ranAt: string,
+): { highlights: ReviewHighlight[]; rejections: RejectionLogEntry[] } => {
+  if (cfg.positive_feedback.enabled !== true) {
+    return { highlights: [], rejections: [] };
+  }
+
+  const highlights: ReviewHighlight[] = [];
+  const rejections: RejectionLogEntry[] = [];
+  const seenMessages = new Set<string>();
+
+  for (const item of raw) {
+    const message = normalizeMessage(item.message);
+    const rationale = normalizeMessage(item.rationale);
+
+    if (message.length === 0 || rationale.length === 0) {
+      rejections.push({
+        finding_id: null,
+        stage: 'validator',
+        reason_code: 'highlight_blank',
+        reason_message: 'highlight message or rationale is blank after normalization',
+        provider_output_excerpt: excerptFor(item),
+        timestamp: ranAt,
+      });
+      continue;
+    }
+
+    if (
+      message.length > HIGHLIGHT_MESSAGE_MAX_LENGTH ||
+      rationale.length > HIGHLIGHT_RATIONALE_MAX_LENGTH
+    ) {
+      rejections.push({
+        finding_id: null,
+        stage: 'validator',
+        reason_code: 'highlight_too_long',
+        reason_message: 'highlight message or rationale exceeds the maximum allowed length',
+        provider_output_excerpt: excerptFor(item),
+        timestamp: ranAt,
+      });
+      continue;
+    }
+
+    if (item.path !== undefined && !analyzableFiles.has(item.path)) {
+      rejections.push({
+        finding_id: null,
+        stage: 'validator',
+        reason_code: 'highlight_path_not_in_diff',
+        reason_message: `path ${item.path} is not present in the analyzable diff`,
+        provider_output_excerpt: excerptFor(item),
+        timestamp: ranAt,
+      });
+      continue;
+    }
+
+    const dedupeKey = message.toLowerCase();
+    if (seenMessages.has(dedupeKey)) {
+      rejections.push({
+        finding_id: null,
+        stage: 'validator',
+        reason_code: 'highlight_duplicate',
+        reason_message: 'duplicate of an earlier highlight (normalized message already seen)',
+        provider_output_excerpt: excerptFor(item),
+        timestamp: ranAt,
+      });
+      continue;
+    }
+    seenMessages.add(dedupeKey);
+
+    if (highlights.length >= cfg.positive_feedback.max_items) {
+      rejections.push({
+        finding_id: null,
+        stage: 'validator',
+        reason_code: 'highlight_over_cap',
+        reason_message: 'highlight count exceeds the configured positive_feedback.max_items',
+        provider_output_excerpt: excerptFor(item),
+        timestamp: ranAt,
+      });
+      continue;
+    }
+
+    highlights.push({
+      message,
+      rationale,
+      ...(item.path !== undefined ? { path: item.path } : {}),
+    });
+  }
+
+  return { highlights, rejections };
+};
+
 export const runValidator = (
   output: ProviderReviewOutput,
   ctx: ValidatorContext,
@@ -238,7 +353,7 @@ export const runValidator = (
         timestamp: ctx.ran_at,
       });
     }
-    return { findings: [], rejections };
+    return { findings: [], rejections, highlights: [] };
   }
 
   const validated: ProviderReviewOutput = parsed.data;
@@ -336,5 +451,13 @@ export const runValidator = (
     findings.push(finding);
   }
 
-  return { findings, rejections };
+  const { highlights, rejections: highlightRejections } = validateHighlights(
+    validated.highlights ?? [],
+    analyzableFiles,
+    ctx.config,
+    ctx.ran_at,
+  );
+  rejections.push(...highlightRejections);
+
+  return { findings, rejections, highlights };
 };

@@ -6,9 +6,11 @@ import type {
   RepoConfig,
 } from '@prisma-bot/shared';
 import type { CheckRunsClient } from '../check-runs/index.js';
+import type { PrReviewsClient } from '../pr-reviews/index.js';
 import type { ReviewCommentsClient } from '../review-comments/index.js';
 import {
   type PriorDedupeState,
+  type PublicationExtras,
   type PublicationPlan,
   type PublicationPlanDropEntry,
   type PublicationPlanSummaryEntry,
@@ -30,7 +32,22 @@ import {
 export interface PublisherDeps {
   checkRuns: CheckRunsClient;
   reviewComments: ReviewCommentsClient;
+  /**
+   * Optional: when absent, `plan.approval_managed` is never actioned (no
+   * approve/dismiss HTTP call is made) — every existing `{checkRuns,
+   * reviewComments}` fake stays assignable without change.
+   */
+  prReviews?: PrReviewsClient;
 }
+
+/**
+ * Message used when dismissing a stale approval — a PR approved at an earlier
+ * commit that later gained findings. Per spec § D.3 / R2: without this, a
+ * once-clean PR keeps its bot approval after a regressing commit unless the
+ * org separately enabled "dismiss stale approvals on new commits".
+ */
+export const STALE_APPROVAL_DISMISS_MESSAGE =
+  'Prisma found issues on a later commit; dismissing the earlier approval.';
 
 /**
  * Regex for the round-counter marker in the check-run summary.
@@ -217,6 +234,13 @@ export const publish = async (
    * `renderSummary` step. Does not alter the plan partition invariant.
    */
   notice?: string,
+  /**
+   * Optional, additive per-publish inputs (highlights + the clean-review
+   * assertion). Forwarded verbatim to `planPublication`. Absent → the plan's
+   * `highlights`/`clean_approval`/`approval_managed` fields fall back to
+   * their byte-identical defaults (empty / null / false).
+   */
+  extras?: PublicationExtras,
 ): Promise<PublicationResult> => {
   const ranAt = new Date().toISOString();
 
@@ -234,7 +258,7 @@ export const publish = async (
   // Build the set of current finding dedupe keys for round-summary arithmetic.
   const currentKeys = new Set<string>(ranked.map((f) => f.dedupe_key));
 
-  const plan: PublicationPlan = planPublication(ranked, cfg, prior, notice);
+  const plan: PublicationPlan = planPublication(ranked, cfg, prior, notice, extras);
 
   // Start the Checks run.
   let checkRunId = 0;
@@ -280,8 +304,14 @@ export const publish = async (
   // Finalize the Checks run with the rendered summary.
   let finalizeError: unknown;
   if (checksError === undefined) {
+    // Per spec § C.2: dry-run or "no inline findings" fall back to the plan's
+    // clean-approval conclusion (`neutral` when the review is not clean, or
+    // absent extras — byte-identical to today). Otherwise a real inline-
+    // bearing publish is always `success`, unchanged.
     const conclusion: 'success' | 'neutral' | 'failure' =
-      plan.mode_applied === 'dry-run' || plan.inline.length === 0 ? 'neutral' : 'success';
+      plan.mode_applied === 'dry-run' || plan.inline.length === 0
+        ? (plan.clean_approval?.conclusion ?? 'neutral')
+        : 'success';
     const title = truncateTitle(MODE_TITLES[plan.mode_applied] ?? 'AI Code Review', 60);
 
     // Build round-summary header and append round marker.
@@ -308,6 +338,50 @@ export const publish = async (
     }
   }
 
+  // Approval sync — strictly AFTER the check run is finalized (fail-open,
+  // mission requirement: a failing approval can never prevent check
+  // publication) and BEFORE the rejection log is assembled.
+  //
+  // - `plan.clean_approval?.submit_review === true` (clean + approve_on_clean):
+  //   approve once, unless an undismissed APPROVE of ours already exists
+  //   (idempotent — `synchronize` re-runs never double-approve).
+  // - Otherwise, when `plan.approval_managed` is true (approve_on_clean is on
+  //   for this run) and an approval of ours exists, this run is NOT clean —
+  //   dismiss the stale approval (§ D.3 / R2).
+  // - Any error is caught and recorded as a rejection; never rethrown.
+  let approvalError: unknown;
+  if (plan.approval_managed && deps.prReviews !== undefined) {
+    try {
+      const existing = await deps.prReviews.findOurApproval({
+        owner: ctx.owner,
+        repo: ctx.repo,
+        pull_number: ctx.pull_request_number,
+        app_login: ctx.app_login,
+      });
+      if (plan.clean_approval?.submit_review === true) {
+        if (existing === null) {
+          await deps.prReviews.approve({
+            owner: ctx.owner,
+            repo: ctx.repo,
+            pull_number: ctx.pull_request_number,
+            commit_id: ctx.head_sha,
+            body: plan.clean_approval.body,
+          });
+        }
+      } else if (existing !== null) {
+        await deps.prReviews.dismiss({
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.pull_request_number,
+          review_id: existing.id,
+          message: STALE_APPROVAL_DISMISS_MESSAGE,
+        });
+      }
+    } catch (err) {
+      approvalError = err; // fail-open: never rethrow
+    }
+  }
+
   // Build the rejection log: every plan.dropped + plan.summary_rejections +
   // any GitHub-API failures we hit on the way.
   const rejections: RejectionLogEntry[] = [];
@@ -320,6 +394,7 @@ export const publish = async (
   for (const f of inlineFailures) rejections.push(f);
   if (checksError !== undefined) rejections.push(rejectionFromGithubError(checksError, ranAt));
   if (finalizeError !== undefined) rejections.push(rejectionFromGithubError(finalizeError, ranAt));
+  if (approvalError !== undefined) rejections.push(rejectionFromGithubError(approvalError, ranAt));
 
   // Build the round summary for the artifact (same as what was sent to GitHub).
   const roundSummaryLine = buildRoundSummaryLine(

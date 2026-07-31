@@ -144,6 +144,23 @@ Guidance is injected as **untrusted data** beneath an immutable system prompt �
 
 Full guide: [docs/custom-review-prompts.md](./docs/custom-review-prompts.md).
 
+**Positive feedback and clean-review approval.** Two more per-repo, default-off opt-ins:
+
+```yaml
+positive_feedback:
+  enabled: true
+  max_items: 3
+
+approval:
+  celebrate_clean: true
+  clean_conclusion: success
+  approve_on_clean: true
+```
+
+`positive_feedback` asks the model to also name up to `max_items` concrete good decisions it can verify in the diff, rendered as a `### Highlights` section — never a finding, never a substitute for one. `approval` governs what happens on a genuinely clean review: `celebrate_clean` swaps the dry `_No findings._` body for a short approval message, `clean_conclusion` can flip the check-run conclusion to `success`, and `approve_on_clean` submits one real, idempotent GitHub approval.
+
+Safety posture: all three keys default **off** — a repo with no `.github/review-bot.yml` (or with these keys absent) gets byte-identical prompt, tool schema, summary, and API calls. `approve_on_clean` is honored **only from the repository's default branch** (a PR cannot grant itself an approval by shipping config in its own diff), and the bot **never** submits `REQUEST_CHANGES` — a dissatisfied later commit dismisses the earlier approval instead. See [docs/config-spec.md](./docs/config-spec.md) § `positive_feedback` / § `approval` and [docs/publication-policy.md](./docs/publication-policy.md).
+
 ## Commands
 
 Mention the bot in a PR comment to trigger actions without opening the GitHub UI:
