@@ -4,8 +4,10 @@ import {
   type IssueCommentsClient,
   type OctokitLike,
   type SecretSource,
+  buildCheckRunsClient,
   buildContentFetcher,
   buildIssueCommentsClient,
+  buildReviewCommentsClient,
   envSecretSource,
 } from '@prisma-bot/github';
 import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/provider-anthropic';
@@ -26,6 +28,7 @@ import {
   parseModelSlug,
 } from '@prisma-bot/shared';
 import IORedis from 'ioredis';
+import { type AskResult, runAsk } from './interactions.js';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
 import { fetchRepoConfig, resolvePrivilegedApproval } from './repo-config.js';
@@ -299,9 +302,11 @@ const buildRepoLookup = (secretSource: SecretSource): RepoLookup => {
 /**
  * Build the text body for a `help` command reply.
  * The `marker` parameter is the configured command_marker (default `@`).
+ * The `ask` row is always shown (opt-in feature, per spec § 3) — the
+ * `interactions.enabled` gate only affects what happens when it is invoked.
  */
 const buildHelpReply = (botLogin: string, marker = '@'): string =>
-  `### ${botLogin} — commands\n\n| Command | Description |\n|---|---|\n| \`${marker}${botLogin} review\` | Run an incremental review (skips already-posted findings) |\n| \`${marker}${botLogin} full review\` | Run a fresh review (re-evaluates all findings) |\n| \`${marker}${botLogin} help\` | Show this command reference |\n| \`${marker}${botLogin} configuration\` | Show the effective repo configuration |\n\nYou can also click **Re-run** on the "AI Code Review" check to trigger an incremental round.`;
+  `### ${botLogin} — commands\n\n| Command | Description |\n|---|---|\n| \`${marker}${botLogin} review\` | Run an incremental review (skips already-posted findings) |\n| \`${marker}${botLogin} full review\` | Run a fresh review (re-evaluates all findings) |\n| \`${marker}${botLogin} help\` | Show this command reference |\n| \`${marker}${botLogin} configuration\` | Show the effective repo configuration |\n| \`${marker}${botLogin} ask <message>\` | Discuss the review feedback (opt-in) |\n\nYou can also click **Re-run** on the "AI Code Review" check to trigger an incremental round.`;
 
 /**
  * Build the text body for a `configuration` command reply.
@@ -378,6 +383,16 @@ const buildConfigReply = (config: RepoConfig): string => {
     }
   }
 
+  // Reviewer interaction (`ask`): always shown (like command_marker) so
+  // operators can confirm whether the feature is opt-in-enabled and the
+  // configured cap, per spec § 3 "configuration reply echoes the block
+  // (always, like command_marker)".
+  lines.push(
+    'interactions:',
+    `  enabled: ${String(config.interactions.enabled)}`,
+    `  max_per_review: ${config.interactions.max_per_review}`,
+  );
+
   lines.push(
     'repo_heuristics:',
     `  security: ${String(config.repo_heuristics.security)}`,
@@ -396,6 +411,20 @@ const buildConfigReply = (config: RepoConfig): string => {
   lines.push('```');
   return lines.join('\n');
 };
+
+/**
+ * Reply builders for the three template (no-provider-call) `ask` outcomes.
+ * Per spec § 3: all three are fail-open, friendly replies; none consumes the
+ * per-round interaction budget.
+ */
+const buildInteractionsDisabledReply = (): string =>
+  'Interactions are disabled for this repository. Ask a maintainer to opt in by setting `interactions.enabled: true` in `.github/review-bot.yml`.';
+
+const buildNoRoundReply = (botLogin: string, marker = '@'): string =>
+  `I don't have a published review round for this PR yet — run \`${marker}${botLogin} review\` first, then ask again.`;
+
+const buildCapExceededReply = (used: number, max: number): string =>
+  `This review round has reached its interaction limit (\`${used}/${max}\`, per \`interactions.max_per_review\`). Run a new review round to reset the budget, or raise \`interactions.max_per_review\` in \`.github/review-bot.yml\`.`;
 
 const start = async (): Promise<void> => {
   const secretSource = envSecretSource();
@@ -495,6 +524,83 @@ const start = async (): Promise<void> => {
         await issueComments.createReply({ owner, repo, issue_number: pr_number, body });
       } else if (cmd.kind === 'configuration') {
         const body = buildConfigReply(config);
+        await issueComments.createReply({ owner, repo, issue_number: pr_number, body });
+      } else if (cmd.kind === 'ask') {
+        // Reviewer interaction (`@bot ask <message>`) — spec § 7 dispatch order.
+        log('command.interaction.started', { idempotency_key: payload.idempotency_key });
+
+        let body: string;
+        if (!config.interactions.enabled) {
+          // Step 1: disabled gate — no I/O beyond the reply, no provider call.
+          log('command.interaction.denied_disabled', {
+            idempotency_key: payload.idempotency_key,
+          });
+          body = buildInteractionsDisabledReply();
+        } else {
+          // PR meta (title/description/refs) for ProviderRespondInput.pr — an
+          // inexpensive metadata call, not a provider spend. Fetched here
+          // (rather than threaded into the pure `runAsk` module) to keep the
+          // worker dispatch straightforward.
+          const prData = await octokit.rest.pulls.get({ owner, repo, pull_number: pr_number });
+          const askDeps = {
+            checkRuns: buildCheckRunsClient(octokit),
+            reviewComments: buildReviewCommentsClient(octokit),
+            issueComments,
+            provider,
+          };
+          const askCtx = {
+            owner,
+            repo,
+            pull_request_number: pr_number,
+            head_sha: prData.data.head.sha,
+            app_id: identity.app_id,
+            app_login: identity.app_login,
+          };
+          const askReq = {
+            author_login: payload.commenter_login,
+            message: cmd.message,
+            interactions: config.interactions,
+            pr: {
+              title: prData.data.title,
+              description: prData.data.body ?? '',
+              base_ref: prData.data.base.ref,
+              head_ref: prData.data.head.ref,
+              head_sha: prData.data.head.sha,
+            },
+            ...(config.review_guidance.instructions !== undefined
+              ? { guidance: config.review_guidance.instructions }
+              : {}),
+          };
+          // Provider errors propagate to the outer catch below, which applies
+          // the existing command-path error-reply semantics (spec § 3
+          // "Provider failure"); no interaction marker is posted on failure.
+          const askResult: AskResult = await runAsk(askDeps, askCtx, askReq);
+          if (askResult.kind === 'disabled') {
+            log('command.interaction.denied_disabled', {
+              idempotency_key: payload.idempotency_key,
+            });
+            body = buildInteractionsDisabledReply();
+          } else if (askResult.kind === 'no_round') {
+            log('command.interaction.denied_no_round', {
+              idempotency_key: payload.idempotency_key,
+            });
+            body = buildNoRoundReply(botLogin, configuredMarker);
+          } else if (askResult.kind === 'cap_exceeded') {
+            log('command.interaction.denied_cap', {
+              idempotency_key: payload.idempotency_key,
+              used: askResult.used,
+              max: askResult.max,
+            });
+            body = buildCapExceededReply(askResult.used, askResult.max);
+          } else {
+            log('command.interaction.replied', {
+              idempotency_key: payload.idempotency_key,
+              round: askResult.round,
+              seq: askResult.seq,
+            });
+            body = askResult.body;
+          }
+        }
         await issueComments.createReply({ owner, repo, issue_number: pr_number, body });
       } else {
         // review or full_review: resolve head sha, then run the pipeline.
@@ -636,6 +742,12 @@ const start = async (): Promise<void> => {
       // Still re-throw ProviderErrorThrowable afterward so the consumer can mark
       // the job failed_terminal (terminal classification is done in the consumer
       // wrapper, not here).
+      if (cmd.kind === 'ask') {
+        log('command.interaction.failed', {
+          idempotency_key: payload.idempotency_key,
+          message: err instanceof Error ? err.message : 'unknown',
+        });
+      }
       if (err instanceof ProviderErrorThrowable) {
         const { kind } = err.value;
         if (kind === 'capability' || kind === 'auth') {

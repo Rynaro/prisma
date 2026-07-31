@@ -7,3 +7,4 @@ export * from './pr-reviews/index.js';
 export * from './issue-comments/index.js';
 export * from './publisher/index.js';
 export * from './content-fetcher/index.js';
+export * from './interactions/index.js';

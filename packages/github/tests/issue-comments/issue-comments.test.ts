@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
+  IssueCommentData,
   IssuesCreateCommentParams,
   OctokitLike,
   ReactionsCreateForIssueCommentParams,
@@ -15,21 +16,34 @@ interface FakeOctokit extends OctokitLike {
   getCommentCalls: Array<{ owner: string; repo: string; comment_id: number }>;
   reactionCalls: ReactionsCreateForIssueCommentParams[];
   setGetCommentUser: (login: string, type: string) => void;
+  setListPages: (pages: IssueCommentData[][]) => void;
+  listCalls: Array<{ page?: number; per_page?: number }>;
 }
 
 const buildFake = (): FakeOctokit => {
   let getCommentUser: { login: string; type: string } = { login: 'alice', type: 'User' };
+  let listPages: IssueCommentData[][] = [];
   const fake: Partial<FakeOctokit> = {};
   fake.createCommentCalls = [];
   fake.getCommentCalls = [];
   fake.reactionCalls = [];
+  fake.listCalls = [];
   fake.setGetCommentUser = (login, type) => {
     getCommentUser = { login, type };
+  };
+  fake.setListPages = (pages) => {
+    listPages = pages;
   };
   fake.rest = {
     pulls: {
       get: async () => ({
-        data: { number: 1, head: { sha: 'a', ref: 'm' }, base: { sha: 'b', ref: 'm' } },
+        data: {
+          number: 1,
+          head: { sha: 'a', ref: 'm' },
+          base: { sha: 'b', ref: 'm' },
+          title: 'test PR',
+          body: null,
+        },
       }),
       listFiles: async () => ({ data: [] }),
     },
@@ -64,6 +78,15 @@ const buildFake = (): FakeOctokit => {
       getComment: async (params) => {
         fake.getCommentCalls?.push(params);
         return { data: { id: params.comment_id, body: 'hello', user: getCommentUser } };
+      },
+      listComments: async (params) => {
+        const entry: { page?: number; per_page?: number } = {};
+        if (params.page !== undefined) entry.page = params.page;
+        if (params.per_page !== undefined) entry.per_page = params.per_page;
+        fake.listCalls?.push(entry);
+        const idx = (params.page ?? 1) - 1;
+        const data = listPages[idx] ?? [];
+        return { data };
       },
     },
     reactions: {
@@ -169,6 +192,63 @@ describe('IssueCommentsClient', () => {
       await client.addReaction({ owner: 'o', repo: 'r', comment_id: 456, content: '+1' });
       expect(fake.reactionCalls).toHaveLength(1);
       expect(fake.reactionCalls[0]?.content).toBe('+1');
+    });
+  });
+
+  describe('listOurs', () => {
+    it('filters out non-bot and other-login comments', async () => {
+      const fake = buildFake();
+      fake.setListPages([
+        [
+          { id: 1, body: 'mine', user: { login: 'prisma-bot[bot]', type: 'Bot' } },
+          { id: 2, body: 'human', user: { login: 'alice', type: 'User' } },
+          { id: 3, body: 'other-bot', user: { login: 'other[bot]', type: 'Bot' } },
+        ],
+      ]);
+      const client = buildIssueCommentsClient(fake);
+      const out = await client.listOurs({
+        owner: 'o',
+        repo: 'r',
+        issue_number: 42,
+        app_login: 'prisma-bot',
+      });
+      expect(out).toHaveLength(1);
+      expect(out[0]).toEqual({ id: 1, body: 'mine' });
+    });
+
+    it('paginates if needed', async () => {
+      const fake = buildFake();
+      const fullPage: IssueCommentData[] = Array.from({ length: 100 }, (_, i) => ({
+        id: i + 1,
+        body: `b${i}`,
+        user: { login: 'prisma-bot[bot]', type: 'Bot' },
+      }));
+      fake.setListPages([
+        fullPage,
+        [{ id: 999, body: 'last', user: { login: 'prisma-bot[bot]', type: 'Bot' } }],
+      ]);
+      const client = buildIssueCommentsClient(fake);
+      const out = await client.listOurs({
+        owner: 'o',
+        repo: 'r',
+        issue_number: 42,
+        app_login: 'prisma-bot',
+      });
+      expect(out).toHaveLength(101);
+      expect(fake.listCalls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('returns an empty array on the fail-open path (no bot comments)', async () => {
+      const fake = buildFake();
+      fake.setListPages([[]]);
+      const client = buildIssueCommentsClient(fake);
+      const out = await client.listOurs({
+        owner: 'o',
+        repo: 'r',
+        issue_number: 42,
+        app_login: 'prisma-bot',
+      });
+      expect(out).toEqual([]);
     });
   });
 });
