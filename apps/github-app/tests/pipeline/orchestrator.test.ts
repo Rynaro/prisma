@@ -628,6 +628,42 @@ describe('runPipeline', () => {
     expect(notice).toMatch(/model_not_found/);
     expect(notice).toMatch(/review-bot\.yml/);
     expect(notice).toMatch(/not a PR-size limit/i);
+    // An unrelated capability failure gets no endpoint-routing suggestion.
+    expect(notice).not.toMatch(/OPENAI_API_STYLE/);
+  });
+
+  it('capability error: the #40 function-tools rejection adds the OPENAI_API_STYLE remedy', async () => {
+    // Issue #40 § "the capability notice points at the remedy for this exact
+    // rejection". The summary must name OPENAI_API_STYLE and must not offer
+    // reasoning_effort 'none' as the fix.
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: {
+            kind: 'capability',
+            message:
+              "Function tools with reasoning_effort are not supported for gpt-5.6-luna in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+          },
+        },
+      ],
+    });
+    const capturedNotices: Array<string | undefined> = [];
+    const spy = buildOctokitSpy();
+    const deps = buildDeps({ provider, octokitSpy: spy });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+    await expect(runPipeline(makePayload(), deps)).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    const notice = capturedNotices[0];
+    expect(notice).toMatch(/OPENAI_API_STYLE=responses/);
+    expect(notice).toMatch(/Do not use `reasoning_effort: 'none'`/);
+    expect(notice).toMatch(/model-compatibility\.md/);
   });
 
   it('auth error: notice passed to runPublish contains credentials text', async () => {

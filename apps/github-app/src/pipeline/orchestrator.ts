@@ -44,6 +44,7 @@ import {
   parseModelSlug,
 } from '@prisma-bot/shared';
 import type { TokenizerFamily } from '@prisma-bot/shared';
+import { withCapabilityRemedy } from '../provider-notices.js';
 
 /**
  * `runPipeline` — single-function orchestrator that wires the Phase 5.1–5.5
@@ -777,7 +778,10 @@ export const runPipeline = async (
     const safeMsg = err.value.message;
     const providerNotice =
       kind === 'capability'
-        ? `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the model setting in \`.github/review-bot.yml\` (or the provider's model env var). This is not a PR-size limit.`
+        ? withCapabilityRemedy(
+            `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the model setting in \`.github/review-bot.yml\` (or the provider's model env var). This is not a PR-size limit.`,
+            safeMsg,
+          )
         : `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key.`;
     try {
       await publishSummaryOnly({

@@ -8,7 +8,8 @@
  * via the return type of `createOpenAIClient`) is the only surface the rest
  * of the package consumes — tests inject mocks against the same shape.
  *
- * Wire shape: OpenAI-compatible `/chat/completions`. On non-2xx
+ * Wire shape: OpenAI-compatible `/chat/completions`, plus `/responses` for the
+ * model families that reject function tools on `/chat/completions`. On non-2xx
  * responses we throw a plain object carrying `status`, `headers`, `message`,
  * and (when available) `error.type` / `error.code`, which `error-mapping.ts`
  * reads vendor-neutrally.
@@ -81,6 +82,61 @@ export interface OpenAIChatCompletionsArgs {
 }
 
 /**
+ * `OpenAIResponsesArgs`, the wire shape sent to `/responses`.
+ *
+ * The Responses API spells the same request differently from
+ * `/chat/completions`:
+ *   - the system message is `instructions`, the remaining turns are `input`;
+ *   - a tool is flat (`{ type, name, description, parameters }`) rather than
+ *     nested under a `function` key;
+ *   - the output cap is `max_output_tokens` (neither `max_tokens` nor
+ *     `max_completion_tokens` is accepted);
+ *   - reasoning effort is a `reasoning: { effort }` object, not the flat
+ *     `reasoning_effort` field the chat endpoint takes;
+ *   - there is no `seed`;
+ *   - `store` controls server-side retention; Prisma sends `false`.
+ *
+ * The endpoint rejects unknown top-level parameters with HTTP 400, so a chat
+ * field cannot simply ride along.
+ *
+ * `tool_choice: 'required'` keeps its meaning and its wire value. The mapping
+ * from `OpenAIChatCompletionsArgs` lives in `toResponsesArgs` (index.ts) so
+ * this file stays transport-only.
+ *
+ * The index signature carries raw `provider_options` passthrough keys exactly
+ * as `OpenAIChatCompletionsArgs` does.
+ */
+export interface OpenAIResponsesArgs {
+  model: string;
+  /** The system message, which the Responses API takes as a top-level field. */
+  instructions: string;
+  input: Array<{ role: 'user' | 'assistant'; content: string }>;
+  tools: Array<{
+    type: 'function';
+    name: string;
+    description: string;
+    parameters: object;
+  }>;
+  /** Same values as the chat endpoint, minus the `function` nesting. */
+  tool_choice: 'required' | { type: 'function'; name: string };
+  /** Output token cap. The Responses API accepts only this spelling. */
+  max_output_tokens?: number;
+  /**
+   * Reasoning configuration. `toResponsesArgs` builds this from a native
+   * `provider_options.openai.reasoning` object and/or the legacy
+   * `reasoning_effort` chat spelling. Typed as `unknown` because the object's
+   * own fields (`effort`, `summary`, …) are the vendor's contract, not this
+   * adapter's — the adapter only guarantees the key.
+   */
+  reasoning?: unknown;
+  /** Server-side retention of the response. Prisma sends `false`. */
+  store?: boolean;
+  temperature?: number;
+  top_p?: number;
+  [k: string]: unknown;
+}
+
+/**
  * `OpenAITextCompletionArgs` — the wire shape for a plain-text (no tools)
  * `/chat/completions` request, used by `respond()` (reviewer-interaction,
  * `@bot ask <message>`). Mirrors `OpenAIChatCompletionsArgs` minus the
@@ -100,6 +156,7 @@ export interface OpenAITextCompletionArgs {
 
 export interface OpenAIClient {
   chatCompletions(args: OpenAIChatCompletionsArgs): Promise<unknown>;
+  responses(args: OpenAIResponsesArgs): Promise<unknown>;
   textCompletion(args: OpenAITextCompletionArgs): Promise<unknown>;
 }
 
@@ -121,10 +178,10 @@ function headersToRecord(headers: Headers): Record<string, string> {
 }
 
 /**
- * Shared POST-and-error-mapping logic for both `chatCompletions` and
- * `textCompletion` — the only difference between the two wire calls is the
- * request body shape (tools present vs. absent); the HTTP/error handling is
- * identical, so it is factored here once (DRY) rather than duplicated.
+ * Shared POST-and-error-mapping logic for `chatCompletions`, `responses` and
+ * `textCompletion`. The only difference between the wire calls is the URL and
+ * the request body shape; the HTTP/error handling is identical, so it is
+ * factored here once (DRY) rather than duplicated.
  */
 async function postChatCompletion(
   url: string,
@@ -202,11 +259,15 @@ async function postChatCompletion(
 export function createOpenAIClient(opts: CreateOpenAIClientOptions): OpenAIClient {
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
   const url = `${baseUrl}/chat/completions`;
+  const responsesUrl = `${baseUrl}/responses`;
   const timeoutMs = opts.timeoutMs;
 
   return {
     chatCompletions(args: OpenAIChatCompletionsArgs): Promise<unknown> {
       return postChatCompletion(url, opts.apiKey, timeoutMs, args);
+    },
+    responses(args: OpenAIResponsesArgs): Promise<unknown> {
+      return postChatCompletion(responsesUrl, opts.apiKey, timeoutMs, args);
     },
     textCompletion(args: OpenAITextCompletionArgs): Promise<unknown> {
       return postChatCompletion(url, opts.apiKey, timeoutMs, args);

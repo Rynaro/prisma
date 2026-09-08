@@ -17,7 +17,7 @@ prisma is a `pnpm` workspace. `apps/` contains runtime entry points; `packages/`
 | `packages/github` | GitHub-side adapters: installation-auth, Checks API, review comments, Installations API. | [`docs/system-design.md#packagesgithubinstallation-auth`](system-design.md#packagesgithubinstallation-auth) |
 | `packages/providers/anthropic` | Anthropic Claude reference adapter (per OQ-1). | [`docs/system-design.md#packagesprovidersanthropic`](system-design.md#packagesprovidersanthropic) |
 | `packages/providers/copilot` | GitHub Copilot adapter (per ADR-004) targeting the GitHub Models inference endpoint. | [ADR-004](architecture-decision-records/adr-004-copilot-provider.md) |
-| `packages/providers/openai` | OpenAI adapter (per ADR-005) targeting the OpenAI `/chat/completions` endpoint; honors a deterministic `seed`. | [ADR-005](architecture-decision-records/adr-005-openai-provider.md) |
+| `packages/providers/openai` | OpenAI adapter (per ADR-005) targeting `/chat/completions` for classic models and `/responses` for reasoning-family models (per ADR-007); honors a deterministic `seed` on the chat endpoint only. | [ADR-005](architecture-decision-records/adr-005-openai-provider.md), [ADR-007](architecture-decision-records/adr-007-openai-responses-endpoint.md) |
 | `packages/providers/fake` | Deterministic in-process `FakeProvider` used by the eval harness and unit tests. | [`docs/system-design.md#packagesproviders-provider-abstraction-surface`](system-design.md#packagesproviders-provider-abstraction-surface) |
 | `evals/runner` | Phase 6 deterministic evaluation harness (`@prisma-bot/eval-runner`); owns the scenario loader and the PASS/FAIL gate. | [`evals/README.md`](../evals/README.md) |
 

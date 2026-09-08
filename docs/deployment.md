@@ -80,6 +80,7 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `OPENAI_TOKEN_PARAM` | Controls which output-token cap parameter the OpenAI adapter sends per request. `auto` (default) applies a heuristic: `max_completion_tokens` for gpt-5*/o-series models, `max_tokens` for classic models (`gpt-4o`, `gpt-4`, `gpt-3.5-turbo`). Set to `max_tokens` or `max_completion_tokens` to override the heuristic — useful for proxy gateways that lag OpenAI's rollout or for misclassified future models. Invalid values are silently ignored and fall back to `auto`. Consumed only when `OPENAI_API_KEY` is set. | `config` |
 | `OPENAI_MAX_OUTPUT_TOKENS` | Optional output token budget for the OpenAI adapter (defaults to `4096`). Raise for reasoning-capable models (o-series, gpt-5) that may need a larger completion window. Non-numeric or non-positive values are silently ignored and fall back to the default. Consumed only when `OPENAI_API_KEY` is set. | `config` |
 | `OPENAI_TOOL_CHOICE` | Controls the `tool_choice` parameter sent to the OpenAI chat completions API. `auto` (default) uses a heuristic: reasoning models (gpt-5+/o-series) receive `"required"` (allows interleaved thinking before calling the tool), classic models (gpt-4o, gpt-4.1) receive the forced-specific function object. Set to `forced` to always send the forced-specific object (useful when a proxy gateway rejects `"required"`), or `required` to always send `"required"`. Invalid values fall back to `auto`. See `docs/model-compatibility.md` for the reasoning-model compatibility matrix. Consumed only when `OPENAI_API_KEY` is set. | `config` |
+| `OPENAI_API_STYLE` | Controls which OpenAI endpoint the adapter posts a review to. `auto` (default) sends every reasoning-family model (o-series, `gpt-5` and later, including `gpt-5.5` and the `gpt-5.6-*` variants) to `/responses`, and leaves classic models (`gpt-4o`, `gpt-4.1`, …) on `/chat/completions`. Those families reject function tools on `/chat/completions` at any reasoning effort other than `none`. Set to `chat` to pin the chat endpoint — the escape hatch for an `OPENAI_BASE_URL` gateway that does not expose `/responses` — or `responses` to use `/responses` for every model. Invalid values fall back to `auto`. Note that `/responses` has no `seed`, so a model routed there reports `deterministic_seed: false` and no seed is sent. See `docs/model-compatibility.md` and [ADR-007](architecture-decision-records/adr-007-openai-responses-endpoint.md). Consumed only when `OPENAI_API_KEY` is set. | `config` |
 | `COPILOT_MODEL` | Optional override for the Copilot adapter's default model (defaults to `gpt-4o`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 | `COPILOT_BASE_URL` | Optional override for the Copilot adapter's inference endpoint (defaults to `https://models.github.ai/inference`). Consumed only when `COPILOT_API_KEY` is set. | `config` |
 
@@ -163,6 +164,12 @@ OPENAI_MAX_OUTPUT_TOKENS=
 # auto: reasoning models (gpt-5+/o-series) use 'required'; classic models use forced-specific object.
 # Set to 'required' if a reasoning model is under-producing findings. See docs/model-compatibility.md.
 OPENAI_TOOL_CHOICE=
+# OPENAI_API_STYLE: auto (default) | chat | responses
+# auto routes reasoning models (o-series, gpt-5+) to /responses; chat pins the
+# old endpoint for gateways that do not expose /responses.
+# auto routes gpt-5.6* and later majors to /responses (function tools are rejected
+# on /chat/completions for those families) and leaves other models on /chat/completions.
+OPENAI_API_STYLE=
 
 # tunables (starting values; see operational-runbooks.md § Numeric tunables)
 QUEUE_CONCURRENCY=4

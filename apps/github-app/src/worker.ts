@@ -14,8 +14,10 @@ import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/pr
 import { CopilotProvider, type CopilotProviderOptions } from '@prisma-bot/provider-copilot';
 import { FakeProvider } from '@prisma-bot/provider-fake';
 import {
+  type ApiStyle,
   OpenAIProvider,
   type OpenAIProviderOptions,
+  type OpenAIUsageTelemetry,
   type TokenParamStyle,
   type ToolChoiceStyle,
 } from '@prisma-bot/provider-openai';
@@ -30,6 +32,7 @@ import {
 import IORedis from 'ioredis';
 import { type AskResult, runAsk } from './interactions.js';
 import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
+import { withCapabilityRemedy } from './provider-notices.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
 import { fetchRepoConfig, resolvePrivilegedApproval } from './repo-config.js';
 import { resolveRepoIdentity } from './repo-identity.js';
@@ -209,6 +212,25 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     if (toolChoiceRaw === 'forced' || toolChoiceRaw === 'required' || toolChoiceRaw === 'auto') {
       opts.toolChoiceStyle = toolChoiceRaw as ToolChoiceStyle;
     }
+    // OPENAI_API_STYLE, an optional override for the endpoint `review()` posts to.
+    // `auto` (default) sends the model families that reject function tools on
+    // /chat/completions (gpt-5.6*, gpt-6+) to /responses and leaves every other
+    // model where it is. `chat` pins /chat/completions; `responses` uses
+    // /responses for every model.
+    // Invalid values are silently ignored and fall back to `auto`.
+    // See deployment.md § Config and docs/model-compatibility.md for details.
+    const apiStyleRaw = await tryGetSecret(secretSource, 'OPENAI_API_STYLE');
+    if (apiStyleRaw === 'chat' || apiStyleRaw === 'responses' || apiStyleRaw === 'auto') {
+      opts.apiStyle = apiStyleRaw as ApiStyle;
+    }
+    // Per-call token accounting, emitted as the `provider.usage` audit event.
+    // Counts only — no prompt or response content (observability.md § Event
+    // taxonomy). `reasoning_tokens` is what tells an operator whether a large
+    // output cap was consumed by reasoning rather than by findings, which is
+    // the question a Responses-routed reasoning model raises (issue #40).
+    opts.onUsage = (usage: OpenAIUsageTelemetry): void => {
+      log('provider.usage', { provider: 'openai', ...usage });
+    };
     log('worker.provider.selected', { provider: 'openai' });
     return new OpenAIProvider(opts);
   }
@@ -755,7 +777,10 @@ const start = async (): Promise<void> => {
           const safeMsg = err.value.message;
           let providerReply: string;
           if (kind === 'capability') {
-            providerReply = `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the \`model\` setting in \`.github/review-bot.yml\` (or the provider's model env var). This is **not** a PR-size limit — the check run shows the same notice.`;
+            providerReply = withCapabilityRemedy(
+              `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the \`model\` setting in \`.github/review-bot.yml\` (or the provider's model env var). This is **not** a PR-size limit — the check run shows the same notice.`,
+              safeMsg,
+            );
           } else {
             providerReply = `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key. The **AI Code Review** check run shows the same notice.`;
           }
