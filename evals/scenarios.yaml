@@ -59,6 +59,10 @@ scenarios:
     name: "Reasoning model (gpt-5.4-nano) returns empty findings — model-aware notice emitted"
     fixture: fixtures/reasoning-model-empty-review.yaml
     tags: ["reasoning_model_compatibility", "false_positive_rate"]
+  - id: reasoning-model-empty-review-gpt6
+    name: "GPT-6 reasoning model (gpt-6-astra) returns empty findings — shared notice emitted"
+    fixture: fixtures/reasoning-model-empty-review-gpt6.yaml
+    tags: ["reasoning_model_compatibility", "false_positive_rate"]
   - id: positive-feedback-highlights
     name: "Positive feedback: highlights capped at max_items"
     fixture: fixtures/positive-feedback-highlights.yaml

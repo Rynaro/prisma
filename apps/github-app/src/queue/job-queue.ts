@@ -77,6 +77,8 @@ export type RetryClass = 'transient' | 'rate_limited' | 'non_transient';
  * Mapping matrix (`docs/system-design.md` § Error taxonomy mapping):
  *   - `ProviderErrorThrowable.kind === 'transport'`         → transient
  *   - `ProviderErrorThrowable.kind === 'rate_limit'`        → rate_limited
+ *     (except `retryable === false`, e.g. OpenAI `insufficient_quota`
+ *     → non_transient: quota exhaustion does not clear by waiting)
  *   - `ProviderErrorThrowable.kind ∈ {auth, capability, schema_validation}`
  *                                                           → non_transient
  *   - Anything else (raw `Error`, non-Error throw, network fault)
@@ -92,7 +94,7 @@ export const classifyRetry = (err: unknown): RetryClass => {
       case 'transport':
         return 'transient';
       case 'rate_limit':
-        return 'rate_limited';
+        return err.value.retryable === false ? 'non_transient' : 'rate_limited';
       case 'auth':
       case 'capability':
       case 'schema_validation':

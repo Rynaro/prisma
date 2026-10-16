@@ -9,21 +9,37 @@ import type { ProviderError } from '@prisma-bot/shared';
  * threat-model.md § Token/cost blowups): the returned `message` MUST NOT
  * contain the API key or any allow-list-failing header. We only read fields we
  * recognize as safe (`message`, `status`, response status, `Retry-After`
- * header value when numeric, optional `error.type` / `error.code` for
- * capability detection).
+ * header value when numeric, optional `error.type` / `error.code` /
+ * `error.param` for capability detection and remedy selection).
  *
  * Mapping (parity with packages/providers/copilot/src/error-mapping.ts):
  *   - network / timeout / connection                   → `transport`, retryable: true
  *   - HTTP 401, 403                                    → `auth`
+ *   - HTTP 429 with error.code insufficient_quota      → `rate_limit`, retryable: false
+ *                                                        (no retry_after_ms; ADR-008 D11)
  *   - HTTP 429                                         → `rate_limit` (with retry_after_ms)
  *   - HTTP 5xx                                         → `transport`, retryable: true
- *   - HTTP 400 with invalid_request / capability wording → `capability`
+ *                                                        (with retry_after_ms; ADR-008 D11)
  *   - HTTP 400 with error.code context_length_exceeded  → `capability`  (GAP-001)
  *   - HTTP 400 with error.code model_not_found          → `capability`  (GAP-001)
+ *   - HTTP 400 with error.code unsupported_value        → `capability`  (ADR-008 D11)
+ *   - HTTP 400 with error.code unsupported_parameter    → `capability`  (ADR-008 D11)
+ *   - HTTP 400 with invalid_request / capability wording → `capability`
  *   - anything else                                    → `transport`, retryable: false
+ *
+ * Every `capability` result carries `code` and `param` when the payload has
+ * them as strings (ADR-008 D11); `provider-notices.ts` keys the remedy on them.
  */
 
 const SAFE_MESSAGE_FALLBACK = 'openai provider error';
+
+/** HTTP 400 `error.code` values that map straight to `capability`. */
+const CAPABILITY_ERROR_CODES: ReadonlySet<string> = new Set([
+  'context_length_exceeded',
+  'model_not_found',
+  'unsupported_value',
+  'unsupported_parameter',
+]);
 const FORBIDDEN_TOKENS = ['authorization', 'bearer', 'x-api-key', 'api-key'];
 
 function safeMessage(raw: unknown): string {
@@ -75,37 +91,21 @@ function readStatus(err: unknown): number | undefined {
   return undefined;
 }
 
-function readErrorCode(err: unknown): string | undefined {
+/**
+ * A string field of the vendor `error` object: `code`, `type`, or `param` (the
+ * request field the API rejected, e.g. `reasoning_effort`, `temperature`). A
+ * non-string value — the API sends `param: null` when no single field is at
+ * fault — reads as `undefined`.
+ */
+function readErrorStringField(err: unknown, key: 'code' | 'param' | 'type'): string | undefined {
   if (typeof err !== 'object' || err === null) {
     return undefined;
   }
-  const record = err as Record<string, unknown>;
-  const errorField = record.error;
+  const errorField = (err as Record<string, unknown>).error;
   if (typeof errorField === 'object' && errorField !== null) {
-    const errRecord = errorField as Record<string, unknown>;
-    const code = errRecord.code;
-    if (typeof code === 'string') {
-      return code;
-    }
-  }
-  return undefined;
-}
-
-function readErrorType(err: unknown): string | undefined {
-  if (typeof err !== 'object' || err === null) {
-    return undefined;
-  }
-  const record = err as Record<string, unknown>;
-  const errorField = record.error;
-  if (typeof errorField === 'object' && errorField !== null) {
-    const errRecord = errorField as Record<string, unknown>;
-    const t = errRecord.type;
-    if (typeof t === 'string') {
-      return t;
-    }
-    const code = errRecord.code;
-    if (typeof code === 'string') {
-      return code;
+    const value = (errorField as Record<string, unknown>)[key];
+    if (typeof value === 'string') {
+      return value;
     }
   }
   return undefined;
@@ -215,6 +215,11 @@ export function mapOpenAIError(err: unknown): ProviderError {
   }
 
   if (status === 429) {
+    // Quota exhaustion (hard spend limit) does not clear by waiting: mark it
+    // non-retryable so the queue stops retrying (ADR-008 D11).
+    if (readErrorStringField(err, 'code') === 'insufficient_quota') {
+      return { kind: 'rate_limit', message: safe, retryable: false };
+    }
     const retryAfterMs = readRetryAfterMs(err);
     const out: ProviderError = { kind: 'rate_limit', message: safe, retryable: true };
     if (retryAfterMs !== undefined) {
@@ -224,17 +229,35 @@ export function mapOpenAIError(err: unknown): ProviderError {
   }
 
   if (status !== undefined && status >= 500 && status < 600) {
-    return { kind: 'transport', message: safe, retryable: true };
+    // 503 `server_is_overloaded` carries a `Retry-After` the caller should honour.
+    const retryAfterMs = readRetryAfterMs(err);
+    const out: ProviderError = { kind: 'transport', message: safe, retryable: true };
+    if (retryAfterMs !== undefined) {
+      out.retry_after_ms = retryAfterMs;
+    }
+    return out;
   }
 
   if (status === 400) {
-    const errorCode = readErrorCode(err);
-    // GAP-001: OpenAI-specific error codes that indicate capability limitations
-    if (errorCode === 'context_length_exceeded' || errorCode === 'model_not_found') {
-      return { kind: 'capability', message: safe };
+    const errorCode = readErrorStringField(err, 'code');
+    const errorParam = readErrorStringField(err, 'param');
+    const capability = (): ProviderError => {
+      const out: Extract<ProviderError, { kind: 'capability' }> = {
+        kind: 'capability',
+        message: safe,
+      };
+      if (errorCode !== undefined && errorCode.length > 0) out.code = errorCode;
+      if (errorParam !== undefined && errorParam.length > 0) out.param = errorParam;
+      return out;
+    };
+    // GAP-001 + ADR-008 D11: OpenAI error codes that name a capability or
+    // configuration rejection — never retried, always actionable.
+    if (errorCode !== undefined && CAPABILITY_ERROR_CODES.has(errorCode)) {
+      return capability();
     }
 
-    const type = readErrorType(err);
+    // `error.type`, falling back to `error.code` when the payload has no type.
+    const type = readErrorStringField(err, 'type') ?? errorCode;
     const lowerMessage = (rawMessage ?? '').toLowerCase();
     const looksLikeCapability =
       (type === 'invalid_request_error' ||
@@ -246,7 +269,7 @@ export function mapOpenAIError(err: unknown): ProviderError {
         lowerMessage.includes('tool') ||
         lowerMessage.includes('function'));
     if (looksLikeCapability) {
-      return { kind: 'capability', message: safe };
+      return capability();
     }
     return { kind: 'transport', message: safe, retryable: false };
   }

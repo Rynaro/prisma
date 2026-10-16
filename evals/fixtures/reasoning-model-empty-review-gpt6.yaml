@@ -1,0 +1,94 @@
+id: reasoning-model-empty-review-gpt6
+name: "GPT-6 reasoning model returns empty findings on real diff"
+description: >-
+  GPT-6 sibling of reasoning-model-empty-review (ADR-008 D10): gpt-6-astra
+  is configured and the provider returns an empty findings array on a
+  non-trivial diff. The check-run summary must carry the shared
+  reasoning-model notice (reasoning_model_empty), which points at the
+  provider.usage telemetry and OPENAI_MAX_OUTPUT_TOKENS rather than at
+  another model.
+
+config_overrides:
+  mode: summary-plus-inline
+  model: openai/gpt-6-astra
+
+pr_payload:
+  action: opened
+  installation:
+    id: 1000
+  repository:
+    id: 2000
+    full_name: octocat/hello-world
+    name: hello-world
+    owner:
+      login: octocat
+  pull_request:
+    number: 99
+    head:
+      sha: "3333333333333333333333333333333333333333"
+
+octokit_responses:
+  pulls_get:
+    number: 99
+    head:
+      sha: "3333333333333333333333333333333333333333"
+      ref: feature/add-auth
+    base:
+      sha: "4444444444444444444444444444444444444444"
+      ref: main
+  pulls_list_files:
+    - filename: src/auth/login.ts
+      status: modified
+      additions: 15
+      deletions: 3
+      patch: |
+        @@ -10,10 +10,22 @@
+        -export const login = async (user, pass) => {
+        -  const result = await db.query(`SELECT * FROM users WHERE name='${user}'`);
+        -  return result.rows[0];
+        +export const login = async (user: string, pass: string) => {
+        +  const result = await db.query(
+        +    'SELECT * FROM users WHERE name = $1 AND password = $2',
+        +    [user, pass]
+        +  );
+        +  if (!result.rows[0]) return null;
+        +  const token = jwt.sign({ id: result.rows[0].id }, process.env.JWT_SECRET);
+        +  return { user: result.rows[0], token };
+         };
+
+# The FakeProvider simulates gpt-6-astra returning empty findings
+# (reasoning short-circuit or a tight output cap -> empty call)
+provider_script:
+  - kind: output
+    output:
+      findings: []
+
+expectations:
+  prefilter:
+    outcome: accepted
+    skipped_paths: []
+    skipped_reasons: []
+    files_sent_to_provider: 1
+  provider:
+    calls: 1
+  validator:
+    findings: 0
+    rejection_reasons: []
+  ranker:
+    output_size_eq_input: true
+  publisher:
+    inline_count: 0
+    summary_count: 0
+    dropped_count: 0
+    publication_state: succeeded
+    summary_contains:
+      - "reasoning model"
+      - "gpt-6-astra"
+      - "OPENAI_MAX_OUTPUT_TOKENS"
+    summary_not_contains:
+      - "gpt-4.1"
+    expected_categories: []
+    rejection_reasons: []
+
+metrics:
+  - false_positive_rate

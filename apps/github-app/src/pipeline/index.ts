@@ -7,6 +7,7 @@ export type {
   OversizedDetail,
   PipelineLogger,
   PipelineOutcome,
+  ProviderLimits,
   RepoIdentity,
   RepoLookup,
   ReviewCompleteChunkedDetail,

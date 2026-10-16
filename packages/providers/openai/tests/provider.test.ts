@@ -2,23 +2,36 @@ import {
   ProviderErrorThrowable,
   type ProviderRespondInput,
   type ProviderReviewInput,
+  buildRespondPrompt,
 } from '@prisma-bot/shared';
 import { describe, expect, it, vi } from 'vitest';
 import type { OpenAIChatCompletionsArgs } from '../src/client.js';
 import {
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  DEFAULT_MAX_OUTPUT_TOKENS_REASONING,
   OPENAI_CAPABILITIES,
   OPENAI_DEFAULT_MODEL,
+  OPENAI_MAX_INPUT_TOKENS_CHAT_LATEST,
+  OPENAI_MAX_INPUT_TOKENS_DEFAULT,
+  OPENAI_MAX_INPUT_TOKENS_GPT6,
   OPENAI_PASSTHROUGH_DENYLIST,
   OPENAI_PROVIDER_NAME,
   type OpenAIClientLike,
   OpenAIProvider,
   type OpenAIUsageTelemetry,
   RESPONSES_STATE_LINKING_KEYS,
+  SAMPLING_KEYS_STRIPPED,
   applyProviderOptions,
+  buildPrompt,
   extractUsage,
   resolveApiStyle,
+  resolveExplicitReasoningEffort,
+  resolveOpenAIContextWindow,
+  resolveOpenAIDefaultMaxOutputTokens,
+  resolveOpenAITokenizerFamily,
   resolveTokenParam,
   resolveToolChoice,
+  shouldStripSampling,
   toResponsesArgs,
 } from '../src/index.js';
 
@@ -224,6 +237,12 @@ describe('OpenAIProvider', () => {
     // The production `MAX_TOKENS_PER_PR` should be set above the provider's
     // hard_cap_in (172904 for Anthropic; similar for OpenAI). Using 200_000
     // (above any realistic hard_cap_in) here ensures the guard clears.
+    //
+    // GPT-6 compat D2: the guard is now `min(maxTokensPerCall, model window)`,
+    // so a ~143k batch only clears on a model whose input window holds it. It
+    // runs on gpt-6-astra (922,000) here; on gpt-4o (128,000) the same batch is
+    // over the window and is rejected up front instead of by the API. The guard
+    // reserves the request's output cap: 128,000 − 4,096 = 123,904 on gpt-4o.
     const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
     // ~12000-line file: 12000 lines x 20 chars = 240k chars raw content.
     const bigContent = 'export const x = 1;\n'.repeat(12000);
@@ -237,11 +256,25 @@ describe('OpenAIProvider', () => {
     };
     const provider = new OpenAIProvider({
       apiKey: 'k',
+      model: 'gpt-6-astra',
       maxTokensPerCall: 200_000, // must be above the unified estimate (~143k for this input)
       client: { chatCompletions, textCompletion: vi.fn() },
     });
     await expect(provider.review(bigInput)).resolves.toBeDefined();
     expect(chatCompletions).toHaveBeenCalledOnce();
+
+    const classicChat = vi.fn();
+    const classic = new OpenAIProvider({
+      apiKey: 'k',
+      model: 'gpt-4o',
+      maxTokensPerCall: 200_000,
+      client: { chatCompletions: classicChat, textCompletion: vi.fn() },
+    });
+    await expect(classic.review(bigInput)).rejects.toMatchObject({
+      cause_kind: 'over_budget',
+      value: { kind: 'over_budget', hard_cap_in: 123904 },
+    });
+    expect(classicChat).not.toHaveBeenCalled();
   });
 
   // T7: seed threading — args.seed === 42
@@ -380,6 +413,139 @@ describe('OpenAIProvider', () => {
     await provider.review(validInput);
     expect(capturedArgs?.max_tokens).toBe(4096);
   });
+
+  // GPT-6 compat AS-4 (D1): the window is a property of the deployment model.
+  it('derives max_context_tokens per model; explicit capabilities win', () => {
+    expect(new OpenAIProvider({ apiKey: 'k', model: 'gpt-6-sol' }).capabilities).toMatchObject({
+      max_context_tokens: 922000,
+      tokenizer_family: 'o200k',
+    });
+    expect(
+      new OpenAIProvider({ apiKey: 'k', model: 'chat-latest' }).capabilities.max_context_tokens,
+    ).toBe(272000);
+    expect(
+      new OpenAIProvider({ apiKey: 'k', model: 'gpt-4o' }).capabilities.max_context_tokens,
+    ).toBe(128000);
+    expect(
+      new OpenAIProvider({
+        apiKey: 'k',
+        model: 'gpt-6-sol',
+        capabilities: { ...OPENAI_CAPABILITIES, max_context_tokens: 50000 },
+      }).capabilities.max_context_tokens,
+    ).toBe(50000);
+  });
+
+  // GPT-6 compat AS-11 (D2): a request_shaping.model override is bounded by
+  // its own window, not the deployment model's.
+  it('bounds the per-call guard by the resolved model window', async () => {
+    // ~143k tokens (o200k): above gpt-4o's 128,000 window, below the 200,000 budget.
+    const bigInput: ProviderReviewInput = {
+      files: [
+        {
+          path: 'src/big.ts',
+          hunks: [
+            {
+              id: 'H1',
+              line_start: 1,
+              line_end: 12000,
+              content: 'export const x = 1;\n'.repeat(12000),
+            },
+          ],
+        },
+      ],
+    };
+    const { client } = recordingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-6-astra',
+      maxTokensPerCall: 200_000,
+    });
+
+    let thrown: unknown;
+    try {
+      await provider.review({ ...bigInput, request_shaping: { model: 'gpt-4o' } });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ProviderErrorThrowable);
+    const value = (thrown as ProviderErrorThrowable).value;
+    expect(value.kind).toBe('over_budget');
+    if (value.kind === 'over_budget') {
+      // gpt-4o's window less its own default output cap: 128,000 − 4,096.
+      expect(value.hard_cap_in).toBe(123904);
+      expect(value.estimated_tokens).toBeGreaterThan(123904);
+      expect(value.message).toBe(
+        `request exceeds per-call token budget: estimated ${value.estimated_tokens} tokens, cap 123904`,
+      );
+    }
+    expect(client.chatCompletions).not.toHaveBeenCalled();
+    expect(client.responses).not.toHaveBeenCalled();
+
+    // Without the override the deployment window (922,000) applies and the
+    // 200,000 budget is the binding cap: the same batch goes through.
+    await expect(provider.review(bigInput)).resolves.toEqual({ findings: [] });
+    expect(client.responses).toHaveBeenCalledTimes(1);
+  });
+
+  // ~143k tokens (o200k): above every 128K-family guard cap below.
+  const overWindowInput: ProviderReviewInput = {
+    files: [
+      {
+        path: 'src/big.ts',
+        hunks: [
+          {
+            id: 'H1',
+            line_start: 1,
+            line_end: 12000,
+            content: 'export const x = 1;\n'.repeat(12000),
+          },
+        ],
+      },
+    ],
+  };
+
+  it('keeps the window bound when maxTokensPerCall is NaN', async () => {
+    // A malformed MAX_TOKENS_PER_PR parses to NaN; `Math.min(NaN, …)` would make
+    // the comparison false and let an over-window request reach the API.
+    const { client } = recordingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-4o',
+      maxTokensPerCall: Number.NaN,
+    });
+    await expect(provider.review(overWindowInput)).rejects.toMatchObject({
+      cause_kind: 'over_budget',
+      value: { kind: 'over_budget', hard_cap_in: 123904 },
+    });
+    expect(client.chatCompletions).not.toHaveBeenCalled();
+  });
+
+  it('reserves the output cap of the request model in the guard', async () => {
+    // gpt-4o deployment, o3 override: o3's default cap is 32,768, so the guard
+    // is min(120,000, 128,000 − 32,768) = 95,232.
+    const { client } = recordingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-4o',
+      maxTokensPerCall: 120_000,
+    });
+    await expect(
+      provider.review({ ...overWindowInput, request_shaping: { model: 'o3' } }),
+    ).rejects.toMatchObject({ value: { kind: 'over_budget', hard_cap_in: 95232 } });
+    // A repo `generation.max_output_tokens` is the cap that request carries:
+    // min(120,000, 128,000 − 65,536) = 62,464.
+    await expect(
+      provider.review({
+        ...overWindowInput,
+        request_shaping: { model: 'o3', generation: { max_output_tokens: 65_536 } },
+      }),
+    ).rejects.toMatchObject({ value: { kind: 'over_budget', hard_cap_in: 62464 } });
+    expect(client.chatCompletions).not.toHaveBeenCalled();
+    expect(client.responses).not.toHaveBeenCalled();
+  });
 });
 
 describe('OpenAIProvider — respond()', () => {
@@ -478,6 +644,46 @@ describe('OpenAIProvider — respond()', () => {
     expect(callArgs.seed).toBe(42);
     expect(callArgs.max_tokens).toBe(2048);
   });
+
+  // GPT-6 compat AS-10 (D5): respond() has no provider_options, so a reasoning
+  // model's effort is always implicit and sampling is withheld.
+  it('strips temperature/top_p but keeps seed and the reasoning output cap for a reasoning model', async () => {
+    const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse('ok'));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      model: 'gpt-6.1-sol',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await provider.respond({
+      ...validRespondInput,
+      generation: { temperature: 0.5, top_p: 0.8, seed: 7 },
+    });
+    const callArgs = textCompletion.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.seed).toBe(7);
+    expect(callArgs.max_completion_tokens).toBe(32768);
+    expect('temperature' in callArgs).toBe(false);
+    expect('top_p' in callArgs).toBe(false);
+    expect('max_tokens' in callArgs).toBe(false);
+  });
+
+  it('forwards temperature/top_p/seed and max_tokens 4096 for a classic model', async () => {
+    const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse('ok'));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      model: 'gpt-4o',
+      client: { chatCompletions: vi.fn(), textCompletion },
+    });
+    await provider.respond({
+      ...validRespondInput,
+      generation: { temperature: 0.5, top_p: 0.8, seed: 7 },
+    });
+    const callArgs = textCompletion.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.temperature).toBe(0.5);
+    expect(callArgs.top_p).toBe(0.8);
+    expect(callArgs.seed).toBe(7);
+    expect(callArgs.max_tokens).toBe(4096);
+    expect('max_completion_tokens' in callArgs).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -563,6 +769,69 @@ describe('resolveTokenParam', () => {
   it('explicit auto behaves identically to omitted override', () => {
     expect(resolveTokenParam('gpt-5.4-nano', 'auto')).toBe('max_completion_tokens');
     expect(resolveTokenParam('gpt-4o', 'auto')).toBe('max_tokens');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GPT-6 compat: per-model input window and tokenizer rule (ADR-008 D1, D8)
+// ---------------------------------------------------------------------------
+
+describe('resolveOpenAIContextWindow (ADR-008 D1)', () => {
+  it('gpt-6 family and its point releases → 922,000 max input tokens', () => {
+    for (const model of ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6', 'gpt-6.1', 'GPT-6-LUNA']) {
+      expect(resolveOpenAIContextWindow(model)).toBe(922000);
+    }
+    expect(OPENAI_MAX_INPUT_TOKENS_GPT6).toBe(922000);
+  });
+
+  it('chat-latest (exact, case-insensitive) → 272,000', () => {
+    expect(resolveOpenAIContextWindow('chat-latest')).toBe(272000);
+    expect(resolveOpenAIContextWindow('CHAT-LATEST')).toBe(272000);
+    expect(OPENAI_MAX_INPUT_TOKENS_CHAT_LATEST).toBe(272000);
+  });
+
+  it('classic, gpt-5.x, o-series, gpt-60 and unknown slugs → 128,000', () => {
+    for (const model of [
+      'gpt-4o',
+      'gpt-5.6-sol',
+      'o3',
+      'gpt-60',
+      'my-gateway-model',
+      'chat-latest-2026',
+    ]) {
+      expect(resolveOpenAIContextWindow(model)).toBe(128000);
+    }
+    expect(OPENAI_MAX_INPUT_TOKENS_DEFAULT).toBe(128000);
+    // The static capability literal stays correct for the default model.
+    expect(OPENAI_CAPABILITIES.max_context_tokens).toBe(128000);
+  });
+});
+
+describe('resolveOpenAITokenizerFamily (ADR-008 D8)', () => {
+  it('reasoning-family and gpt-4o / gpt-4.1 / gpt-4.5 slugs → o200k', () => {
+    for (const model of [
+      'gpt-5.6-sol',
+      'gpt-6-astra',
+      'gpt-6.1-sol',
+      'chat-latest',
+      'o3',
+      'gpt-4o',
+      'gpt-4.1-nano',
+      'gpt-4.5',
+    ]) {
+      expect(resolveOpenAITokenizerFamily(model)).toBe('o200k');
+    }
+  });
+
+  it('gpt-4 / gpt-4-turbo / gpt-3.5-turbo and unknown slugs → cl100k', () => {
+    for (const model of ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo', 'unknown-model']) {
+      expect(resolveOpenAITokenizerFamily(model)).toBe('cl100k');
+    }
+  });
+
+  it('no longer exports the exact-match OPENAI_TOKENIZER_FAMILY_MAP', async () => {
+    const mod: Record<string, unknown> = await import('../src/index.js');
+    expect('OPENAI_TOKENIZER_FAMILY_MAP' in mod).toBe(false);
   });
 });
 
@@ -675,6 +944,89 @@ describe('OpenAIProvider — token param per-request wiring', () => {
     await provider.review(validInput);
     const args = getArgs();
     expect(args.max_tokens).toBe(4096);
+  });
+
+  // GPT-6 compat AS-13, adapter half (D7).
+  it('defaults max output to 32768 for reasoning and 4096 for classic; explicit option wins', async () => {
+    for (const model of ['gpt-6-sol', 'o3', 'chat-latest']) {
+      expect(resolveOpenAIDefaultMaxOutputTokens(model)).toBe(32768);
+    }
+    for (const model of ['gpt-4o', 'gpt-4.1']) {
+      expect(resolveOpenAIDefaultMaxOutputTokens(model)).toBe(4096);
+    }
+    expect(DEFAULT_MAX_OUTPUT_TOKENS).toBe(4096);
+    expect(DEFAULT_MAX_OUTPUT_TOKENS_REASONING).toBe(32768);
+
+    // Wiring: the default follows the deployment model's family. This client
+    // has no `responses` method, so a reasoning model stays on chat here.
+    const reasoning = makeCapturingClient();
+    await new OpenAIProvider({ apiKey: 'k', client: reasoning.client, model: 'gpt-6-sol' }).review(
+      validInput,
+    );
+    expect(reasoning.getArgs().max_completion_tokens).toBe(32768);
+
+    const classic = makeCapturingClient();
+    await new OpenAIProvider({ apiKey: 'k', client: classic.client, model: 'gpt-4o' }).review(
+      validInput,
+    );
+    expect(classic.getArgs().max_tokens).toBe(4096);
+
+    // An explicit maxOutputTokens wins regardless of family.
+    for (const model of ['gpt-6-sol', 'gpt-4o']) {
+      const explicit = makeCapturingClient();
+      await new OpenAIProvider({
+        apiKey: 'k',
+        client: explicit.client,
+        model,
+        maxOutputTokens: 12000,
+      }).review(validInput);
+      const args = explicit.getArgs();
+      expect(args[resolveTokenParam(model)]).toBe(12000);
+    }
+  });
+
+  // ADR-008 D7: the default cap follows the model each request uses, so a
+  // per-repo `model:` override never inherits the deployment model's default.
+  it('resolves the default output cap per request from the request model; explicit option wins', async () => {
+    const run = async (deployment: string, override: string, maxOutputTokens?: number) => {
+      const recorder = recordingClient();
+      const options: ConstructorParameters<typeof OpenAIProvider>[0] = {
+        apiKey: 'k',
+        client: recorder.client,
+        model: deployment,
+      };
+      if (maxOutputTokens !== undefined) options.maxOutputTokens = maxOutputTokens;
+      await new OpenAIProvider(options).review({
+        ...validInput,
+        request_shaping: { model: override },
+      });
+      return recorder;
+    };
+
+    // gpt-6-astra deployment (default 32,768) → gpt-4o request: chat, 4096.
+    expect((await run('gpt-6-astra', 'gpt-4o')).chat().max_tokens).toBe(4096);
+    // gpt-4o deployment (default 4096) → gpt-6-astra request: /responses, 32,768.
+    expect((await run('gpt-4o', 'gpt-6-astra')).responses().max_output_tokens).toBe(32768);
+    // An explicit maxOutputTokens applies to every model, in both directions.
+    expect((await run('gpt-6-astra', 'gpt-4o', 12000)).chat().max_tokens).toBe(12000);
+    expect((await run('gpt-4o', 'gpt-6-astra', 12000)).responses().max_output_tokens).toBe(12000);
+
+    // The truncation error reports the cap this request carried.
+    const base = chatCompletionsResponse({ findings: [] });
+    const truncating = new OpenAIProvider({
+      apiKey: 'k',
+      model: 'gpt-6-astra',
+      client: {
+        chatCompletions: vi.fn().mockResolvedValue({
+          ...base,
+          choices: base.choices.map((choice) => ({ ...choice, finish_reason: 'length' })),
+        }),
+        textCompletion: vi.fn(),
+      },
+    });
+    await expect(
+      truncating.review({ ...validInput, request_shaping: { model: 'gpt-4o' } }),
+    ).rejects.toMatchObject({ value: { kind: 'output_truncated', requested_max_tokens: 4096 } });
   });
 
   it('output_truncated: error is kind output_truncated and message is param-agnostic with the token cap', async () => {
@@ -817,6 +1169,102 @@ describe('OpenAIProvider — generation→vendor mapping (spec § 5.3)', () => {
     expect('temperature' in args).toBe(false);
     expect('top_p' in args).toBe(false);
   });
+
+  // GPT-6 compat AS-6 (D4).
+  it('strips generation.temperature/top_p for a reasoning model with implicit effort', async () => {
+    const { client, responses } = recordingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-6-astra' });
+    await provider.review({
+      ...validInput,
+      request_shaping: { generation: { temperature: 0.2, top_p: 0.9, max_output_tokens: 8000 } },
+    });
+    expect(client.responses).toHaveBeenCalledTimes(1);
+    const body = responses();
+    expect('temperature' in body).toBe(false);
+    expect('top_p' in body).toBe(false);
+    expect(body.max_output_tokens).toBe(8000);
+  });
+
+  // GPT-6 compat AS-7 (D4): an explicit effort of 'none' keeps sampling; the
+  // native `reasoning.effort` spelling wins over the legacy flat key.
+  it('forwards sampling when the explicit effort is none (native spelling wins)', async () => {
+    const generation = { temperature: 0.2, top_p: 0.9, max_output_tokens: 8000 };
+
+    const legacy = recordingClient();
+    await new OpenAIProvider({ apiKey: 'k', client: legacy.client, model: 'gpt-6-sol' }).review({
+      ...validInput,
+      request_shaping: { generation, provider_options: { reasoning_effort: 'none' } },
+    });
+    expect(legacy.responses().temperature).toBe(0.2);
+    expect(legacy.responses().top_p).toBe(0.9);
+    expect(legacy.responses().reasoning).toEqual({ effort: 'none' });
+
+    const nativeNone = recordingClient();
+    await new OpenAIProvider({ apiKey: 'k', client: nativeNone.client, model: 'gpt-6-sol' }).review(
+      {
+        ...validInput,
+        request_shaping: {
+          generation,
+          provider_options: { reasoning: { effort: 'none' }, reasoning_effort: 'high' },
+        },
+      },
+    );
+    expect(nativeNone.responses().temperature).toBe(0.2);
+    expect(nativeNone.responses().top_p).toBe(0.9);
+    expect(nativeNone.responses().reasoning).toEqual({ effort: 'none' });
+
+    // Converse: the native spelling also wins when it is NOT 'none'.
+    const nativeHigh = recordingClient();
+    await new OpenAIProvider({ apiKey: 'k', client: nativeHigh.client, model: 'gpt-6-sol' }).review(
+      {
+        ...validInput,
+        request_shaping: {
+          generation,
+          provider_options: { reasoning: { effort: 'high' }, reasoning_effort: 'none' },
+        },
+      },
+    );
+    expect('temperature' in nativeHigh.responses()).toBe(false);
+    expect('top_p' in nativeHigh.responses()).toBe(false);
+    expect(nativeHigh.responses().reasoning).toEqual({ effort: 'high' });
+  });
+
+  // GPT-6 compat AS-8 (D4): keyed on the model predicate, not the endpoint.
+  it('keeps sampling for a classic model pinned to /responses', async () => {
+    const { client, responses } = recordingClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-4o',
+      apiStyle: 'responses',
+    });
+    await provider.review({ ...validInput, request_shaping: { generation: { temperature: 0.3 } } });
+    expect(client.responses).toHaveBeenCalledTimes(1);
+    expect(responses().temperature).toBe(0.3);
+  });
+
+  it('resolveExplicitReasoningEffort / shouldStripSampling implement the native-wins rule', () => {
+    expect(SAMPLING_KEYS_STRIPPED).toEqual(['temperature', 'top_p']);
+    expect(resolveExplicitReasoningEffort(undefined)).toBeUndefined();
+    expect(resolveExplicitReasoningEffort({})).toBeUndefined();
+    expect(resolveExplicitReasoningEffort({ reasoning_effort: 'none' })).toBe('none');
+    expect(
+      resolveExplicitReasoningEffort({ reasoning: { effort: 'xhigh' }, reasoning_effort: 'none' }),
+    ).toBe('xhigh');
+    // A native object without a string effort defers to the legacy key.
+    expect(
+      resolveExplicitReasoningEffort({ reasoning: { summary: 'auto' }, reasoning_effort: 'low' }),
+    ).toBe('low');
+    // Non-string values are not an explicit effort.
+    expect(resolveExplicitReasoningEffort({ reasoning_effort: 0 })).toBeUndefined();
+
+    expect(shouldStripSampling('gpt-6-astra', undefined)).toBe(true);
+    expect(shouldStripSampling('gpt-6-astra', 'high')).toBe(true);
+    expect(shouldStripSampling('gpt-6-astra', 'none')).toBe(false);
+    expect(shouldStripSampling('chat-latest', undefined)).toBe(true);
+    expect(shouldStripSampling('gpt-4o', undefined)).toBe(false);
+    expect(shouldStripSampling('gpt-4.1', 'high')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -865,6 +1313,22 @@ describe('OpenAIProvider — provider_options passthrough (spec § 5.3, § 3.7)'
     });
     // Raw bag wins: max_tokens=1000 overrides generation's 4096
     expect(getArgs().max_tokens).toBe(1000);
+  });
+
+  // GPT-6 compat AS-9 (D4): the operator addressed the wire; the strip only
+  // applies to the vendor-neutral `generation` mapping.
+  it('does not strip a passthrough temperature on a reasoning model', async () => {
+    const { client, responses } = recordingClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-6-astra' });
+    await provider.review({
+      ...validInput,
+      request_shaping: {
+        generation: { temperature: 0.7 },
+        provider_options: { temperature: 0 },
+      },
+    });
+    expect(client.responses).toHaveBeenCalledTimes(1);
+    expect(responses().temperature).toBe(0);
   });
 
   // G8: denylist enforced — tool_choice cannot be overridden
@@ -1188,6 +1652,86 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
     const tc = getArgs().tool_choice as Record<string, unknown>;
     expect(tc.type).toBe('function');
   });
+
+  // AS-19 (GPT-6 compat spec § 5, guard G-3): the regression gate for the
+  // whole GPT-6 / GPT-6.1 feature. The expected objects below were captured on
+  // main@f28be3e BEFORE any GPT-6 change. Every classic-model field is pinned
+  // as a literal (token param + value, forced tool_choice, seed, sampling);
+  // the prompt text comes from the unchanged shared prompt builders. The
+  // `JSON.stringify` comparison pins key order too, i.e. the serialized bytes.
+  it('classic request bodies are byte-identical to the pre-GPT-6 snapshot', async () => {
+    const reviewPrompt = buildPrompt(validInput);
+    const respondPrompt = buildRespondPrompt(validRespondInput);
+
+    for (const model of ['gpt-4o', 'gpt-4.1']) {
+      const reviewCalls: unknown[] = [];
+      const respondCalls: unknown[] = [];
+      const client: OpenAIClientLike = {
+        chatCompletions: vi.fn().mockImplementation((args: unknown) => {
+          reviewCalls.push(args);
+          return Promise.resolve(chatCompletionsResponse({ findings: [] }));
+        }),
+        textCompletion: vi.fn().mockImplementation((args: unknown) => {
+          respondCalls.push(args);
+          return Promise.resolve(textCompletionResponse('ok'));
+        }),
+      };
+      // `maxTokensPerCall` mirrors the worker's MAX_TOKENS_PER_PR default so
+      // the per-call guard path is exercised for the classic family too.
+      const provider = new OpenAIProvider({
+        apiKey: 'k',
+        client,
+        model,
+        maxTokensPerCall: 120_000,
+      });
+
+      expect(provider.capabilities).toEqual({
+        structured_output: true,
+        function_calling: true,
+        deterministic_seed: true,
+        max_context_tokens: 128000,
+        tokenizer_family: 'o200k',
+      });
+
+      await provider.review({
+        ...validInput,
+        request_shaping: {
+          generation: { temperature: 0.2, top_p: 0.9 },
+          deterministic_seed: 1,
+        },
+      });
+      await provider.respond({
+        ...validRespondInput,
+        generation: { temperature: 0.2, top_p: 0.9, seed: 1 },
+      });
+
+      const expectedReview = {
+        model,
+        messages: reviewPrompt.messages,
+        tools: [reviewPrompt.tool],
+        tool_choice: { type: 'function', function: { name: 'submit_review_findings' } },
+        max_tokens: 4096,
+        seed: 1,
+        temperature: 0.2,
+        top_p: 0.9,
+      };
+      const expectedRespond = {
+        model,
+        messages: respondPrompt.messages,
+        max_tokens: 4096,
+        temperature: 0.2,
+        top_p: 0.9,
+        seed: 1,
+      };
+
+      expect(reviewCalls).toHaveLength(1);
+      expect(respondCalls).toHaveLength(1);
+      expect(reviewCalls[0]).toEqual(expectedReview);
+      expect(respondCalls[0]).toEqual(expectedRespond);
+      expect(JSON.stringify(reviewCalls[0])).toBe(JSON.stringify(expectedReview));
+      expect(JSON.stringify(respondCalls[0])).toBe(JSON.stringify(expectedRespond));
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1323,8 +1867,9 @@ describe('OpenAIProvider, /responses routing', () => {
     expect(Object.keys(tools[0] ?? {})).not.toContain('function');
     // tool_choice keeps its reasoning-model value
     expect(args.tool_choice).toBe('required');
-    // the output cap is spelled max_output_tokens, and neither chat spelling is sent
-    expect(args.max_output_tokens).toBe(4096);
+    // the output cap is spelled max_output_tokens, and neither chat spelling is sent;
+    // the reasoning-family default is 32768 (GPT-6 compat D7; was 4096)
+    expect(args.max_output_tokens).toBe(32768);
     expect('max_tokens' in args).toBe(false);
     expect('max_completion_tokens' in args).toBe(false);
     expect(args.store).toBe(false);
@@ -1386,7 +1931,8 @@ describe('OpenAIProvider, /responses routing', () => {
     await provider.review(validInput);
     expect(client.chatCompletions).toHaveBeenCalledTimes(1);
     expect(client.responses).not.toHaveBeenCalled();
-    expect(getChatArgs().max_completion_tokens).toBe(4096);
+    // reasoning-family default output cap (GPT-6 compat D7; was 4096)
+    expect(getChatArgs().max_completion_tokens).toBe(32768);
   });
 
   it("apiStyle='responses' routes a classic model to /responses with a flat forced tool", async () => {
@@ -1708,6 +2254,25 @@ describe('#41 [P2] auto endpoint selection covers the affected reasoning configs
     }
   });
 
+  // GPT-6 compat AS-1.
+  it('routes every GPT-6 / GPT-6.1 id and chat-latest to /responses with required + max_output_tokens', async () => {
+    for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol', 'chat-latest']) {
+      const { client, responses } = recordingClient();
+      const provider = new OpenAIProvider({ apiKey: 'k', client, model });
+      await provider.review({ ...validInput, request_shaping: { deterministic_seed: 1 } });
+      expect(client.responses).toHaveBeenCalledTimes(1);
+      expect(client.chatCompletions).not.toHaveBeenCalled();
+      const body = responses();
+      expect(body.model).toBe(model);
+      expect(body.tool_choice).toBe('required');
+      expect(body.max_output_tokens).toBe(32768);
+      expect(body.store).toBe(false);
+      expect('max_tokens' in body).toBe(false);
+      expect('max_completion_tokens' in body).toBe(false);
+      expect('seed' in body).toBe(false);
+    }
+  });
+
   it('preserves classic models on /chat/completions with the pre-Responses wire shape', async () => {
     for (const model of ['gpt-4o', 'gpt-4.1', 'gpt-4', 'gpt-3.5-turbo']) {
       expect(resolveApiStyle(model)).toBe('chat');
@@ -1817,7 +2382,7 @@ describe('#41 [P2] deterministic seed is endpoint-aware', () => {
 // --- [P2] native output-budget override -------------------------------------
 
 describe('#41 [P2] Responses output-budget precedence', () => {
-  it('honors a native max_output_tokens override of 32000 over the 4096 default', async () => {
+  it('honors a native max_output_tokens override of 32000 over the deployment default', async () => {
     const { client, responses } = recordingClient();
     const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-5.6-luna' });
     await provider.review({
@@ -1938,6 +2503,36 @@ describe('#41 Responses usage telemetry', () => {
       endpoint: 'responses',
       model: 'm',
       input_tokens: 5,
+    });
+  });
+
+  // GPT-6 compat AS-21 (§ 3.12 addendum).
+  it('reports cache_write_tokens from either endpoint and omits it when absent', () => {
+    expect(
+      extractUsage(
+        { usage: { input_tokens: 600, input_tokens_details: { cache_write_tokens: 512 } } },
+        'responses',
+        'gpt-6-astra',
+      ).cache_write_tokens,
+    ).toBe(512);
+    expect(
+      extractUsage(
+        { usage: { prompt_tokens: 300, prompt_tokens_details: { cache_write_tokens: 256 } } },
+        'chat',
+        'gpt-4o',
+      ).cache_write_tokens,
+    ).toBe(256);
+    const absent = extractUsage(
+      { usage: { input_tokens: 600, input_tokens_details: { cached_tokens: 100 } } },
+      'responses',
+      'gpt-6-astra',
+    );
+    expect('cache_write_tokens' in absent).toBe(false);
+    expect(absent).toEqual({
+      endpoint: 'responses',
+      model: 'gpt-6-astra',
+      input_tokens: 600,
+      cached_input_tokens: 100,
     });
   });
 

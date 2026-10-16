@@ -3,22 +3,28 @@ import { FakeProvider, makeFindingFixture } from '@prisma-bot/provider-fake';
 import {
   type JobPayload,
   type PrSnapshot,
+  type ProviderCapabilities,
+  type ProviderError,
   ProviderErrorThrowable,
   type ProviderReviewInput,
   type ProviderReviewOutput,
   type RepoConfig,
   RepoConfigSchema,
+  estimatePromptTokens,
+  serializeForEstimate,
 } from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
 import {
   type LogEvent,
   type OrchestratorDeps,
   type PipelineLogger,
+  type ProviderLimits,
   type RepoIdentity,
   type RepoLookup,
   runPipeline,
 } from '../../src/pipeline/index.js';
 import { type NoFindingsReasoningHint } from '../../src/pipeline/index.js';
+import { reasoningModelNoFindingsNotice } from '../../src/provider-notices.js';
 
 const REPO_ID: RepoIdentity = {
   owner: 'octocat',
@@ -598,6 +604,29 @@ describe('runPipeline', () => {
     expect(errorEvent?.fields.message).toBe('model_not_found');
   });
 
+  it('capability error: provider.error log carries param and code only when present', async () => {
+    // ADR-008 D11: key names and codes, never values (G-1).
+    const run = async (error: ProviderError) => {
+      const logger = buildLogger();
+      const provider = new FakeProvider({ script: [{ kind: 'error', error }] });
+      await expect(
+        runPipeline(makePayload(), buildDeps({ provider, logger })),
+      ).rejects.toBeInstanceOf(ProviderErrorThrowable);
+      return logger.events.find((e) => e.event === 'provider.error')?.fields;
+    };
+    const withMeta = await run({
+      kind: 'capability',
+      message: "Unsupported value: 'none' is not supported with the 'gpt-6-astra' model.",
+      param: 'reasoning.effort',
+      code: 'unsupported_value',
+    });
+    expect(withMeta?.param).toBe('reasoning.effort');
+    expect(withMeta?.code).toBe('unsupported_value');
+    const without = await run({ kind: 'capability', message: 'model_not_found' });
+    expect(without).not.toHaveProperty('param');
+    expect(without).not.toHaveProperty('code');
+  });
+
   it('capability error: notice passed to runPublish contains model-pointer text and NOT-size-limit text', async () => {
     // Per spec: the capability notice must make clear this is a provider/model
     // rejection, NOT a size limit, and point at the model config.
@@ -664,6 +693,35 @@ describe('runPipeline', () => {
     expect(notice).toMatch(/OPENAI_API_STYLE=responses/);
     expect(notice).toMatch(/Do not use `reasoning_effort: 'none'`/);
     expect(notice).toMatch(/model-compatibility\.md/);
+  });
+
+  it('capability error: param/code from the provider error select the targeted remedy', async () => {
+    // ADR-008 D11: the orchestrator forwards `param` / `code` to the remedy table.
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: {
+            kind: 'capability',
+            message: "Unsupported parameter: 'temperature' is not supported with this model.",
+            param: 'temperature',
+          },
+        },
+      ],
+    });
+    const capturedNotices: Array<string | undefined> = [];
+    const deps = buildDeps({ provider });
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, _roundIntent, notice) => {
+        capturedNotices.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg);
+      },
+    };
+    await expect(runPipeline(makePayload(), deps)).rejects.toBeInstanceOf(ProviderErrorThrowable);
+    expect(capturedNotices[0]).toContain('Remedy: this model rejects `temperature`');
+    expect(capturedNotices[0]).not.toMatch(/OPENAI_API_STYLE/);
   });
 
   it('auth error: notice passed to runPublish contains credentials text', async () => {
@@ -949,6 +1007,201 @@ const buildChunkableSnapshot = (fileCount = 3): PrSnapshot => ({
 });
 
 describe('runPipeline — diff chunking', () => {
+  it('caps effectiveBudget by providerLimits.maxTokensPerCall and reserves the provider output cap', async () => {
+    // ADR-008 D2/D7. Sizes are anthropic-approx estimates (chars/4 × 1.15) of
+    // the serialized prompt: one hunk line costs ≈ 7.5 tokens.
+    const hunkOf = (lines: number): string => '+const a = 1;\n'.repeat(lines);
+    const capabilities = (max_context_tokens: number): ProviderCapabilities => ({
+      structured_output: true,
+      function_calling: true,
+      deterministic_seed: true,
+      max_context_tokens,
+      tokenizer_family: 'anthropic-approx',
+    });
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      chunking: { enabled: true, max_files: 200, max_changed_lines: 12000 },
+    });
+    const plan = async (
+      window: number,
+      snapshot: PrSnapshot,
+      providerLimits: ProviderLimits | undefined,
+    ) => {
+      const provider = new FakeProvider({
+        capabilities: capabilities(window),
+        script: Array.from({ length: 6 }, () => ({
+          kind: 'output' as const,
+          output: { findings: [] },
+        })),
+      });
+      const logger = buildLogger();
+      const deps = buildDeps({ provider, snapshot, config, logger });
+      if (providerLimits !== undefined) deps.providerLimits = providerLimits;
+      await runPipeline(makePayload(), deps);
+      const planned = logger.events.find((e) => e.event === 'chunking.planned')?.fields;
+      const estimates = provider.calls.map((c) =>
+        estimatePromptTokens(serializeForEstimate(c), 'anthropic-approx'),
+      );
+      return { planned, estimates };
+    };
+
+    // (1) GPT-6 window (922K): four ≈45K-token files.
+    const fourBig = buildChunkableSnapshot(4);
+    const big = hunkOf(6_000);
+    fourBig.files = fourBig.files.map((f) => ({
+      ...f,
+      hunks: f.hunks.map((h) => ({ ...h, content: big })),
+    }));
+    const limits: ProviderLimits = { maxTokensPerCall: 120_000, maxOutputTokens: 32_768 };
+    const capped = await plan(922_000, fourBig, limits);
+    expect(capped.planned?.batch_count).toBe(2);
+    expect(capped.estimates).toHaveLength(2);
+    for (const est of capped.estimates) expect(est).toBeLessThanOrEqual(120_000);
+    // Absent: the plan is unchanged — one batch under hard_cap_in (844,364).
+    const uncapped = await plan(922_000, fourBig, undefined);
+    expect(uncapped.planned?.batch_count).toBe(1);
+    expect(uncapped.estimates[0]).toBeGreaterThan(120_000);
+
+    // (2) reserved_output = max(chunking.reserved_output_tokens, maxOutputTokens).
+    // 100K window, one ≈70K-token file: absoluteCap = 100,000 − 4,096 − 9,000
+    // = 86,904 keeps it; with 32,768 reserved it is 58,232 and the file is skipped.
+    const oneHuge = buildChunkableSnapshot(2);
+    const huge = hunkOf(9_400);
+    oneHuge.files = oneHuge.files.map((f, i) =>
+      i === 0 ? { ...f, hunks: f.hunks.map((h) => ({ ...h, content: huge })) } : f,
+    );
+    const reserved = await plan(100_000, oneHuge, { maxOutputTokens: 32_768 });
+    expect(reserved.planned?.skipped_files).toBe(1);
+    expect((await plan(100_000, oneHuge, undefined)).planned?.skipped_files).toBe(0);
+    // A cap below the repo's reserved_output_tokens (4096) leaves the reservation unchanged.
+    expect((await plan(100_000, oneHuge, { maxOutputTokens: 1_000 })).planned?.skipped_files).toBe(
+      0,
+    );
+  });
+
+  // ADR-008 D2/D7 review fixes: the absolute cap honours the adapter's
+  // per-call ceiling, an output cap the window cannot hold falls back to the
+  // config reservation, and `generation.max_output_tokens` is reserved.
+  const reservationConfig = (generation: { max_output_tokens?: number } = {}): RepoConfig =>
+    RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      chunking: { enabled: true, max_files: 200, max_changed_lines: 12000 },
+      generation,
+    });
+  /** Two-file chunkable PR; the first file is one hunk of `lines` lines (≈7.5 tokens each). */
+  const snapshotWithBigFile = (lines: number): PrSnapshot => {
+    const snapshot = buildChunkableSnapshot(2);
+    const content = '+const a = 1;\n'.repeat(lines);
+    snapshot.files = snapshot.files.map((f, i) =>
+      i === 0 ? { ...f, hunks: f.hunks.map((h) => ({ ...h, content })) } : f,
+    );
+    return snapshot;
+  };
+  const runWithWindow = async (
+    window: number,
+    snapshot: PrSnapshot,
+    providerLimits: ProviderLimits | undefined,
+    config: RepoConfig = reservationConfig(),
+  ) => {
+    const provider = new FakeProvider({
+      capabilities: {
+        structured_output: true,
+        function_calling: true,
+        deterministic_seed: true,
+        max_context_tokens: window,
+        tokenizer_family: 'anthropic-approx',
+      },
+      script: Array.from({ length: 6 }, () => ({
+        kind: 'output' as const,
+        output: { findings: [] },
+      })),
+    });
+    const logger = buildLogger();
+    const deps = buildDeps({ provider, snapshot, config, logger });
+    if (providerLimits !== undefined) deps.providerLimits = providerLimits;
+    const result = await runPipeline(makePayload(), deps);
+    const planned = logger.events.find((e) => e.event === 'chunking.planned')?.fields;
+    return { result, planned, logger, provider, events: logger.events.map((e) => e.event) };
+  };
+
+  it('bounds the absolute cap by providerLimits.maxTokensPerCall: an oversize file is skipped up front', async () => {
+    // ≈300K-token single-hunk file on a GPT-6 window. Bounded only by the window
+    // (922,000 − 32,768 − 9,000 = 880,232) it is planned as a solo batch that
+    // the 120K adapter guard rejects on every retry.
+    const snapshot = snapshotWithBigFile(40_000);
+    const limits: ProviderLimits = { maxTokensPerCall: 120_000, maxOutputTokens: 32_768 };
+    const { result, planned, provider, events } = await runWithWindow(922_000, snapshot, limits);
+    expect(planned?.skipped_files).toBe(1);
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    if (result.outcome?.kind === 'review_complete_chunked') {
+      expect(result.outcome.detail.skipped_files.map((f) => f.path)).toEqual(['src/file0.ts']);
+      expect(result.outcome.detail.not_reviewed_files).toHaveLength(0);
+    }
+    // First pass, no guard-trip retries: the file never reaches the provider.
+    for (const call of provider.calls) {
+      expect(call.files.map((f) => f.path)).not.toContain('src/file0.ts');
+    }
+    for (const retry of [
+      'provider.batch.split',
+      'provider.batch.hunk_split',
+      'provider.batch.budget_exhausted',
+      'provider.batch.budget_unsplittable',
+    ] as const) {
+      expect(events).not.toContain(retry);
+    }
+    // Without the per-call ceiling the same file is planned as its own batch.
+    const unbounded = await runWithWindow(922_000, snapshot, { maxOutputTokens: 32_768 });
+    expect(unbounded.planned?.skipped_files).toBe(0);
+  });
+
+  it('falls back to chunking.reserved_output_tokens and warns when the output cap leaves no input budget', async () => {
+    // 128K window with a 128,000 output cap: hard_cap_in and the absolute cap go
+    // negative and every file would be skipped. Planning falls back to 4096.
+    const snapshot = buildChunkableSnapshot(2);
+    const fallback = await runWithWindow(128_000, snapshot, { maxOutputTokens: 128_000 });
+    expect(fallback.planned?.skipped_files).toBe(0);
+    expect(fallback.provider.calls.length).toBeGreaterThan(0);
+    const warn = fallback.logger.events.find(
+      (e) => e.event === 'pipeline.budget.output_cap_exceeds_window',
+    );
+    expect(warn?.fields).toMatchObject({
+      level: 'warn',
+      window: 128_000,
+      reserved_output_requested: 128_000,
+      reserved_output_applied: 4096,
+      hard_cap_in: 128_000 - 4096 - 9000 - 8960,
+      absolute_cap_tokens: 128_000 - 4096 - 9000,
+    });
+    expect(fallback.result.config_notes?.some((n) => n.includes('OPENAI_MAX_OUTPUT_TOKENS'))).toBe(
+      true,
+    );
+
+    // A cap the window holds (GPT-6: 922K window, 32,768 cap) changes nothing.
+    const fits = await runWithWindow(922_000, snapshot, {
+      maxTokensPerCall: 120_000,
+      maxOutputTokens: 32_768,
+    });
+    expect(fits.events).not.toContain('pipeline.budget.output_cap_exceeds_window');
+    expect(
+      (fits.result.config_notes ?? []).some((n) => n.includes('OPENAI_MAX_OUTPUT_TOKENS')),
+    ).toBe(false);
+  });
+
+  it('reserves generation.max_output_tokens (65,536 on a 128K window)', async () => {
+    // ≈70K-token file. Reserving 4096 the absolute cap is 114,904 and the file
+    // is planned; reserving the repo's 65,536 it is 53,464 and the file is skipped.
+    const snapshot = snapshotWithBigFile(9_400);
+    const reserved = await runWithWindow(
+      128_000,
+      snapshot,
+      undefined,
+      reservationConfig({ max_output_tokens: 65_536 }),
+    );
+    expect(reserved.planned?.skipped_files).toBe(1);
+    expect(reserved.events).not.toContain('pipeline.budget.output_cap_exceeds_window');
+    expect((await runWithWindow(128_000, snapshot, undefined)).planned?.skipped_files).toBe(0);
+  });
+
   it('chunkable PR: calls provider once per batch, merges findings, returns review_complete_chunked', async () => {
     // 3 files × 900 lines = 2700 lines > 2000 (max_changed_lines) → chunkable.
     // Budget is very tight (1 token) so each file gets its own batch → 3 batches.
@@ -2024,25 +2277,41 @@ describe('runPipeline — no_findings reasoning model hint', () => {
   const cfgWithModel = (model: string): RepoConfig =>
     RepoConfigSchema.parse({ mode: 'summary-plus-inline', model });
 
+  // Records the notice every publication receives (summary-only included).
+  const captureNotices = (deps: OrchestratorDeps): Array<string | undefined> => {
+    const captured: Array<string | undefined> = [];
+    deps.hooks = {
+      ...deps.hooks,
+      runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice) => {
+        captured.push(notice);
+        const { publish: realPublish } = await import('@prisma-bot/github');
+        return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice);
+      },
+    };
+    return captured;
+  };
+
   it('no_findings + reasoning model (gpt-5.4-nano) + provider called -> hint emitted', async () => {
     // Provider returns empty findings on a non-trivial diff.
     const provider = new FakeProvider({
       script: [{ kind: 'output', output: { findings: [] } }],
     });
     const spy = buildOctokitSpy();
-    const result = await runPipeline(
-      makePayload(),
-      buildDeps({
-        provider,
-        octokitSpy: spy,
-        config: cfgWithModel('openai/gpt-5.4-nano'),
-      }),
-    );
+    const deps = buildDeps({
+      provider,
+      octokitSpy: spy,
+      config: cfgWithModel('openai/gpt-5.4-nano'),
+    });
+    const notices = captureNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
     expect(result.state).toBe('succeeded');
     expect(result.outcome?.kind).toBe('no_findings');
     const outcome = result.outcome as { kind: 'no_findings'; detail?: NoFindingsReasoningHint };
     expect(outcome.detail?.reasoning_model_empty).toBe(true);
     expect(outcome.detail?.model).toBe('gpt-5.4-nano');
+    // ADR-008 D10: the shared helper text, not the old gpt-4.1 advice.
+    expect(notices[0]).toBe(`ℹ️ ${reasoningModelNoFindingsNotice('gpt-5.4-nano')}`);
+    expect(notices[0]).not.toContain('gpt-4.1');
   });
 
   it('no_findings + reasoning model (o3) + provider called -> hint emitted', async () => {
@@ -2050,18 +2319,73 @@ describe('runPipeline — no_findings reasoning model hint', () => {
       script: [{ kind: 'output', output: { findings: [] } }],
     });
     const spy = buildOctokitSpy();
-    const result = await runPipeline(
-      makePayload(),
-      buildDeps({
-        provider,
-        octokitSpy: spy,
-        config: cfgWithModel('openai/o3'),
-      }),
-    );
+    const deps = buildDeps({
+      provider,
+      octokitSpy: spy,
+      config: cfgWithModel('openai/o3'),
+    });
+    const notices = captureNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
     expect(result.outcome?.kind).toBe('no_findings');
     const outcome = result.outcome as { kind: 'no_findings'; detail?: NoFindingsReasoningHint };
     expect(outcome.detail?.reasoning_model_empty).toBe(true);
     expect(outcome.detail?.model).toBe('o3');
+    expect(notices[0]).toContain('`o3` is a reasoning model');
+    expect(notices[0]).not.toContain('OPENAI_TOOL_CHOICE=required');
+  });
+
+  it('no_findings + GPT-6 reasoning model (gpt-6-astra) -> shared helper notice; gpt-4o gets none', async () => {
+    const provider = new FakeProvider({
+      script: [{ kind: 'output', output: { findings: [] } }],
+    });
+    const deps = buildDeps({ provider, config: cfgWithModel('openai/gpt-6-astra') });
+    const notices = captureNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome).toEqual({
+      kind: 'no_findings',
+      detail: { reasoning_model_empty: true, model: 'gpt-6-astra' },
+    });
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('`gpt-6-astra` is a reasoning model');
+    expect(notices[0]).toContain('provider.usage');
+    expect(notices[0]).toContain('OPENAI_MAX_OUTPUT_TOKENS');
+    expect(notices[0]).not.toContain('gpt-4.1');
+
+    const classicDeps = buildDeps({
+      provider: new FakeProvider({ script: [{ kind: 'output', output: { findings: [] } }] }),
+      config: cfgWithModel('openai/gpt-4o'),
+    });
+    const classicNotices = captureNotices(classicDeps);
+    const classic = await runPipeline(makePayload(), classicDeps);
+    expect(classic.outcome?.kind).toBe('review_complete');
+    expect(classicNotices[0] ?? '').not.toContain('is a reasoning model');
+  });
+
+  it('chunked empty review on a reasoning model appends the shared helper to the floors notice', async () => {
+    const provider = new FakeProvider({
+      script: [
+        { kind: 'output', output: { findings: [] } },
+        { kind: 'output', output: { findings: [] } },
+      ],
+    });
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      model: 'openai/gpt-6-astra',
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1, // tiny budget → one batch per file → 2 sections
+      },
+    });
+    const deps = buildDeps({ provider, snapshot: buildChunkableSnapshot(2), config });
+    const notices = captureNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    expect(notices[0]).toMatch(/No issues were reported at or above your configured inline floors/);
+    expect(notices[0]).toContain(` ${reasoningModelNoFindingsNotice('gpt-6-astra')}`);
   });
 
   it('no_findings + classic model (gpt-4o) + provider called -> NO hint', async () => {

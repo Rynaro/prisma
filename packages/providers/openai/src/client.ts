@@ -166,7 +166,7 @@ interface OpenAIHttpError {
   status: number;
   headers: Record<string, string>;
   message: string;
-  error?: { type?: string; code?: string };
+  error?: { type?: string; code?: string; param?: string };
 }
 
 function headersToRecord(headers: Headers): Record<string, string> {
@@ -234,7 +234,7 @@ async function postChatCompletion(
         : {};
     const innerError =
       typeof payload.error === 'object' && payload.error !== null
-        ? (payload.error as { type?: string; code?: string; message?: string })
+        ? (payload.error as { type?: string; code?: string; param?: unknown; message?: string })
         : undefined;
     const messageRaw =
       (innerError?.message ?? (typeof payload.message === 'string' ? payload.message : '')) ||
@@ -245,9 +245,13 @@ async function postChatCompletion(
       message: messageRaw,
     };
     if (innerError !== undefined) {
-      const e: { type?: string; code?: string } = {};
+      const e: { type?: string; code?: string; param?: string } = {};
       if (innerError.type !== undefined) e.type = innerError.type;
       if (innerError.code !== undefined) e.code = innerError.code;
+      // `param` names the rejected request field (e.g. `reasoning_effort`,
+      // `temperature`); the remedy text is keyed on it (ADR-008 D11). The API
+      // sends `null` when no single field is at fault, so copy strings only.
+      if (typeof innerError.param === 'string') e.param = innerError.param;
       httpError.error = e;
     }
     throw httpError;

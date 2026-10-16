@@ -10,6 +10,7 @@ import {
   requiresWrite,
 } from '@prisma-bot/shared';
 import { describe, expect, it, vi } from 'vitest';
+import { reasoningModelNoFindingsNotice } from '../../src/provider-notices.js';
 
 /**
  * Hand-rolled `FakeIssueCommentsClient` matching the `IssueCommentsClient`
@@ -728,6 +729,20 @@ describe('chunked review reply text', () => {
     });
     expect(reply).toContain('2 of 4 section(s) could not be analyzed');
     expect(reply).toContain('1 file(s) were too large');
+  });
+
+  it('no_findings reply for a reasoning model uses the shared helper', () => {
+    /** Mirrors the `no_findings` reply branch inside `handleCommentJob` in `worker.ts`. */
+    const buildNoFindingsReply = (detail?: { reasoning_model_empty: true; model: string }) =>
+      detail?.reasoning_model_empty === true
+        ? reasoningModelNoFindingsNotice(detail.model)
+        : 'Review complete — no issues found. Check the **AI Code Review** check run for the full summary.';
+    const reply = buildNoFindingsReply({ reasoning_model_empty: true, model: 'gpt-6-astra' });
+    expect(reply).toContain('`gpt-6-astra` is a reasoning model');
+    expect(reply).toContain('OPENAI_MAX_OUTPUT_TOKENS');
+    expect(reply).not.toContain('gpt-4.1');
+    expect(reply).not.toContain('OPENAI_TOOL_CHOICE=required');
+    expect(buildNoFindingsReply()).toContain('no issues found');
   });
 });
 

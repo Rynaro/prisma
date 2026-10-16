@@ -19,6 +19,24 @@ describe('classifyRetry', () => {
     expect(classifyRetry(err)).toBe('rate_limited');
   });
 
+  it('treats a non-retryable rate_limit (insufficient_quota) as non_transient', () => {
+    const quota = new ProviderErrorThrowable({
+      kind: 'rate_limit',
+      message: 'You exceeded your current quota',
+      retryable: false,
+    });
+    expect(classifyRetry(quota)).toBe('non_transient');
+    // `retryable` absent or true keeps the rate_limited class.
+    expect(
+      classifyRetry(new ProviderErrorThrowable({ kind: 'rate_limit', message: 'slow down' })),
+    ).toBe('rate_limited');
+    expect(
+      classifyRetry(
+        new ProviderErrorThrowable({ kind: 'rate_limit', message: 'slow down', retryable: true }),
+      ),
+    ).toBe('rate_limited');
+  });
+
   it('classifies ProviderErrorThrowable auth as non_transient', () => {
     const err = new ProviderErrorThrowable({
       kind: 'auth',

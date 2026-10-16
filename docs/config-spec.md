@@ -53,7 +53,7 @@ Configuration is resolved in this order; each layer overrides the previous on a 
 - **Malformed slugs.** `openai/` (empty name) → warning, no model override; `/gpt-4o` (empty provider) → treated as bare `gpt-4o`; `a/b/c` (multiple slashes) → warning, no model override. None of these reject the file.
 - **Example.** `model: openai/gpt-5.4-nano`  (slug form, preferred)
 - **Migration.** Replace `provider: openai` + `model: gpt-5.4-nano` with `model: openai/gpt-5.4-nano` and remove the `provider:` key.
-- **Model compatibility.** Reasoning-family models (gpt-5+/o-series) use a different `tool_choice` mode than classic models. If a reasoning model returns an empty review, see [`docs/model-compatibility.md`](model-compatibility.md) for the compatibility matrix and remedies.
+- **Model compatibility.** Reasoning-family models (gpt-5+/o-series/gpt-6/chat-latest) use a different `tool_choice` mode than classic models. If a reasoning model returns an empty review, see [`docs/model-compatibility.md`](model-compatibility.md) for the compatibility matrix and remedies.
 
 ### generation
 
@@ -61,7 +61,7 @@ Configuration is resolved in this order; each layer overrides the previous on a 
 - **Required.** Optional.
 - **Default.** `{}` (empty — all sub-keys absent, deployment defaults apply).
 - **Validation rule (plain English).** All sub-keys are optional and independently validated:
-  - `max_output_tokens`: positive integer. Overrides the deployment-level `OPENAI_MAX_OUTPUT_TOKENS` for this repo's requests. The token parameter key (`max_tokens` vs `max_completion_tokens`) is chosen by the adapter per model family — the config need not specify which.
+  - `max_output_tokens`: positive integer. Overrides the deployment-level `OPENAI_MAX_OUTPUT_TOKENS` for this repo's requests. The token parameter key (`max_tokens` vs `max_completion_tokens`) is chosen by the adapter per model family — the config need not specify which. Default when the env var is unset: 4096 classic / 32768 reasoning.
   - `temperature`: number in `[0, 2]`. Values outside this range reject the file.
   - `top_p`: number in `[0, 1]`. Values outside this range reject the file.
   - `seed`: integer (any sign). Forwarded to the adapter as a determinism hint.
@@ -491,7 +491,7 @@ estimator to count the exact serialized prompt (system + diff + tool schema +
 guidance), and the budget is computed as:
 
 ```
-window                 = provider.capabilities.max_context_tokens      # e.g., 200_000 (Anthropic), 128_000 (OpenAI)
+window                 = provider.capabilities.max_context_tokens      # e.g., 200_000 (Anthropic), 128_000 classic OpenAI, 922_000 gpt-6 family, 272_000 chat-latest
 reserved_output        = chunking.reserved_output_tokens               # default 4096
 prompt_overhead        = chunking.prompt_overhead_tokens               # default 9000
 safety                 = ceil(chunking.safety_fraction × window)       # default: ceil(0.07 × window)
