@@ -111,7 +111,7 @@ prisma ships with three production-ready provider adapters and one boot-only stu
 
 Optional OpenAI overrides (consumed only when `OPENAI_API_KEY` is set):
 
-- `OPENAI_MODEL` — defaults to `gpt-4o` (startup warning when unset; see [deployment.md](deployment.md)).
+- `OPENAI_MODEL` — defaults to `gpt-6-luna` (was `gpt-4o`; see [model-compatibility.md](model-compatibility.md#default-model)).
 - `OPENAI_BASE_URL` — defaults to `https://api.openai.com/v1`. Useful for re-targeting at Azure OpenAI or a proxy gateway without code changes (per ADR-005 § Decision).
 
 (Listed by precedence above, Copilot is tried before OpenAI.) Optional Copilot overrides (consumed only when `COPILOT_API_KEY` is set):

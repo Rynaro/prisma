@@ -7,8 +7,7 @@
  * `pipeline/orchestrator.ts` (check-run summary) and `worker.ts` (the comment
  * reply on the `ask` path). Both must say the same thing, so the text lives
  * once, here. The same applies to the reasoning-model empty-review notice
- * (`reasoningModelNoFindingsNotice`) and the default-model startup warning
- * (`OPENAI_DEFAULT_MODEL_WARNING`).
+ * (`reasoningModelNoFindingsNotice`).
  *
  * The input is `ProviderError.message` — already the safe, secret-scrubbed
  * string each adapter's `map*Error` produced — plus the optional `param` /
@@ -166,14 +165,3 @@ export function withCapabilityRemedy(
 export function reasoningModelNoFindingsNotice(model: string): string {
   return `\`${model}\` is a reasoning model and reported no findings. If you expected some, check the \`provider.usage\` log event: \`reasoning_tokens\` near zero means the model skipped reasoning (do not set \`reasoning_effort: 'none'\`; unset \`OPENAI_TOOL_CHOICE=forced\`); a large count with an empty result usually means a tight output cap — raise \`OPENAI_MAX_OUTPUT_TOKENS\` (≥ 25,000 on GPT-6) or the effort. See docs/model-compatibility.md.`;
 }
-
-/**
- * Startup warning logged by `worker.ts` (`worker.provider.openai_default_model`,
- * level `warn`) when the OpenAI adapter is selected with `OPENAI_MODEL` unset
- * (ADR-008 D9). The default stays `gpt-4o`; this tells the operator its
- * snapshot has a shutdown date. The date and replacement are exported so the
- * log payload's `shutdown` / `replacement` fields come from the same source.
- */
-export const OPENAI_DEFAULT_MODEL_SHUTDOWN = '2027-01-14';
-export const OPENAI_DEFAULT_MODEL_REPLACEMENT = 'gpt-6-luna';
-export const OPENAI_DEFAULT_MODEL_WARNING = `OPENAI_MODEL is unset; the default \`gpt-4o\` resolves to a snapshot scheduled for shutdown on ${OPENAI_DEFAULT_MODEL_SHUTDOWN} (replacement: \`${OPENAI_DEFAULT_MODEL_REPLACEMENT}\`). Set OPENAI_MODEL explicitly before then; see docs/model-compatibility.md.`;

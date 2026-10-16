@@ -6,11 +6,11 @@ This document describes how the review bot handles different OpenAI model famili
 
 | Model family | Examples | Endpoint (`OPENAI_API_STYLE=auto`) | Tool-choice mode | Token parameter | Deterministic seed | Input ceiling | Default output cap | Notes |
 |---|---|---|---|---|---|---|---|---|
-| Classic (proven) | `gpt-4o`, `gpt-4.1`, `gpt-4`, `gpt-3.5-turbo` | `/chat/completions` | Forced-specific function object | `max_tokens` | Yes | 128,000 | 4,096 | Default behavior. Byte-identical to pre-v0.10.0 requests. No regression. |
+| Classic (proven) | `gpt-4o`, `gpt-4.1`, `gpt-4`, `gpt-3.5-turbo` | `/chat/completions` | Forced-specific function object | `max_tokens` | Yes | 128,000 | 4,096 | Byte-identical to pre-v0.10.0 requests. No regression. Opt in with `OPENAI_MODEL` (see [Default model](#default-model)). |
 | Reasoning (o-series) | `o1`, `o3`, `o4-mini` | `/responses` | `'required'` (auto) | `max_output_tokens` | No | 128,000 (assumed) | 32,768 | OpenAI's guidance is that reasoning models belong on the Responses API. The cap includes reasoning tokens. |
 | Reasoning (gpt-5 … gpt-5.5) | `gpt-5`, `gpt-5.4-nano`, `gpt-5.5` | `/responses` | `'required'` (auto) | `max_output_tokens` | No | 128,000 (assumed) | 32,768 | Function tools are rejected on `/chat/completions` at any reasoning effort other than `none` from GPT-5.4 onward. |
 | Reasoning (gpt-5.6) | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | `/responses` | `'required'` (auto) | `max_output_tokens` | No | 128,000 (assumed) | 32,768 | Same rejection, and `reasoning_effort: 'none'` is not an escape (see below). |
-| Reasoning (GPT-6) | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | `/responses` | `'required'` (auto) | `max_output_tokens` | No | 922,000 | 32,768 | Window 1,050,000, max input 922,000, max output 128,000. `max` effort is new. Sampling parameters are rejected at any effort other than `none`. |
+| Reasoning (GPT-6) | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | `/responses` | `'required'` (auto) | `max_output_tokens` | No | 922,000 | 32,768 | Window 1,050,000, max input 922,000, max output 128,000. `max` effort is new. Sampling parameters are rejected at any effort other than `none`. `gpt-6-luna` is the default model. |
 | Reasoning (GPT-6.1) | `gpt-6.1-sol` | `/responses` | `'required'` (auto) | `max_output_tokens` | No | 922,000 | 32,768 | Same limits as GPT-6. Rejects `none` and `minimal` effort, so chat with tools has no working effort. |
 | Alias | `chat-latest` | `/responses` | `'required'` (auto) | `max_output_tokens` | No | 272,000 | 32,768 | The ChatGPT-tracking alias (window 400,000, max input 272,000). See [chat-latest](#chat-latest). |
 
@@ -214,13 +214,11 @@ model: openai/gpt-4.1
 
 OpenAI has announced that the dated `gpt-4o` and `gpt-4.1` snapshots shut down on 2027-01-14, with `gpt-6-luna` as the named replacement. Treat a classic model as a short-term choice.
 
-### Set OPENAI_MODEL explicitly
+### Default model
 
-`OPENAI_MODEL` defaults to `gpt-4o`. When it is unset, the worker logs a `worker.provider.openai_default_model` warning at startup:
+`OPENAI_MODEL` defaults to `gpt-6-luna`, OpenAI's named replacement for the retired `gpt-4o` / `gpt-4.1` snapshots ([ADR-008](architecture-decision-records/adr-008-gpt6-model-family-compatibility.md) D9). It was `gpt-4o`.
 
-> OPENAI_MODEL is unset; the default `gpt-4o` resolves to a snapshot scheduled for shutdown on 2027-01-14 (replacement: `gpt-6-luna`). Set OPENAI_MODEL explicitly before then; see docs/model-compatibility.md.
-
-Set `OPENAI_MODEL` (or `model:` in `.github/review-bot.yml`) before that date. The default itself has not changed, so existing deployments keep their current behavior until you do.
+A deployment that never set `OPENAI_MODEL` changes behavior when it upgrades. It moves from `gpt-4o` on `/chat/completions` (seeded, 4,096 output cap, 128,000 input ceiling) to `gpt-6-luna` on `/responses` (no seed, 32,768 output cap, 922,000 input ceiling), with `tool_choice: 'required'` and without `generation.temperature` / `top_p`. To keep the old behavior, set `OPENAI_MODEL=gpt-4o`; that works until the `gpt-4o` snapshot shuts down on 2027-01-14.
 
 ## Notice in check-run and comment reply
 

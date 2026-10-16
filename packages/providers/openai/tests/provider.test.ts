@@ -93,18 +93,21 @@ function chatCompletionsResponse(toolArgs: unknown, toolName = 'submit_review_fi
 }
 
 describe('OpenAIProvider', () => {
-  // T1: name + caps (deterministic_seed===true)
-  it('exposes name = "openai" and default capabilities with deterministic_seed true', () => {
+  // T1: name + caps for the default model (ADR-008 D9: gpt-6-luna, /responses,
+  // so no seed). The chat-routed seed capability is pinned in the #41 [P2] block.
+  it('exposes name = "openai" and the gpt-6-luna default capabilities (deterministic_seed false)', () => {
     const provider = new OpenAIProvider({
       apiKey: 'irrelevant',
       client: { chatCompletions: vi.fn(), textCompletion: vi.fn() },
     });
+    expect(OPENAI_DEFAULT_MODEL).toBe('gpt-6-luna');
     expect(provider.name).toBe(OPENAI_PROVIDER_NAME);
     expect(provider.name).toBe('openai');
     expect(provider.capabilities.structured_output).toBe(true);
     expect(provider.capabilities.function_calling).toBe(true);
-    expect(provider.capabilities.deterministic_seed).toBe(true);
-    expect(provider.capabilities.max_context_tokens).toBeGreaterThan(0);
+    expect(provider.capabilities.deterministic_seed).toBe(false);
+    expect(provider.capabilities.max_context_tokens).toBe(922000);
+    expect(provider.capabilities.tokenizer_family).toBe('o200k');
     // deep-equal check against OPENAI_CAPABILITIES
     expect(provider.capabilities).toEqual(OPENAI_CAPABILITIES);
   });
@@ -286,6 +289,7 @@ describe('OpenAIProvider', () => {
     });
     const provider = new OpenAIProvider({
       apiKey: 'k',
+      model: 'gpt-4o',
       client: { chatCompletions, textCompletion: vi.fn() },
     });
     await provider.review({ ...validInput, request_shaping: { deterministic_seed: 42 } });
@@ -302,6 +306,7 @@ describe('OpenAIProvider', () => {
     });
     const provider = new OpenAIProvider({
       apiKey: 'k',
+      model: 'gpt-4o',
       client: { chatCompletions, textCompletion: vi.fn() },
     });
     await provider.review(validInput);
@@ -632,6 +637,7 @@ describe('OpenAIProvider — respond()', () => {
     const textCompletion = vi.fn().mockResolvedValue(textCompletionResponse('ok'));
     const provider = new OpenAIProvider({
       apiKey: 'k',
+      model: 'gpt-4o',
       client: { chatCompletions: vi.fn(), textCompletion },
     });
     await provider.respond({
@@ -782,6 +788,8 @@ describe('resolveOpenAIContextWindow (ADR-008 D1)', () => {
       expect(resolveOpenAIContextWindow(model)).toBe(922000);
     }
     expect(OPENAI_MAX_INPUT_TOKENS_GPT6).toBe(922000);
+    // The static capability literal follows the default model, gpt-6-luna.
+    expect(OPENAI_CAPABILITIES.max_context_tokens).toBe(922000);
   });
 
   it('chat-latest (exact, case-insensitive) → 272,000', () => {
@@ -802,8 +810,6 @@ describe('resolveOpenAIContextWindow (ADR-008 D1)', () => {
       expect(resolveOpenAIContextWindow(model)).toBe(128000);
     }
     expect(OPENAI_MAX_INPUT_TOKENS_DEFAULT).toBe(128000);
-    // The static capability literal stays correct for the default model.
-    expect(OPENAI_CAPABILITIES.max_context_tokens).toBe(128000);
   });
 });
 
@@ -856,18 +862,20 @@ describe('OpenAIProvider — token param per-request wiring', () => {
     return { client, getArgs: () => capturedArgs };
   }
 
-  it('classic model (gpt-4o default) → sends max_tokens, NOT max_completion_tokens', async () => {
+  it('classic model (gpt-4o) → sends max_tokens, NOT max_completion_tokens', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review(validInput);
     const args = getArgs();
     expect('max_tokens' in args).toBe(true);
     expect('max_completion_tokens' in args).toBe(false);
   });
 
+  // The gpt-4o deployment keeps the per-request override observable: the
+  // field flips from the deployment's max_tokens to max_completion_tokens.
   it('gpt-5.4-nano via request_shaping.model → sends max_completion_tokens, NOT max_tokens', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({ ...validInput, request_shaping: { model: 'gpt-5.4-nano' } });
     const args = getArgs();
     expect('max_completion_tokens' in args).toBe(true);
@@ -876,7 +884,7 @@ describe('OpenAIProvider — token param per-request wiring', () => {
 
   it('o3 via request_shaping.model → sends max_completion_tokens, NOT max_tokens', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({ ...validInput, request_shaping: { model: 'o3' } });
     const args = getArgs();
     expect('max_completion_tokens' in args).toBe(true);
@@ -885,8 +893,8 @@ describe('OpenAIProvider — token param per-request wiring', () => {
 
   it('never sends both max_tokens and max_completion_tokens in the same request', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
-    // gpt-4o default
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
+    // gpt-4o deployment
     await provider.review(validInput);
     const args1 = getArgs();
     expect('max_tokens' in args1 && 'max_completion_tokens' in args1).toBe(false);
@@ -916,6 +924,7 @@ describe('OpenAIProvider — token param per-request wiring', () => {
     const provider = new OpenAIProvider({
       apiKey: 'k',
       client,
+      model: 'gpt-4o',
       tokenParamStyle: 'max_completion_tokens',
     });
     await provider.review(validInput);
@@ -938,12 +947,18 @@ describe('OpenAIProvider — token param per-request wiring', () => {
     expect('max_tokens' in args).toBe(false);
   });
 
-  it('maxOutputTokens defaults to 4096 when unset', async () => {
-    const { client, getArgs } = makeCapturingClient();
+  // The default model (gpt-6-luna) is reasoning-family: its unset cap is the
+  // 32,768 reasoning default, spelled max_output_tokens on /responses. The
+  // classic 4096 default is pinned by AC1.5 above.
+  it('maxOutputTokens defaults to 32768 for the default model (gpt-6-luna) when unset', async () => {
+    const { client, responses } = recordingClient();
     const provider = new OpenAIProvider({ apiKey: 'k', client });
     await provider.review(validInput);
-    const args = getArgs();
-    expect(args.max_tokens).toBe(4096);
+    expect(client.chatCompletions).not.toHaveBeenCalled();
+    const args = responses();
+    expect(args.max_output_tokens).toBe(32768);
+    expect('max_tokens' in args).toBe(false);
+    expect('max_completion_tokens' in args).toBe(false);
   });
 
   // GPT-6 compat AS-13, adapter half (D7).
@@ -1109,7 +1124,7 @@ describe('OpenAIProvider — generation→vendor mapping (spec § 5.3)', () => {
   // AS-5: generation.max_output_tokens → correct token-param key per model
   it('AS-5: gpt-4o + generation.max_output_tokens=8192 → max_tokens=8192', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({
       ...validInput,
       request_shaping: { generation: { max_output_tokens: 8192 } },
@@ -1121,7 +1136,8 @@ describe('OpenAIProvider — generation→vendor mapping (spec § 5.3)', () => {
 
   it('AS-5: gpt-5.4-nano + generation.max_output_tokens=8192 → max_completion_tokens=8192', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    // gpt-4o deployment: the request-model override decides the key.
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({
       ...validInput,
       request_shaping: {
@@ -1137,7 +1153,7 @@ describe('OpenAIProvider — generation→vendor mapping (spec § 5.3)', () => {
   // AS-6: seed → deterministic_seed → args.seed
   it('AS-6: deterministic_seed=42 → args.seed=42', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({
       ...validInput,
       request_shaping: { deterministic_seed: 42 },
@@ -1148,7 +1164,7 @@ describe('OpenAIProvider — generation→vendor mapping (spec § 5.3)', () => {
   // AS-7: temperature + top_p reach args
   it('AS-7: generation.temperature and generation.top_p reach args', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({
       ...validInput,
       request_shaping: {
@@ -1303,7 +1319,7 @@ describe('OpenAIProvider — provider_options passthrough (spec § 5.3, § 3.7)'
   // AS-9: escape hatch wins on collision (provider_options > generation)
   it('AS-9: provider_options.max_tokens overrides generation.max_output_tokens (classic model)', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client }); // gpt-4o default
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({
       ...validInput,
       request_shaping: {
@@ -1334,7 +1350,7 @@ describe('OpenAIProvider — provider_options passthrough (spec § 5.3, § 3.7)'
   // G8: denylist enforced — tool_choice cannot be overridden
   it('G8: denylisted key (tool_choice) is dropped; forced tool intact', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({
       ...validInput,
       request_shaping: {
@@ -1572,17 +1588,18 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
     return { client, getArgs: () => capturedArgs };
   }
 
-  // Reasoning model: tool_choice must be 'required'
+  // Reasoning model: tool_choice must be 'required'. The gpt-4o deployment
+  // keeps the per-request override observable (forced object → 'required').
   it('reasoning model (gpt-5.4-nano) sends tool_choice="required"', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({ ...validInput, request_shaping: { model: 'gpt-5.4-nano' } });
     expect(getArgs().tool_choice).toBe('required');
   });
 
   it('reasoning model (o3) sends tool_choice="required"', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({ ...validInput, request_shaping: { model: 'o3' } });
     expect(getArgs().tool_choice).toBe('required');
   });
@@ -1590,7 +1607,7 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
   // Reasoning model: system message contains the nudge
   it('reasoning model: system message contains the reasoning nudge', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({ ...validInput, request_shaping: { model: 'gpt-5.4-nano' } });
     const messages = getArgs().messages as Array<{ role: string; content: string }>;
     const systemMsg = messages.find((m) => m.role === 'system');
@@ -1598,10 +1615,10 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
     expect(systemMsg?.content).toContain('Analyze the diff thoroughly');
   });
 
-  // Classic model (gpt-4o default): tool_choice must be forced object
-  it('classic model (gpt-4o default) sends forced tool_choice object', async () => {
+  // Classic model (gpt-4o): tool_choice must be forced object
+  it('classic model (gpt-4o) sends forced tool_choice object', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review(validInput);
     const tc = getArgs().tool_choice as Record<string, unknown>;
     expect(tc.type).toBe('function');
@@ -1611,7 +1628,7 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
   // Classic model: system message does NOT contain the nudge (golden snapshot)
   it('classic model (gpt-4o): system message does NOT contain the reasoning nudge', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review(validInput);
     const messages = getArgs().messages as Array<{ role: string; content: string }>;
     const systemMsg = messages.find((m) => m.role === 'system');
@@ -1621,8 +1638,13 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
   // explicit toolChoiceStyle='required' override on a classic model
   it("toolChoiceStyle='required' sends 'required' even for classic model", async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client, toolChoiceStyle: 'required' });
-    await provider.review(validInput); // gpt-4o default
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-4o',
+      toolChoiceStyle: 'required',
+    });
+    await provider.review(validInput);
     expect(getArgs().tool_choice).toBe('required');
   });
 
@@ -1643,12 +1665,12 @@ describe('OpenAIProvider — tool_choice + prompt per model family', () => {
   // denylist: tool_choice from provider_options is still blocked
   it('tool_choice from provider_options is still blocked by denylist', async () => {
     const { client, getArgs } = makeCapturingClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-4o' });
     await provider.review({
       ...validInput,
       request_shaping: { provider_options: { tool_choice: 'none' } },
     });
-    // tool_choice should still be the forced object (gpt-4o default)
+    // tool_choice should still be the forced object (gpt-4o)
     const tc = getArgs().tool_choice as Record<string, unknown>;
     expect(tc.type).toBe('function');
   });
@@ -1937,13 +1959,33 @@ describe('OpenAIProvider, /responses routing', () => {
 
   it("apiStyle='responses' routes a classic model to /responses with a flat forced tool", async () => {
     const { client, getResponsesArgs } = makeDualClient();
-    const provider = new OpenAIProvider({ apiKey: 'k', client, apiStyle: 'responses' });
-    await provider.review(validInput); // gpt-4o default -> forced-specific tool_choice
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-4o',
+      apiStyle: 'responses',
+    });
+    await provider.review(validInput); // classic gpt-4o -> forced-specific tool_choice
     expect(client.responses).toHaveBeenCalledTimes(1);
     const toolChoice = getResponsesArgs().tool_choice as Record<string, unknown>;
     expect(toolChoice.type).toBe('function');
     expect(toolChoice.name).toBe('submit_review_findings');
     expect(Object.keys(toolChoice)).not.toContain('function');
+  });
+
+  // ADR-008 D9 (ratified): with no model configured, the adapter uses
+  // OPENAI_DEFAULT_MODEL, gpt-6-luna, a reasoning-family model on /responses.
+  it('an unconfigured provider sends gpt-6-luna to /responses: required, 32768, no seed', async () => {
+    const { client, getResponsesArgs } = makeDualClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client });
+    await provider.review({ ...validInput, request_shaping: { deterministic_seed: 42 } });
+    expect(client.responses).toHaveBeenCalledTimes(1);
+    expect(client.chatCompletions).not.toHaveBeenCalled();
+    const args = getResponsesArgs();
+    expect(args.model).toBe('gpt-6-luna');
+    expect(args.tool_choice).toBe('required');
+    expect(args.max_output_tokens).toBe(32768);
+    expect('seed' in args).toBe(false);
   });
 
   it('a client without a responses method keeps the chat path', async () => {
@@ -2363,7 +2405,9 @@ describe('#41 [P2] deterministic seed is endpoint-aware', () => {
   });
 
   it('keeps deterministic_seed true for a chat-routed deployment', () => {
-    expect(new OpenAIProvider({ apiKey: 'k' }).capabilities.deterministic_seed).toBe(true);
+    expect(
+      new OpenAIProvider({ apiKey: 'k', model: 'gpt-4o' }).capabilities.deterministic_seed,
+    ).toBe(true);
     expect(
       new OpenAIProvider({ apiKey: 'k', model: 'gpt-5.6-luna', apiStyle: 'chat' }).capabilities
         .deterministic_seed,

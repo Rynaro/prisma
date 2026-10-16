@@ -4,7 +4,7 @@
 
 Proposed — 2026-10-16. Amends [ADR-005](adr-005-openai-provider.md) (capability constants: `max_context_tokens` becomes a per-model resolution and `tokenizer_family` becomes a rule) and [ADR-006](adr-006-diff-chunking-stability.md) (the 128K window assumption and the `reserved_output` coupling). Supersedes nothing. ADRs are immutable once accepted; superseding decisions require a new ADR that explicitly references this one.
 
-Three decisions are pending user ratification: D3 (forward reasoning effort verbatim), D7 (32,768 default output cap for reasoning-family models) and D9 (keep the `gpt-4o` default with a startup warning).
+Two decisions are pending user ratification: D3 (forward reasoning effort verbatim) and D7 (32,768 default output cap for reasoning-family models). D9 (flip the default model to `gpt-6-luna`) was ratified by the maintainer on 2026-10-16.
 
 ## Context
 
@@ -56,9 +56,11 @@ When `OPENAI_MAX_OUTPUT_TOKENS` is unset, the default is 4,096 for classic model
 
 `resolveOpenAITokenizerFamily(model)` returns `o200k` for `isReasoningModel(model)` or `/^gpt-4(o|\.1|\.5)/i`, and `cl100k` otherwise. `OPENAI_TOKENIZER_FAMILY_MAP` is removed. Unknown slugs and gateway deployment names stay `cl100k`: over-counting is safe.
 
-### D9 — the default model stays `gpt-4o`, with a startup warning (pending ratification)
+### D9 — the default model is `gpt-6-luna` (ratified 2026-10-16)
 
-`OPENAI_DEFAULT_MODEL` is unchanged. When the worker builds the OpenAI adapter with `OPENAI_MODEL` unset, it logs a `warn` event `worker.provider.openai_default_model` carrying the 2027-01-14 shutdown date and `gpt-6-luna` as the replacement. Flipping the default is a separate release.
+`OPENAI_DEFAULT_MODEL` moves from `gpt-4o` to `gpt-6-luna`, OpenAI's named replacement for the retired `gpt-4o` and `gpt-4.1` snapshots, in this release. The maintainer ratified the flip on 2026-10-16. `OPENAI_CAPABILITIES` is derived from the default through the resolvers the constructor uses, so it reads `deterministic_seed: false`, `max_context_tokens: 922000` and `tokenizer_family: 'o200k'`. No startup warning is logged.
+
+Consequence: a deployment without `OPENAI_MODEL` changes behavior on upgrade. It moves from `gpt-4o` on `/chat/completions` (seeded, 4,096 output cap, 128,000 input ceiling, forced tool, sampling forwarded) to `gpt-6-luna` on `/responses` (no seed, 32,768 output cap, 922,000 input ceiling, `tool_choice: 'required'`, `generation.temperature` / `top_p` dropped). `OPENAI_MODEL=gpt-4o` is the opt-out: it restores the previous behavior until the snapshot shuts down on 2027-01-14.
 
 ### D10 — one empty-review notice
 
@@ -82,7 +84,7 @@ The transport copies `error.param`. The `capability` error variant gains optiona
 - **D6 — one token fixes six behaviors.** The alternative, three global env vars (`OPENAI_API_STYLE`, `OPENAI_TOKEN_PARAM`, `OPENAI_TOOL_CHOICE`) for one alias, affects every other model. That `chat-latest` accepts `tool_choice: 'required'` on `/responses` is inferred, not observed.
 - **D7 — pending ratification.** The cap includes reasoning tokens. At 4,096 a medium-effort review truncates and each `output_truncated` split costs a real call. 32,768 clears OpenAI's 25,000 guidance with room for the findings JSON and is a quarter of the 128,000 ceiling. The worker resolves the cap for batch planning, so the family default must live where the worker resolves it as well as in the adapter, and `reserved_output` must follow it or `hard_cap_in` under-reserves. Rejected: keeping 4,096 (broken by default); documenting only.
 - **D8 — one family predicate, an honest vocabulary rule.** GPT-6 is empirically `o200k` (not an OpenAI statement), and no newer encoding exists in the tokenizer libraries, so `o200k` is the best estimate. A larger future vocabulary would tokenize to fewer tokens, so it does not under-count. Reusing `isReasoningModel` adds no fourth family classification; the classic arm is a vocabulary rule. Rejected: extending the slug table (stale per codename); defaulting unknown slugs to `o200k` (could under-count a `cl100k` model).
-- **D9 — pending ratification.** Flipping to `gpt-6-luna` changes endpoint, `tool_choice`, seed handling, output cap and cost for unconfigured deployments with no operator action, which violates the classic-path regression principle three months before it is forced. A warning is non-breaking and visible in the logs. Rejected: changing the default now; docs only (nobody reads docs for a default they never set).
+- **D9 — flip now, ratified.** The `gpt-4o` default has a fixed end (2027-01-14), so every unconfigured deployment changes model by then regardless. Flipping in the release that makes the GPT-6 family correct end to end (window, tokenizer, output cap, sampling, remedies) moves those deployments to a supported model while the `OPENAI_MODEL=gpt-4o` opt-out still works, instead of at a forced deadline. The cost is a behavior change (endpoint, `tool_choice`, seed, output cap, window and spend) with no operator action; it is documented in `docs/model-compatibility.md` § Default model and `docs/deployment.md`. Rejected: keeping `gpt-4o` with a `warn` startup event (the earlier proposal: non-breaking, but it only defers the same change to the shutdown date and depends on operators reading logs); docs only (nobody reads docs for a default they never set).
 - **D10 — one helper, in the app.** The three copies drifted, and the app's notice module is already the single text home shared by the orchestrator and the worker. Rejected: placing product copy in `@prisma-bot/shared`, a vendor-neutral library with no other consumer.
 - **D11 — `code` and `param` are the stable fields.** Message strings come from bug reports and may change. Both fields are carried because remedies are keyed on `param` and gated by `code`: the chat-with-tools rejection also carries `param: 'reasoning_effort'` with a null `code`, so the effort remedy must not fire on it, and the existing signature is evaluated first. Rejected: message-only regexes; treating `unsupported_parameter` as retryable.
 
@@ -95,11 +97,12 @@ The transport copies `error.param`. The `capability` error variant gains optiona
 - `resolveExplicitReasoningEffort(bag)`, `shouldStripSampling(model, explicitEffort)`, `SAMPLING_KEYS_STRIPPED`.
 - `resolveOpenAITokenizerFamily(model)` — now a rule. `OPENAI_TOKENIZER_FAMILY_MAP` is **removed**.
 - `OpenAIUsageTelemetry.cache_write_tokens`.
+- `OPENAI_DEFAULT_MODEL` is `gpt-6-luna` (was `gpt-4o`); `OPENAI_CAPABILITIES` is derived from it (D9).
 - `OpenAIHttpError.error.param` (`client.ts`); `mapOpenAIError` maps `unsupported_value` / `unsupported_parameter`, `insufficient_quota` and 5xx `Retry-After`.
 
 ### App (`apps/github-app`)
 
-- `reasoningModelNoFindingsNotice(model)`, `OPENAI_DEFAULT_MODEL_WARNING`, `capabilityRemedyNotice(message, meta?)` and `withCapabilityRemedy(notice, message, meta?)` with `CapabilityErrorMeta = { param?, code? }`.
+- `reasoningModelNoFindingsNotice(model)`, `capabilityRemedyNotice(message, meta?)` and `withCapabilityRemedy(notice, message, meta?)` with `CapabilityErrorMeta = { param?, code? }`.
 - `OrchestratorDeps.providerLimits?: { maxTokensPerCall?: number; maxOutputTokens?: number }` (type `ProviderLimits`); `buildProvider` returns it alongside the provider.
 - Job queue: a `rate_limit` error with `retryable: false` is `non_transient`.
 
@@ -111,7 +114,6 @@ The transport copies `error.param`. The `capability` error variant gains optiona
 
 ### New log event
 
-- `worker.provider.openai_default_model` (`warn`) — `{ model, shutdown, replacement, message }`.
 - `pipeline.budget.output_cap_exceeds_window` (`warn`) — `{ window, reserved_output_requested, reserved_output_applied, hard_cap_in, absolute_cap_tokens }`.
 - `provider.usage` gains `cache_write_tokens`; `provider.error` may carry `param`, `code` and `retry_after_ms`. See `docs/observability.md`.
 
@@ -133,11 +135,11 @@ The transport copies `error.param`. The `capability` error variant gains optiona
 - All five IDs (`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol`, `chat-latest`) route to `/responses` with `tool_choice: 'required'` and `max_output_tokens`, with family-correct window, tokenizer and default output cap.
 - Vendor-neutral `generation` config no longer 400s on a switch to a reasoning model.
 - Every GPT-6 parameter rejection becomes a `capability` error with a `param`-targeted remedy; quota exhaustion stops retrying.
-- Classic-model deployments are unaffected.
+- Deployments that set `OPENAI_MODEL` to a classic model are unaffected.
+- Deployments that never set `OPENAI_MODEL` move from `gpt-4o` to `gpt-6-luna` on upgrade, with that model's endpoint, seed, output cap and window (D9); `OPENAI_MODEL=gpt-4o` opts out until 2027-01-14.
 
 ## Consequences (later)
 
-- **Flip the default model before 2027-01-14.** `OPENAI_DEFAULT_MODEL` moves to a supported model (OpenAI names `gpt-6-luna`) in its own release; D9's warning is the lead-in.
 - **A provider-note channel.** Forwarding ignored-field and dropped-sampling notes into `config_notes` needs a `Provider`-interface change and its own ADR; with it, D3 can be revisited (`minimal` to `low` with a visible note).
 - **Per-request capabilities.** The window now varies by request model; a guard compensates. A third per-request capability would justify `Provider.capabilitiesFor(model)`.
 - **Add gpt-5.x and o-series windows** to `resolveOpenAIContextWindow` once OpenAI publishes them.
@@ -164,7 +166,7 @@ Acceptance scenarios from the spec (`docs/_planning/gpt6-compat/spec.md` § 5):
 - **AS-15** — the queue classifies a non-retryable `rate_limit` as `non_transient`.
 - **AS-16** — remedy selection precedence, including the chat-with-tools trap and unknown `param` (`provider-notices.test.ts`).
 - **AS-17** — the shared empty-review notice and its three call sites.
-- **AS-18** — the default-model warning text names `2027-01-14`, `gpt-6-luna` and `OPENAI_MODEL`; the emission gate is verified manually.
+- **AS-18** — superseded by D9 as ratified: there is no default-model warning. Instead, `OPENAI_DEFAULT_MODEL` is `gpt-6-luna`, an unconfigured provider declares `deterministic_seed: false`, `max_context_tokens: 922000` and `tokenizer_family: 'o200k'` (equal to `OPENAI_CAPABILITIES`), and sends `/responses` with `tool_choice: 'required'`, `max_output_tokens: 32768` and no seed (`provider.test.ts`).
 - **AS-19** — classic request bodies are byte-identical to the pre-GPT-6 snapshot.
 - **AS-20** — an eval fixture for `openai/gpt-6-astra` empty reviews.
 - **AS-21** — `cache_write_tokens` from either endpoint, omitted when absent.

@@ -648,9 +648,13 @@ function applyGenerationSampling(
  * Default model identifier. Centralized so it can be swapped in one place.
  * Model selection is treated as configuration, not as a vendor type.
  *
- * Per spec D4: GPT-4o as default model. Operators override via `OPENAI_MODEL`.
+ * The default follows OpenAI's named replacement for the retired `gpt-4o` /
+ * `gpt-4.1` snapshots (shutdown 2027-01-14): `gpt-6-luna`, a reasoning-family
+ * model, so an unconfigured deployment routes to `/responses` (ADR-008 D9, as
+ * ratified). Operators override via `OPENAI_MODEL`; `OPENAI_MODEL=gpt-4o`
+ * restores the classic behavior until that shutdown.
  */
-export const OPENAI_DEFAULT_MODEL = 'gpt-4o';
+export const OPENAI_DEFAULT_MODEL = 'gpt-6-luna';
 
 /**
  * Default base URL for the OpenAI inference endpoint. Operators may
@@ -702,8 +706,7 @@ export function resolveOpenAITokenizerFamily(model: string): TokenizerFamily {
 
 /**
  * Maximum INPUT tokens per call for classic models, gpt-5.x, the o-series and
- * any unknown slug. Also the `OPENAI_CAPABILITIES` literal (correct for the
- * default model `gpt-4o`).
+ * any unknown slug.
  */
 export const OPENAI_MAX_INPUT_TOKENS_DEFAULT = 128_000;
 
@@ -753,28 +756,33 @@ export function resolveOpenAIContextWindow(model: string): number {
 }
 
 /**
- * `OPENAI_CAPABILITIES` — declared capability set for the OpenAI adapter.
+ * `OPENAI_CAPABILITIES` — declared capability set for the OpenAI adapter with
+ * the default model (`OPENAI_DEFAULT_MODEL`, `gpt-6-luna`) and `apiStyle:
+ * 'auto'`. The model-dependent fields are derived from the same resolvers the
+ * constructor uses, so the literal cannot drift from the default:
  *
- * Key differentiator vs. Copilot: `deterministic_seed: true` — OpenAI's
- * `/chat/completions` honors an integer `seed` parameter. This is a BOOL
- * (support flag); the INT seed value travels via `ProviderRequestShaping.deterministic_seed`.
+ * `deterministic_seed`: `true` only when the default model resolves to
+ * `/chat/completions`, which honors an integer `seed`; `/responses` has no
+ * seed. `false` for `gpt-6-luna`. This is a BOOL (support flag); the INT seed
+ * value travels via `ProviderRequestShaping.deterministic_seed`. A chat-routed
+ * model (e.g. `OPENAI_MODEL=gpt-4o`) reports `true` — see the constructor.
  *
- * `tokenizer_family`: defaults to `'o200k'` matching the default model `gpt-4o`.
- * Overridden at construction time via `resolveOpenAITokenizerFamily(model)`.
+ * `tokenizer_family`: `resolveOpenAITokenizerFamily(OPENAI_DEFAULT_MODEL)`
+ * (`'o200k'`). Overridden at construction time for the resolved model.
  *
- * `max_context_tokens`: maximum INPUT tokens per call. `128000` matches the
- * default model `gpt-4o`; overridden at construction time via
- * `resolveOpenAIContextWindow(model)` (922,000 for the GPT-6 family, 272,000
- * for `chat-latest`).
+ * `max_context_tokens`: maximum INPUT tokens per call,
+ * `resolveOpenAIContextWindow(OPENAI_DEFAULT_MODEL)` (922,000). Overridden at
+ * construction time for the resolved model (128,000 for classic models,
+ * 272,000 for `chat-latest`).
  *
  * Per chunking-stability-spec.md § Phase 2 "Provider capabilities".
  */
 export const OPENAI_CAPABILITIES: ProviderCapabilities = {
   structured_output: true,
   function_calling: true,
-  deterministic_seed: true,
-  max_context_tokens: 128000,
-  tokenizer_family: 'o200k',
+  deterministic_seed: resolveApiStyle(OPENAI_DEFAULT_MODEL) === 'chat',
+  max_context_tokens: resolveOpenAIContextWindow(OPENAI_DEFAULT_MODEL),
+  tokenizer_family: resolveOpenAITokenizerFamily(OPENAI_DEFAULT_MODEL),
 };
 
 /**
@@ -826,6 +834,10 @@ export interface OpenAIClientLike {
 
 export interface OpenAIProviderOptions {
   apiKey: string;
+  /**
+   * Deployment model. Defaults to `OPENAI_DEFAULT_MODEL` (`gpt-6-luna`, a
+   * reasoning-family model routed to `/responses`). Wired from `OPENAI_MODEL`.
+   */
   model?: string;
   baseUrl?: string;
   /**
@@ -1184,9 +1196,11 @@ function extractMessageContent(response: unknown): string {
  * (`https://api.openai.com/v1/chat/completions`), accessed over the standard
  * OpenAI REST shape.
  *
- * Key differentiator: `deterministic_seed: true` — when the caller supplies
- * `request_shaping.deterministic_seed` (an INT), it is threaded as `seed` into
- * the request. This is the only honest basis for declaring the capability.
+ * Key differentiator: `deterministic_seed: true` for a chat-routed model (e.g.
+ * `gpt-4o`) — when the caller supplies `request_shaping.deterministic_seed`
+ * (an INT), it is threaded as `seed` into the request. This is the only honest
+ * basis for declaring the capability, so a `/responses`-routed model —
+ * including the default `gpt-6-luna` — declares `false`.
  *
  * Invariants (ADR-002, api-contracts.md § Invariants and error semantics):
  *   - Network primitive (`fetch`) is confined to `client.ts`.

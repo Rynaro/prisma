@@ -1,8 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  OPENAI_DEFAULT_MODEL_REPLACEMENT,
-  OPENAI_DEFAULT_MODEL_SHUTDOWN,
-  OPENAI_DEFAULT_MODEL_WARNING,
   capabilityRemedyNotice,
   reasoningModelNoFindingsNotice,
   withCapabilityRemedy,
@@ -155,22 +152,5 @@ describe('reasoningModelNoFindingsNotice', () => {
 
   it('carries no leading emoji (call sites add their own prefix)', () => {
     expect(reasoningModelNoFindingsNotice('o3').startsWith('`o3`')).toBe(true);
-  });
-});
-
-describe('OPENAI_DEFAULT_MODEL_WARNING', () => {
-  it('names the shutdown date, the replacement and OPENAI_MODEL', () => {
-    expect(OPENAI_DEFAULT_MODEL_WARNING).toContain('2027-01-14');
-    expect(OPENAI_DEFAULT_MODEL_WARNING).toContain('gpt-6-luna');
-    expect(OPENAI_DEFAULT_MODEL_WARNING).toContain('OPENAI_MODEL');
-    expect(OPENAI_DEFAULT_MODEL_WARNING).toContain('`gpt-4o`');
-  });
-
-  it('is built from the exported shutdown date and replacement, byte for byte', () => {
-    expect(OPENAI_DEFAULT_MODEL_SHUTDOWN).toBe('2027-01-14');
-    expect(OPENAI_DEFAULT_MODEL_REPLACEMENT).toBe('gpt-6-luna');
-    expect(OPENAI_DEFAULT_MODEL_WARNING).toBe(
-      'OPENAI_MODEL is unset; the default `gpt-4o` resolves to a snapshot scheduled for shutdown on 2027-01-14 (replacement: `gpt-6-luna`). Set OPENAI_MODEL explicitly before then; see docs/model-compatibility.md.',
-    );
   });
 });

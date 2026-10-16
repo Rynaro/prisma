@@ -39,13 +39,7 @@ import {
   type RepoLookup,
   runPipeline,
 } from './pipeline/index.js';
-import {
-  OPENAI_DEFAULT_MODEL_REPLACEMENT,
-  OPENAI_DEFAULT_MODEL_SHUTDOWN,
-  OPENAI_DEFAULT_MODEL_WARNING,
-  reasoningModelNoFindingsNotice,
-  withCapabilityRemedy,
-} from './provider-notices.js';
+import { reasoningModelNoFindingsNotice, withCapabilityRemedy } from './provider-notices.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
 import { fetchRepoConfig, resolvePrivilegedApproval } from './repo-config.js';
 import { resolveRepoIdentity } from './repo-identity.js';
@@ -292,10 +286,10 @@ const buildProvider = async (
       opts.toolChoiceStyle = toolChoiceRaw as ToolChoiceStyle;
     }
     // OPENAI_API_STYLE, an optional override for the endpoint `review()` posts to.
-    // `auto` (default) sends the model families that reject function tools on
-    // /chat/completions (gpt-5.6*, gpt-6+) to /responses and leaves every other
-    // model where it is. `chat` pins /chat/completions; `responses` uses
-    // /responses for every model.
+    // `auto` (default) sends every reasoning-family model (`isReasoningModel`:
+    // o-series, gpt-5+, gpt-6 / gpt-6.1, `chat-latest`) to /responses and leaves
+    // classic models (gpt-4o, gpt-4.1, …) on /chat/completions. `chat` pins
+    // /chat/completions; `responses` uses /responses for every model.
     // Invalid values are silently ignored and fall back to `auto`.
     // See deployment.md § Config and docs/model-compatibility.md for details.
     const apiStyleRaw = await tryGetSecret(secretSource, 'OPENAI_API_STYLE');
@@ -310,18 +304,10 @@ const buildProvider = async (
     opts.onUsage = (usage: OpenAIUsageTelemetry): void => {
       log('provider.usage', { provider: 'openai', ...usage });
     };
+    // With `OPENAI_MODEL` unset the adapter uses `OPENAI_DEFAULT_MODEL`
+    // (`gpt-6-luna`, ADR-008 D9), which routes to `/responses`; the output
+    // reservation above already follows that default.
     log('worker.provider.selected', { provider: 'openai' });
-    if (model === undefined) {
-      // ADR-008 D9: the default model stays `gpt-4o`, but its snapshot has a
-      // shutdown date. `level` in the payload overrides the logger's `info`.
-      log('worker.provider.openai_default_model', {
-        level: 'warn',
-        model: OPENAI_DEFAULT_MODEL,
-        shutdown: OPENAI_DEFAULT_MODEL_SHUTDOWN,
-        replacement: OPENAI_DEFAULT_MODEL_REPLACEMENT,
-        message: OPENAI_DEFAULT_MODEL_WARNING,
-      });
-    }
     return {
       provider: new OpenAIProvider(opts),
       providerLimits: limitsFor(maxOutputTokens),
