@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": ".eidolons/harness/hooks/copilot-SessionStart.sh",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

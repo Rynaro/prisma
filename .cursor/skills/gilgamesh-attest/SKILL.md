@@ -1,0 +1,1 @@
+../../../.eidolons/gilgamesh/skills/attest/SKILL.md

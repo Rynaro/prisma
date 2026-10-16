@@ -1,0 +1,1 @@
+../../../.eidolons/gilgamesh/skills/gauge/SKILL.md
