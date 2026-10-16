@@ -1,0 +1,1 @@
+../../../.eidolons/gilgamesh/skills/grind/SKILL.md

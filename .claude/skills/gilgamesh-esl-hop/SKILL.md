@@ -1,0 +1,1 @@
+../../../.eidolons/gilgamesh/skills/esl-hop/SKILL.md

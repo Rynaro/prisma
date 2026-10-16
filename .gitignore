@@ -19,12 +19,17 @@ evals/last-report.md
 deploy/.releases
 deploy/backups/
 
-# Per-developer tool state (not project assets)
-.claude/
-.eidolons/
 
 # Kamal secrets (per-deployment, never committed; only .example is tracked)
 .kamal/secrets
 .kamal/secrets.*
 .kamal/secrets-common
 !.kamal/secrets.example
+# Eidolons: .eidolons/ and the CLI-written parts of .claude/ (agents/, skills/,
+# settings.json) are committed so a fresh clone is wired without a sync.
+# Only per-developer and runtime state is ignored.
+.claude/settings.local.json
+.claude/worktrees/
+.eidolons/.context/
+.eidolons/memories/
+agents/memories/
