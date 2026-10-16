@@ -34,7 +34,7 @@ make eval
 cat evals/last-report.md
 ```
 
-**Expected result:** `23 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
+**Expected result:** `24 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
 
 Smoke test (end-to-end stack — app, worker, Redis, signed webhook, teardown; ~45 seconds):
 
@@ -67,7 +67,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.14.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.15.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 Prefer Kamal? An alternative single-host path using Kamal + kamal-proxy (native TLS) with a
 Redis accessory is documented in [docs/deployment-kamal.md](./docs/deployment-kamal.md). The
@@ -217,9 +217,9 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.14.0** — the reviewer gains a voice beyond findings, via two opt-in (default-off) feature sets in `.github/review-bot.yml`. **Positive feedback & clean-review approval** (#37): `positive_feedback` adds up to `max_items` "Highlights" to the review summary, each praising a concrete good decision; `approval` lets a clean review celebrate ("no issues — nice work"), flip the check conclusion to `success`, and optionally submit a real GitHub PR approval. **Reviewer interaction** (#38): `@bot ask <message>` lets developers discuss the feedback with the reviewer — replies are grounded in the latest round's findings and check-run summary, prior exchanges thread into later messages, and `interactions.max_per_review` hard-caps provider-backed replies per review round (budget tracked statelessly via comment markers, hardened against forged-marker bypass).
+**v0.15.0** — GPT-6 / GPT-6.1 compatibility (#43). The OpenAI provider now supports `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol` and `chat-latest`; the default model changes from `gpt-4o` to `gpt-6-luna` (set `OPENAI_MODEL=gpt-4o` to opt out until its 2027-01-14 snapshot shutdown). The output cap is family-aware (32,768 reasoning / 4096 classic, env var wins) and the input ceiling is per-model (922,000 for gpt-6 / 6.1, 272,000 for `chat-latest`, 128,000 otherwise). Sampling parameters are dropped for reasoning models unless effort is explicitly `none`, and `unsupported_value` / `unsupported_parameter` errors surface with `param`-aware remedies.
 
-- 1018 tests across 56 files, all passing · 23/23 deterministic eval scenarios PASS
+- 1134 tests across 58 files, all passing · 24/24 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
