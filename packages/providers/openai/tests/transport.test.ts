@@ -129,8 +129,9 @@ describe('OpenAI transport boundary — URL and request body', () => {
     expect('conversation' in body).toBe(false);
     // [P2] no seed on an endpoint that has none.
     expect('seed' in body).toBe(false);
-    // [P2] one cap, in the native spelling only.
-    expect(body.max_output_tokens).toBe(4096);
+    // [P2] one cap, in the native spelling only (reasoning-family default,
+    // GPT-6 compat D7; was 4096).
+    expect(body.max_output_tokens).toBe(32768);
     expect('max_tokens' in body).toBe(false);
     expect('max_completion_tokens' in body).toBe(false);
     // The review contract survives the translation.
@@ -143,7 +144,7 @@ describe('OpenAI transport boundary — URL and request body', () => {
     expect(body.tool_choice).toBe('required');
   });
 
-  it('serializes a native max_output_tokens override at the transport, not the 4096 default', async () => {
+  it('serializes a native max_output_tokens override at the transport, not the deployment default', async () => {
     stubOk(responsesPayload({ findings: [] }));
     const provider = new OpenAIProvider({ apiKey: 'sk-test', model: 'gpt-5.6-luna' });
     await provider.review({
@@ -317,6 +318,32 @@ describe('OpenAI transport boundary — error mapping', () => {
       cause_kind: 'capability',
     });
     expect(recorded[0]?.url).toBe('https://api.openai.com/v1/responses');
+  });
+
+  it('forwards error.param from a /responses 400 into the capability error', async () => {
+    stubOk(
+      {
+        error: {
+          message: "Unsupported parameter: 'temperature' is not supported with this model.",
+          type: 'invalid_request_error',
+          param: 'temperature',
+          code: null,
+        },
+      },
+      400,
+    );
+    const provider = new OpenAIProvider({ apiKey: 'sk-test', model: 'gpt-6-luna' });
+    const rejection = await provider.review(reviewInput).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(recorded[0]?.url).toBe('https://api.openai.com/v1/responses');
+    expect(rejection).toMatchObject({
+      cause_kind: 'capability',
+      value: { kind: 'capability', param: 'temperature' },
+    });
+    // `code: null` on the wire is not carried as a code.
+    expect((rejection as { value: Record<string, unknown> }).value).not.toHaveProperty('code');
   });
 
   it('maps a 401 from /responses to auth and a 429 to rate_limited', async () => {

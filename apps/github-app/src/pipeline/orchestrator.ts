@@ -32,6 +32,7 @@ import {
   type PrSnapshot,
   type PrefilteredFile,
   type Provider,
+  type ProviderError,
   ProviderErrorThrowable,
   type ProviderReviewInput,
   type ProviderReviewOutput,
@@ -44,7 +45,7 @@ import {
   parseModelSlug,
 } from '@prisma-bot/shared';
 import type { TokenizerFamily } from '@prisma-bot/shared';
-import { withCapabilityRemedy } from '../provider-notices.js';
+import { reasoningModelNoFindingsNotice, withCapabilityRemedy } from '../provider-notices.js';
 
 /**
  * `runPipeline` — single-function orchestrator that wires the Phase 5.1–5.5
@@ -113,7 +114,9 @@ export type LogEvent =
   | 'chunking.subset_selected'
   | 'provider.batch.budget_exhausted'
   | 'provider.batch.hunk_split'
-  | 'provider.batch.budget_unsplittable';
+  | 'provider.batch.budget_unsplittable'
+  // ADR-008 D7: an output cap the window cannot hold; planning fell back.
+  | 'pipeline.budget.output_cap_exceeds_window';
 
 export interface PipelineLogger {
   emit(event: LogEvent, fields: Record<string, unknown>): void;
@@ -153,9 +156,27 @@ export interface OrchestratorHooks {
   ) => Promise<PublicationResult>;
 }
 
+/**
+ * Limits the worker configured on the provider adapter, threaded into batch
+ * planning so the orchestrator never plans a batch the adapter's per-call guard
+ * would reject (ADR-008 D2) and reserves the adapter's real output cap
+ * (ADR-008 D7). Both optional: an absent key leaves planning unchanged.
+ */
+export interface ProviderLimits {
+  /** The adapter's per-call input ceiling (`MAX_TOKENS_PER_PR` in the worker). */
+  maxTokensPerCall?: number;
+  /** The adapter's resolved output token cap (e.g. `OPENAI_MAX_OUTPUT_TOKENS`). */
+  maxOutputTokens?: number;
+}
+
 export interface OrchestratorDeps {
   installationAuth: InstallationAuth;
   provider: Provider;
+  /**
+   * The provider adapter's configured limits (see `ProviderLimits`). Absent in
+   * tests and evals that do not model the worker's adapter options.
+   */
+  providerLimits?: ProviderLimits;
   config: RepoConfig;
   /** Resolves owner/repo and App identity for an installation/repo pair. */
   repoLookup: RepoLookup;
@@ -375,9 +396,31 @@ const buildEmptyReviewNotice = (
   let notice = `ℹ️ No issues were reported at or above your configured inline floors (severity ≥ ${sevFloor}, confidence ≥ ${confFloor.toFixed(2)}). The PR looks clean to the model, or the bar is set high for it — lower \`confidence_floor.inline\` / \`severity_floor.inline\` if you expected more.`;
   const slug = parseModelSlug(config.model, config.provider);
   if (slug.model !== undefined && isReasoningModel(slug.model)) {
-    notice += ` Note: \`${slug.model}\` is a reasoning model and may be under-producing with this review flow — try \`openai/gpt-4.1\` or set \`OPENAI_TOOL_CHOICE=required\` (see docs/model-compatibility.md).`;
+    notice += ` ${reasoningModelNoFindingsNotice(slug.model)}`;
   }
   return notice;
+};
+
+/**
+ * Optional diagnostic fields of a `ProviderError` for the `provider.error` /
+ * `provider.batch.error` events (ADR-008 D11): the vendor's rejected request
+ * field name and error code on `capability`, and the server back-off on
+ * `transport` / `rate_limit`. Key names and codes only, never values (G-1);
+ * absent fields are omitted.
+ */
+const providerErrorDetailFields = (value: ProviderError): Record<string, unknown> => {
+  const fields: Record<string, unknown> = {};
+  if (value.kind === 'capability') {
+    if (value.param !== undefined) fields.param = value.param;
+    if (value.code !== undefined) fields.code = value.code;
+  }
+  if (
+    (value.kind === 'transport' || value.kind === 'rate_limit') &&
+    value.retry_after_ms !== undefined
+  ) {
+    fields.retry_after_ms = value.retry_after_ms;
+  }
+  return fields;
 };
 
 const traceFields = (payload: JobPayload): Record<string, unknown> => {
@@ -776,11 +819,13 @@ export const runPipeline = async (
   const handleAuthCapabilityError = async (err: ProviderErrorThrowable): Promise<never> => {
     const kind = err.value.kind as 'auth' | 'capability';
     const safeMsg = err.value.message;
+    // `param` / `code` select a targeted remedy (ADR-008 D11).
     const providerNotice =
-      kind === 'capability'
+      err.value.kind === 'capability'
         ? withCapabilityRemedy(
             `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the model setting in \`.github/review-bot.yml\` (or the provider's model env var). This is not a PR-size limit.`,
             safeMsg,
+            { param: err.value.param, code: err.value.code },
           )
         : `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key.`;
     try {
@@ -828,21 +873,66 @@ export const runPipeline = async (
     // Phase 2: compute `hard_cap_in` from the provider's context window using
     // the reservation formula (chunking-stability-spec.md § Phase 2):
     //   window          = provider.capabilities.max_context_tokens
-    //   reserved_output = chunking.reserved_output_tokens   (default 4096)
+    //   reserved_output = max(chunking.reserved_output_tokens (default 4096),
+    //                         providerLimits.maxOutputTokens,   (ADR-008 D7)
+    //                         generation.max_output_tokens)     (sent instead of the cap)
     //   prompt_overhead = chunking.prompt_overhead_tokens   (default 9000)
     //   safety          = ceil(safety_fraction × window)    (default 0.07)
     //   hard_cap_in     = window − reserved_output − prompt_overhead − safety
     //
-    // Backward compat: effective budget = min(call_token_budget, hard_cap_in).
-    // When `call_token_budget` is at its default sentinel (1_000_000) the
-    // derived `hard_cap_in` dominates. When operators set a lower value, that
-    // lower value is still respected.
+    // Effective budget = min(call_token_budget, hard_cap_in,
+    // providerLimits.maxTokensPerCall). When `call_token_budget` is at its
+    // default sentinel (1_000_000) the derived `hard_cap_in` dominates; when
+    // operators set a lower value, that lower value is still respected. The
+    // adapter's per-call ceiling caps the plan so no batch is planned above
+    // what the adapter's guard accepts (ADR-008 D2; a 922K window would
+    // otherwise plan batches the 120K guard rejects and splits twice).
+    //
+    // `absoluteCapTokens`: the true-overflow threshold (replaces HARD_SAFETY_CAP_TOKENS).
+    // A file whose single-file estimate exceeds this value CANNOT fit even alone:
+    // the context window minus required non-content overhead, bounded by the
+    // adapter's per-call ceiling (a solo batch above it is rejected by the guard
+    // on every retry). Files over `effectiveBudget` but under `absoluteCapTokens`
+    // get their own batch; only files over `absoluteCapTokens` go to `skippedFiles`.
+    // Per chunking-stability-spec.md § Phase 2 "HARD_SAFETY_CAP_TOKENS replaced".
     const window = deps.provider.capabilities.max_context_tokens;
-    const reservedOutput = chunking.reserved_output_tokens;
     const promptOverhead = chunking.prompt_overhead_tokens;
     const safety = Math.ceil(chunking.safety_fraction * window);
-    const hard_cap_in = window - reservedOutput - promptOverhead - safety;
-    const effectiveBudget = Math.min(chunking.call_token_budget, hard_cap_in);
+    const maxTokensPerCall = deps.providerLimits?.maxTokensPerCall ?? Number.POSITIVE_INFINITY;
+    const requestedReservedOutput = Math.max(
+      chunking.reserved_output_tokens,
+      deps.providerLimits?.maxOutputTokens ?? 0,
+      deps.config.generation.max_output_tokens ?? 0,
+    );
+    const budgetsFor = (reservedOutput: number) => ({
+      hard_cap_in: window - reservedOutput - promptOverhead - safety,
+      absoluteCapTokens: Math.min(window - reservedOutput - promptOverhead, maxTokensPerCall),
+    });
+    let { hard_cap_in, absoluteCapTokens } = budgetsFor(requestedReservedOutput);
+    if (
+      requestedReservedOutput > chunking.reserved_output_tokens &&
+      (hard_cap_in <= 0 || absoluteCapTokens <= 0)
+    ) {
+      // An output cap the window cannot hold (e.g. OPENAI_MAX_OUTPUT_TOKENS=128000
+      // on a 128K model) leaves no input budget, and every file would be skipped
+      // silently. Plan with the repo's own reservation instead and say so; a
+      // non-positive budget even then is a config problem left as it was.
+      // Counts and key names only (G-1).
+      ({ hard_cap_in, absoluteCapTokens } = budgetsFor(chunking.reserved_output_tokens));
+      logger.emit('pipeline.budget.output_cap_exceeds_window', {
+        ...trace,
+        level: 'warn',
+        window,
+        reserved_output_requested: requestedReservedOutput,
+        reserved_output_applied: chunking.reserved_output_tokens,
+        hard_cap_in,
+        absolute_cap_tokens: absoluteCapTokens,
+      });
+      allNotes.push(
+        "The output token cap (`OPENAI_MAX_OUTPUT_TOKENS` or the provider's equivalent, or `generation.max_output_tokens`) leaves no input budget in the model's context window; batches were planned with `chunking.reserved_output_tokens` instead. Lower the cap.",
+      );
+    }
+    const effectiveBudget = Math.min(chunking.call_token_budget, hard_cap_in, maxTokensPerCall);
 
     // The tokenizer family comes from the provider's capabilities (set by each
     // adapter: anthropic→'anthropic-approx', openai→'o200k'/'cl100k', copilot→'cl100k').
@@ -855,14 +945,6 @@ export const runPipeline = async (
     // schema that the adapter will send on the wire.
     const buildInputForBatch = (files: PrefilteredFile[]): ProviderReviewInput =>
       buildProviderInput(files, deps.config, deps.provider.name, allNotes, resolvedGuidance);
-
-    // `absoluteCapTokens`: the true-overflow threshold (replaces HARD_SAFETY_CAP_TOKENS).
-    // A file whose single-file estimate exceeds this value CANNOT fit even alone
-    // (the context window minus required non-content overhead). Files over
-    // `effectiveBudget` but under `absoluteCapTokens` get their own batch;
-    // only files over `absoluteCapTokens` go to `skippedFiles`.
-    // Per chunking-stability-spec.md § Phase 2 "HARD_SAFETY_CAP_TOKENS replaced".
-    const absoluteCapTokens = window - reservedOutput - promptOverhead;
 
     const batchPlan = planBatches(prefilter.files, {
       callTokenBudget: effectiveBudget,
@@ -1003,6 +1085,7 @@ export const runPipeline = async (
             provider: deps.provider.name,
             message: batchErr.value.message,
             retry_depth: retryDepth,
+            ...providerErrorDetailFields(batchErr.value),
           });
 
           if (kind === 'output_truncated') {
@@ -1421,6 +1504,7 @@ export const runPipeline = async (
         provider: deps.provider.name,
         message: err.value.message,
         ...(err.value.retryable !== undefined ? { retryable: err.value.retryable } : {}),
+        ...providerErrorDetailFields(err.value),
       };
       logger.emit('provider.error', providerErrorLogFields);
       if (kind === 'schema_validation') {
@@ -1503,7 +1587,7 @@ export const runPipeline = async (
 
     if (isReasoning && resolvedModelName !== undefined) {
       // Build the reasoning-model notice text.
-      const reasoningNotice = `ℹ️ Review produced no findings. The configured model (\`${resolvedModelName}\`) is a reasoning model and may be under-producing with this review flow. If you expected findings, try \`openai/gpt-4.1\`, or set \`OPENAI_TOOL_CHOICE=required\`. See docs/model-compatibility.md.`;
+      const reasoningNotice = `ℹ️ ${reasoningModelNoFindingsNotice(resolvedModelName)}`;
 
       const publication = await publishSummaryOnly({
         payload,

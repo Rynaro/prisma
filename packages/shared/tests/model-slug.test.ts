@@ -234,6 +234,21 @@ describe('isReasoningModel', () => {
     expect(isReasoningModel('o4-mini')).toBe(true);
   });
 
+  // GPT-6 compat spec AS-2: the GPT-6 / GPT-6.1 family and the chat-latest alias.
+  it('gpt-6-astra/sol/luna and gpt-6.1-sol are reasoning models', () => {
+    for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol', 'GPT-6-ASTRA']) {
+      expect(isReasoningModel(model)).toBe(true);
+    }
+  });
+
+  it('chat-latest matches exactly, not as a prefix', () => {
+    expect(isReasoningModel('chat-latest')).toBe(true);
+    expect(isReasoningModel('CHAT-LATEST')).toBe(true);
+    expect(isReasoningModel('chat-latest-2026')).toBe(false);
+    expect(isReasoningModel('chat-latestx')).toBe(false);
+    expect(isReasoningModel('gpt-4o')).toBe(false);
+  });
+
   // Classic-family models: should return false
   it('gpt-4o is NOT a reasoning model', () => {
     expect(isReasoningModel('gpt-4o')).toBe(false);

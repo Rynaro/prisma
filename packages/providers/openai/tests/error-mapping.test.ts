@@ -69,7 +69,8 @@ describe('mapOpenAIError', () => {
     expect(mapped.kind).toBe('capability');
   });
 
-  // T14: 429 insufficient_quota → rate_limit
+  // T14: 429 insufficient_quota → rate_limit, not retryable (ADR-008 D11:
+  // quota exhaustion does not clear by waiting).
   it('maps HTTP 429 insufficient_quota to rate_limit', () => {
     const mapped = mapOpenAIError({
       status: 429,
@@ -77,7 +78,7 @@ describe('mapOpenAIError', () => {
       error: { code: 'insufficient_quota' },
     });
     expect(mapped.kind).toBe('rate_limit');
-    expect(mapped.retryable).toBe(true);
+    expect(mapped.retryable).toBe(false);
   });
 
   // T15: secret scrub
@@ -119,5 +120,103 @@ describe('mapOpenAIError', () => {
       error: { type: 'invalid_request_error' },
     });
     expect(mapped.kind).toBe('capability');
+  });
+  // ── ADR-008 D11: GPT-6 rejections (research digest § 13 verbatim strings) ──
+
+  it('maps a 400 unsupported_value on reasoning_effort to capability carrying param and code', () => {
+    const mapped = mapOpenAIError({
+      status: 400,
+      message:
+        "Unsupported value: 'reasoning_effort' does not support 'none' with this model. Supported values are: 'low', 'medium', 'high', and 'xhigh'.",
+      error: {
+        type: 'invalid_request_error',
+        param: 'reasoning_effort',
+        code: 'unsupported_value',
+      },
+    });
+    expect(mapped).toMatchObject({
+      kind: 'capability',
+      param: 'reasoning_effort',
+      code: 'unsupported_value',
+    });
+  });
+
+  it('maps a 400 unsupported temperature (code null) to capability with param and no code', () => {
+    const mapped = mapOpenAIError({
+      status: 400,
+      message: "Unsupported parameter: 'temperature' is not supported with this model.",
+      error: { type: 'invalid_request_error', param: 'temperature', code: null },
+    });
+    expect(mapped.kind).toBe('capability');
+    if (mapped.kind !== 'capability') throw new Error('unreachable');
+    expect(mapped.param).toBe('temperature');
+    expect('code' in mapped).toBe(false);
+  });
+
+  it('maps the chat max_tokens rejection to capability with param max_tokens', () => {
+    const mapped = mapOpenAIError({
+      status: 400,
+      message:
+        "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
+      error: { type: 'invalid_request_error', param: 'max_tokens', code: 'unsupported_parameter' },
+    });
+    expect(mapped).toMatchObject({
+      kind: 'capability',
+      param: 'max_tokens',
+      code: 'unsupported_parameter',
+    });
+  });
+
+  it('maps the chat+tools rejection to capability with param reasoning_effort and no code', () => {
+    const mapped = mapOpenAIError({
+      status: 400,
+      message:
+        "Function tools with reasoning_effort are not supported for gpt-6-astra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+      error: { type: 'invalid_request_error', param: 'reasoning_effort', code: null },
+    });
+    expect(mapped.kind).toBe('capability');
+    if (mapped.kind !== 'capability') throw new Error('unreachable');
+    expect(mapped.param).toBe('reasoning_effort');
+    expect('code' in mapped).toBe(false);
+  });
+
+  it('maps a 400 code unsupported_parameter to capability even with a neutral message', () => {
+    const mapped = mapOpenAIError({
+      status: 400,
+      message: 'bad request',
+      error: { code: 'unsupported_parameter', param: 'store' },
+    });
+    expect(mapped).toMatchObject({
+      kind: 'capability',
+      param: 'store',
+      code: 'unsupported_parameter',
+    });
+  });
+
+  it('maps a 429 insufficient_quota to a non-retryable rate_limit without retry_after_ms', () => {
+    const mapped = mapOpenAIError({
+      status: 429,
+      message: 'You exceeded your current quota, please check your plan and billing details.',
+      headers: { 'retry-after': '20' },
+      error: { type: 'insufficient_quota', code: 'insufficient_quota' },
+    });
+    expect(mapped.kind).toBe('rate_limit');
+    expect(mapped.retryable).toBe(false);
+    expect('retry_after_ms' in mapped).toBe(false);
+  });
+
+  it('maps a 503 with Retry-After to a retryable transport carrying retry_after_ms', () => {
+    const mapped = mapOpenAIError({
+      status: 503,
+      message: 'The server is overloaded. Please retry after a short wait.',
+      headers: { 'retry-after': '3' },
+      error: { type: 'service_unavailable_error', code: 'server_is_overloaded' },
+    });
+    expect(mapped).toEqual({
+      kind: 'transport',
+      message: 'The server is overloaded. Please retry after a short wait.',
+      retryable: true,
+      retry_after_ms: 3000,
+    });
   });
 });

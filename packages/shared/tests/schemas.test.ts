@@ -10,6 +10,7 @@ import {
   MAX_INSTRUCTION_BLOCK_BYTES,
   MAX_PATH_INSTRUCTIONS,
   NormalizedFindingSchema,
+  ProviderErrorSchema,
   ProviderOptionsSchema,
   ProviderRespondInputSchema,
   ProviderRespondOutputSchema,
@@ -1274,6 +1275,41 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
       expect(ProviderRespondOutputSchema.safeParse({ reply_markdown: 'ok' }).success).toBe(true);
       expect(ProviderRespondOutputSchema.safeParse({ reply_markdown: '' }).success).toBe(false);
       expect(ProviderRespondOutputSchema.safeParse({}).success).toBe(false);
+    });
+  });
+  // ── ProviderError additive fields (ADR-008 D11) ─────────────────────────────
+
+  describe('ProviderErrorSchema — capability param/code and transport retry_after_ms', () => {
+    it('round-trips capability.param', () => {
+      const value = { kind: 'capability', message: 'rejected', param: 'temperature' } as const;
+      expect(ProviderErrorSchema.parse(value)).toEqual(value);
+      expect(ProviderErrorSchema.safeParse({ ...value, param: '' }).success).toBe(false);
+    });
+
+    it('round-trips capability.code', () => {
+      const value = { kind: 'capability', message: 'rejected', code: 'unsupported_value' } as const;
+      expect(ProviderErrorSchema.parse(value)).toEqual(value);
+      expect(ProviderErrorSchema.safeParse({ ...value, code: '' }).success).toBe(false);
+    });
+
+    it('round-trips transport.retry_after_ms', () => {
+      const value = {
+        kind: 'transport',
+        message: 'overloaded',
+        retryable: true,
+        retry_after_ms: 3000,
+      } as const;
+      expect(ProviderErrorSchema.parse(value)).toEqual(value);
+      expect(ProviderErrorSchema.safeParse({ ...value, retry_after_ms: -1 }).success).toBe(false);
+    });
+
+    it('keeps the variants strict: the new keys are not accepted on other variants', () => {
+      expect(
+        ProviderErrorSchema.safeParse({ kind: 'auth', message: 'x', param: 'temperature' }).success,
+      ).toBe(false);
+      expect(
+        ProviderErrorSchema.safeParse({ kind: 'transport', message: 'x', code: 'c' }).success,
+      ).toBe(false);
     });
   });
 });

@@ -43,19 +43,27 @@ const KNOWN_PROVIDERS = new Set(['openai', 'anthropic', 'copilot', 'fake']);
 
 /**
  * `REASONING_MODEL_RE` — regex that identifies OpenAI reasoning-family models
- * (o-series and gpt-5+) from a bare model identifier (no `provider/` prefix).
+ * (o-series, gpt-5+ and `chat-latest`) from a bare model identifier (no
+ * `provider/` prefix).
  *
- * Pattern rationale — same as `NEWER_MODEL_RE` in
- * `packages/providers/openai/src/index.ts`:
+ * Pattern rationale:
  *   - `o[1-9]`       — o-series: o1, o3, o4, o4-mini, …
- *   - `gpt-[5-9]`    — gpt-5, gpt-5.4-nano, gpt-6, …
+ *   - `gpt-[5-9]`    — gpt-5, gpt-5.4-nano, gpt-6, gpt-6-astra, gpt-6.1-sol, …
  *   - `gpt-\d{2,}`   — gpt-10, gpt-11, … (future two-digit major versions)
+ *   - `chat-latest$` — the moving `chat-latest` alias (currently a GPT-6
+ *                      snapshot). Matched EXACTLY: the `$` anchors the end, so
+ *                      `chat-latest-2026` and `chat-latestx` do not match.
  *
  * Classic models (`gpt-4o`, `gpt-4`, `gpt-4.1`, `gpt-3.5-turbo`) do NOT
  * match: `gpt-4` has a single-digit major ≤ 4; `gpt-4o` has a letter suffix.
  *
  * Anchored at the start to avoid false positives in suffix tokens.
  * The `i` flag is defensive for mixed-case API identifiers.
+ *
+ * This is the ONE family predicate (GPT-6 compat spec § 6 G-2): token param,
+ * `tool_choice`, endpoint (`/responses`), tokenizer, default output cap,
+ * sampling strip, the reasoning nudge and the empty-review notice all key off
+ * it. No other regex may decide any of those.
  *
  * References:
  *   - OpenAI reasoning model docs: https://platform.openai.com/docs/guides/reasoning
@@ -64,12 +72,12 @@ const KNOWN_PROVIDERS = new Set(['openai', 'anthropic', 'copilot', 'fake']);
  *     skip reasoning and emit an empty call. Detected models use
  *     `tool_choice: 'required'` instead.
  */
-const REASONING_MODEL_RE = /^(o[1-9]|gpt-(?:[5-9]|\d{2,}))/i;
+const REASONING_MODEL_RE = /^(o[1-9]|gpt-(?:[5-9]|\d{2,})|chat-latest$)/i;
 
 /**
  * `isReasoningModel` — returns `true` when `model` belongs to the OpenAI
- * reasoning family (o-series or gpt-5+) that requires `tool_choice: 'required'`
- * rather than a forced-specific function call.
+ * reasoning family (o-series, gpt-5+ or `chat-latest`) that requires
+ * `tool_choice: 'required'` rather than a forced-specific function call.
  *
  * This is the **single source of truth** for the reasoning-family classification.
  * Both the OpenAI adapter (`resolveToolChoice`) and the orchestrator
@@ -80,8 +88,9 @@ const REASONING_MODEL_RE = /^(o[1-9]|gpt-(?:[5-9]|\d{2,}))/i;
  *                is responsible for stripping the prefix via `parseModelSlug`
  *                before calling this function.
  *
- * @returns `true`  for o1, o3, o4-mini, gpt-5, gpt-5.4-nano, gpt-6, gpt-10, …
- *          `false` for gpt-4o, gpt-4.1, gpt-4, gpt-3.5-turbo, …
+ * @returns `true`  for o1, o3, o4-mini, gpt-5, gpt-5.4-nano, gpt-6, gpt-6-astra,
+ *                   gpt-6.1-sol, gpt-10, chat-latest, …
+ *          `false` for gpt-4o, gpt-4.1, gpt-4, gpt-3.5-turbo, chat-latest-2026, …
  *
  * Exported from `@prisma-bot/shared` so every package that needs the
  * classification imports from one place.

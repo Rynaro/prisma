@@ -53,6 +53,7 @@ export type {
   OrchestratorHooks,
   OrchestratorResult,
   PipelineLogger,
+  ProviderLimits,
   RepoIdentity,
   RepoLookup,
   SnapshotterCall,

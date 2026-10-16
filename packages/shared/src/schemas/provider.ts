@@ -274,6 +274,11 @@ export const ProviderErrorSchema = z.discriminatedUnion('kind', [
   z
     .object({
       kind: z.literal('transport'),
+      /**
+       * Server-requested back-off from a `Retry-After` header on a 5xx (e.g.
+       * OpenAI 503 `server_is_overloaded`). Optional and additive (ADR-008 D11).
+       */
+      retry_after_ms: z.number().int().nonnegative().optional(),
       ...ProviderErrorBase,
     })
     .strict(),
@@ -294,6 +299,17 @@ export const ProviderErrorSchema = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('capability'),
       missing_capability: z.string().min(1).optional(),
+      /**
+       * The vendor's name for the rejected request field (OpenAI `error.param`,
+       * e.g. `reasoning_effort`, `temperature`). Keys the operator remedy text.
+       * Optional and additive (ADR-008 D11).
+       */
+      param: z.string().min(1).optional(),
+      /**
+       * The vendor's error code (OpenAI `error.code`, e.g. `unsupported_value`).
+       * Gates the remedy text alongside `param`. Optional and additive (ADR-008 D11).
+       */
+      code: z.string().min(1).optional(),
       ...ProviderErrorBase,
     })
     .strict(),

@@ -104,14 +104,14 @@ prisma ships with three production-ready provider adapters and one boot-only stu
 
 1. If `ANTHROPIC_API_KEY` is set → `AnthropicProvider` (the OQ-1 reference adapter at `packages/providers/anthropic`).
 2. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (per ADR-004; targets the GitHub Models inference endpoint at `https://models.github.ai/inference/chat/completions` over an OpenAI-compatible chat-completions surface).
-3. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (per ADR-005; targets the OpenAI `/chat/completions` endpoint at `https://api.openai.com/v1/chat/completions`. The only adapter that honors a deterministic `seed` and a per-request model override via `request_shaping`).
+3. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (per ADR-005; targets `/chat/completions` for classic models and `/responses` for reasoning models (ADR-007), under `https://api.openai.com/v1`. The only adapter that honors a deterministic `seed` and a per-request model override via `request_shaping`).
 4. Else → `FakeProvider({ script: [] })` (the worker boots and logs `worker.started` but every real job fails terminal — this is the dev-stub posture, not a production posture).
 
 **Set exactly one** of the keys for production-equivalent behavior. If more than one is set, the highest-precedence wins (Anthropic, then Copilot, then OpenAI); the operator must explicitly unset it to switch vendors. The chosen vendor is observable via the `worker.provider.selected` log event.
 
 Optional OpenAI overrides (consumed only when `OPENAI_API_KEY` is set):
 
-- `OPENAI_MODEL` — defaults to `gpt-4o`.
+- `OPENAI_MODEL` — defaults to `gpt-6-luna` (was `gpt-4o`; see [model-compatibility.md](model-compatibility.md#default-model)).
 - `OPENAI_BASE_URL` — defaults to `https://api.openai.com/v1`. Useful for re-targeting at Azure OpenAI or a proxy gateway without code changes (per ADR-005 § Decision).
 
 (Listed by precedence above, Copilot is tried before OpenAI.) Optional Copilot overrides (consumed only when `COPILOT_API_KEY` is set):

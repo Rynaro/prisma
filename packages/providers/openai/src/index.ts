@@ -56,6 +56,7 @@ export type TokenParamStyle = 'auto' | 'max_tokens' | 'max_completion_tokens';
  *   - `o[1-9]`        — o-series reasoning models: o1, o3, o4, …
  *   - `gpt-[5-9]`     — gpt-5, gpt-6, … (gpt-5.4-nano matches on the `5`)
  *   - `gpt-\d{2,}`    — gpt-10, gpt-11, … (future two-digit major versions)
+ *   - `chat-latest`   — the moving alias, matched exactly
  *
  * Classic models (`gpt-4o`, `gpt-4`, `gpt-4.1`, `gpt-3.5-turbo`) return
  * `max_tokens`; the regex anchored at start avoids suffix false positives.
@@ -550,13 +551,110 @@ export function applyProviderOptions(
   return { args: merged, droppedNotes };
 }
 
+// ---------------------------------------------------------------------------
+// Sampling parameters on reasoning models — GPT-6 compat D4
+// ---------------------------------------------------------------------------
+
+/**
+ * `SAMPLING_KEYS_STRIPPED` — the normalized `generation` sampling keys that
+ * `review()` / `respond()` withhold from a reasoning-family model whose
+ * effective reasoning effort is not `'none'` (see `shouldStripSampling`).
+ *
+ * These keys are NOT added to `OPENAI_PASSTHROUGH_DENYLIST`: a
+ * `provider_options.openai.temperature` / `top_p` is the operator addressing
+ * the wire directly and always rides through.
+ *
+ * Exported so tests can assert against the set directly.
+ */
+export const SAMPLING_KEYS_STRIPPED = ['temperature', 'top_p'] as const;
+
+/**
+ * `resolveExplicitReasoningEffort` — the reasoning effort an operator set
+ * explicitly in the raw `provider_options.openai` bag, or `undefined` when the
+ * model's own default applies.
+ *
+ * Precedence mirrors `toResponsesArgs` (native wins, ADR-007 D3):
+ *   1. `bag.reasoning` is a plain object with a string `effort` → that value;
+ *   2. else `bag.reasoning_effort` is a string → that value;
+ *   3. else `undefined`.
+ *
+ * The value is read, never rewritten (GPT-6 compat spec § 6 G-8).
+ *
+ * Exported for direct unit-testing.
+ */
+export function resolveExplicitReasoningEffort(
+  bag: Record<string, unknown> | undefined,
+): string | undefined {
+  if (typeof bag !== 'object' || bag === null) return undefined;
+  const native = bag.reasoning;
+  if (typeof native === 'object' && native !== null && !Array.isArray(native)) {
+    const effort = (native as Record<string, unknown>).effort;
+    if (typeof effort === 'string') return effort;
+  }
+  const legacy = bag.reasoning_effort;
+  return typeof legacy === 'string' ? legacy : undefined;
+}
+
+/**
+ * `shouldStripSampling` — whether the normalized `generation.temperature` /
+ * `generation.top_p` must be withheld from a request.
+ *
+ * ## Why
+ *
+ * Reasoning-family models reject `temperature` / `top_p` with HTTP 400 at any
+ * reasoning effort other than `'none'`. `generation` is the vendor-neutral
+ * config surface, so a repo that sets `temperature: 0.2` must not start
+ * failing because `OPENAI_MODEL` moved to a reasoning model.
+ *
+ * Rule: `isReasoningModel(model) && explicitEffort !== 'none'` (strict
+ * equality; an implicit effort is the model default, which is never `'none'`
+ * for the families that reject sampling). Keyed on the model predicate, not
+ * the endpoint: a classic model pinned to `/responses` keeps its sampling.
+ *
+ * Provenance is by ordering, not tracking: the strip runs on the `generation`
+ * mapping step, before `applyProviderOptions`, so a passthrough
+ * `provider_options.openai.temperature` is never stripped.
+ *
+ * Exported for direct unit-testing.
+ */
+export function shouldStripSampling(model: string, explicitEffort: string | undefined): boolean {
+  return isReasoningModel(model) && explicitEffort !== 'none';
+}
+
+/**
+ * Copy `generation.temperature` / `generation.top_p` onto the request args or,
+ * when `strip` (see `shouldStripSampling`), withhold them and record a
+ * key-only note (G-1). Shared by `review()` and `respond()`; iterates
+ * `SAMPLING_KEYS_STRIPPED` in order, so the wire key order is unchanged.
+ */
+function applyGenerationSampling(
+  args: { temperature?: number; top_p?: number },
+  generation: { temperature?: number | undefined; top_p?: number | undefined },
+  strip: boolean,
+  notes: string[],
+): void {
+  for (const key of SAMPLING_KEYS_STRIPPED) {
+    const value = generation[key];
+    if (typeof value !== 'number') continue;
+    if (strip) {
+      notes.push(`generation.${key} ignored (reasoning model)`);
+    } else {
+      args[key] = value;
+    }
+  }
+}
+
 /**
  * Default model identifier. Centralized so it can be swapped in one place.
  * Model selection is treated as configuration, not as a vendor type.
  *
- * Per spec D4: GPT-4o as default model. Operators override via `OPENAI_MODEL`.
+ * The default follows OpenAI's named replacement for the retired `gpt-4o` /
+ * `gpt-4.1` snapshots (shutdown 2027-01-14): `gpt-6-luna`, a reasoning-family
+ * model, so an unconfigured deployment routes to `/responses` (ADR-008 D9, as
+ * ratified). Operators override via `OPENAI_MODEL`; `OPENAI_MODEL=gpt-4o`
+ * restores the classic behavior until that shutdown.
  */
-export const OPENAI_DEFAULT_MODEL = 'gpt-4o';
+export const OPENAI_DEFAULT_MODEL = 'gpt-6-luna';
 
 /**
  * Default base URL for the OpenAI inference endpoint. Operators may
@@ -565,84 +663,126 @@ export const OPENAI_DEFAULT_MODEL = 'gpt-4o';
 export const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 
 // ---------------------------------------------------------------------------
-// Model → tokenizer family map (Phase 2)
+// Model → tokenizer family and input window (Phase 2; GPT-6 compat D1, D8)
 // ---------------------------------------------------------------------------
 
 /**
- * OpenAI model → `TokenizerFamily` map (Phase 2).
+ * `O200K_CLASSIC_RE` — the classic (non-reasoning) families that tokenize with
+ * `o200k_base`: `gpt-4o*`, `gpt-4.1*`, `gpt-4.5*`.
  *
- * OpenAI uses two BPE vocabularies:
- *   - `cl100k_base` (100k vocab): GPT-4 classic, GPT-3.5-turbo, text-embedding-ada-002.
- *   - `o200k_base` (200k vocab): GPT-4o family, gpt-4.1, o-series (o1/o3/o4), gpt-5*.
+ * ## Vocabulary rule, not a family classification
  *
- * Conservative choice: when the model slug is not in this map we fall back to
- * `cl100k` (the older, smaller vocab), which over-counts for o200k models —
- * that is safe (never under-counts). The spec allows this conservative default.
- *
- * Exported so adapter tests can assert the mapping directly.
+ * This regex answers ONE question — which BPE vocabulary counts tokens for a
+ * classic model — and is consulted only by `resolveOpenAITokenizerFamily`. It
+ * never decides routing, `tool_choice`, the token parameter or any notice;
+ * those key off the shared `isReasoningModel` predicate alone (GPT-6 compat
+ * spec § 6 G-2). Anchored at the start so a gateway alias that merely contains
+ * `gpt-4o` is not mistaken for it.
  */
-export const OPENAI_TOKENIZER_FAMILY_MAP: Record<string, TokenizerFamily> = {
-  // GPT-4o family — o200k_base
-  'gpt-4o': 'o200k',
-  'gpt-4o-mini': 'o200k',
-  'gpt-4o-mini-2024-07-18': 'o200k',
-  'gpt-4o-2024-05-13': 'o200k',
-  'gpt-4o-2024-08-06': 'o200k',
-  'gpt-4o-2024-11-20': 'o200k',
-  'gpt-4o-latest': 'o200k',
-  // GPT-4.1 family — o200k_base
-  'gpt-4.1': 'o200k',
-  'gpt-4.1-mini': 'o200k',
-  'gpt-4.1-nano': 'o200k',
-  // o-series reasoning models — o200k_base
-  o1: 'o200k',
-  'o1-mini': 'o200k',
-  'o1-preview': 'o200k',
-  o3: 'o200k',
-  'o3-mini': 'o200k',
-  o4: 'o200k',
-  'o4-mini': 'o200k',
-  // gpt-5* — o200k_base (future models in the gpt-5 family)
-  'gpt-5': 'o200k',
-  // GPT-4 classic family — cl100k_base
-  'gpt-4': 'cl100k',
-  'gpt-4-turbo': 'cl100k',
-  'gpt-4-turbo-preview': 'cl100k',
-  'gpt-4-0125-preview': 'cl100k',
-  'gpt-4-1106-preview': 'cl100k',
-  // GPT-3.5 — cl100k_base
-  'gpt-3.5-turbo': 'cl100k',
-  'gpt-3.5-turbo-16k': 'cl100k',
-  'gpt-3.5-turbo-0125': 'cl100k',
-  'gpt-3.5-turbo-1106': 'cl100k',
-};
+const O200K_CLASSIC_RE = /^gpt-4(o|\.1|\.5)/i;
 
 /**
  * Resolve the `TokenizerFamily` for a given OpenAI model slug.
- * Falls back to `'cl100k'` (conservative; never under-counts for unknown models).
+ *
+ * OpenAI uses two BPE vocabularies:
+ *   - `cl100k_base` (100k vocab): GPT-4 classic, GPT-3.5-turbo, text-embedding-ada-002.
+ *   - `o200k_base` (200k vocab): GPT-4o / gpt-4.1 / gpt-4.5 and every
+ *     reasoning-family model (o-series, gpt-5+, gpt-6 / gpt-6.1, `chat-latest`).
+ *
+ * Rule (GPT-6 compat D8): `isReasoningModel(model) || O200K_CLASSIC_RE` →
+ * `'o200k'`; anything else → `'cl100k'`. This replaces the former exact-match
+ * map, which sent every unlisted reasoning slug (`gpt-5.6-sol`, `gpt-6-*`,
+ * `chat-latest`) to `cl100k`.
+ *
+ * Conservative fallback: unknown slugs and gateway names stay `cl100k` (the
+ * older, smaller vocab), which over-counts for o200k models — that is safe
+ * (never under-counts).
+ *
+ * Exported so adapter tests can assert the rule directly.
  */
 export function resolveOpenAITokenizerFamily(model: string): TokenizerFamily {
-  return OPENAI_TOKENIZER_FAMILY_MAP[model] ?? 'cl100k';
+  return isReasoningModel(model) || O200K_CLASSIC_RE.test(model) ? 'o200k' : 'cl100k';
 }
 
 /**
- * `OPENAI_CAPABILITIES` — declared capability set for the OpenAI adapter.
+ * Maximum INPUT tokens per call for classic models, gpt-5.x, the o-series and
+ * any unknown slug.
+ */
+export const OPENAI_MAX_INPUT_TOKENS_DEFAULT = 128_000;
+
+/**
+ * Maximum INPUT tokens per call for the GPT-6 / GPT-6.1 family. This is the
+ * documented max input (922,000), not the 1.05M total context window: the
+ * orchestrator treats `max_context_tokens` as an input budget.
+ */
+export const OPENAI_MAX_INPUT_TOKENS_GPT6 = 922_000;
+
+/** Maximum INPUT tokens per call for the `chat-latest` alias. */
+export const OPENAI_MAX_INPUT_TOKENS_CHAT_LATEST = 272_000;
+
+/**
+ * `GPT6_WINDOW_RE` — matches the GPT-6 major and its point releases:
+ * `gpt-6`, `gpt-6.1`, `gpt-6-astra`, `gpt-6.1-sol`, … but NOT `gpt-60`.
  *
- * Key differentiator vs. Copilot: `deterministic_seed: true` — OpenAI's
- * `/chat/completions` honors an integer `seed` parameter. This is a BOOL
- * (support flag); the INT seed value travels via `ProviderRequestShaping.deterministic_seed`.
+ * ## Window rule, not a family classification
  *
- * `tokenizer_family`: defaults to `'o200k'` matching the default model `gpt-4o`.
- * Overridden at construction time via `resolveOpenAITokenizerFamily(model)`.
+ * Consulted only by `resolveOpenAIContextWindow` to pick an input ceiling. It
+ * never decides routing, `tool_choice`, the token parameter or any notice
+ * (GPT-6 compat spec § 6 G-2). Deliberately narrower than "gpt-6 and later":
+ * a future `gpt-7` window is unknown, and under-declaring (128,000) only
+ * over-chunks, whereas over-declaring risks `context_length_exceeded`.
+ */
+const GPT6_WINDOW_RE = /^gpt-6(?:\.\d+)?(?:-|$)/i;
+
+/**
+ * `resolveOpenAIContextWindow` — maximum input tokens per call for a model
+ * slug (GPT-6 compat D1). Feeds `capabilities.max_context_tokens` for the
+ * deployment model and the per-request guard in `review()` for a
+ * `request_shaping.model` override.
+ *
+ * Rule, in order:
+ *   1. `GPT6_WINDOW_RE` → `OPENAI_MAX_INPUT_TOKENS_GPT6` (922,000)
+ *   2. exactly `chat-latest` (case-insensitive) → `OPENAI_MAX_INPUT_TOKENS_CHAT_LATEST` (272,000)
+ *   3. otherwise → `OPENAI_MAX_INPUT_TOKENS_DEFAULT` (128,000) — classic,
+ *      gpt-5.x and o-series ceilings are not published, so they keep the
+ *      historical value.
+ *
+ * Exported for direct unit-testing.
+ */
+export function resolveOpenAIContextWindow(model: string): number {
+  if (GPT6_WINDOW_RE.test(model)) return OPENAI_MAX_INPUT_TOKENS_GPT6;
+  if (model.toLowerCase() === 'chat-latest') return OPENAI_MAX_INPUT_TOKENS_CHAT_LATEST;
+  return OPENAI_MAX_INPUT_TOKENS_DEFAULT;
+}
+
+/**
+ * `OPENAI_CAPABILITIES` — declared capability set for the OpenAI adapter with
+ * the default model (`OPENAI_DEFAULT_MODEL`, `gpt-6-luna`) and `apiStyle:
+ * 'auto'`. The model-dependent fields are derived from the same resolvers the
+ * constructor uses, so the literal cannot drift from the default:
+ *
+ * `deterministic_seed`: `true` only when the default model resolves to
+ * `/chat/completions`, which honors an integer `seed`; `/responses` has no
+ * seed. `false` for `gpt-6-luna`. This is a BOOL (support flag); the INT seed
+ * value travels via `ProviderRequestShaping.deterministic_seed`. A chat-routed
+ * model (e.g. `OPENAI_MODEL=gpt-4o`) reports `true` — see the constructor.
+ *
+ * `tokenizer_family`: `resolveOpenAITokenizerFamily(OPENAI_DEFAULT_MODEL)`
+ * (`'o200k'`). Overridden at construction time for the resolved model.
+ *
+ * `max_context_tokens`: maximum INPUT tokens per call,
+ * `resolveOpenAIContextWindow(OPENAI_DEFAULT_MODEL)` (922,000). Overridden at
+ * construction time for the resolved model (128,000 for classic models,
+ * 272,000 for `chat-latest`).
  *
  * Per chunking-stability-spec.md § Phase 2 "Provider capabilities".
  */
 export const OPENAI_CAPABILITIES: ProviderCapabilities = {
   structured_output: true,
   function_calling: true,
-  deterministic_seed: true,
-  max_context_tokens: 128000,
-  tokenizer_family: 'o200k',
+  deterministic_seed: resolveApiStyle(OPENAI_DEFAULT_MODEL) === 'chat',
+  max_context_tokens: resolveOpenAIContextWindow(OPENAI_DEFAULT_MODEL),
+  tokenizer_family: resolveOpenAITokenizerFamily(OPENAI_DEFAULT_MODEL),
 };
 
 /**
@@ -694,6 +834,10 @@ export interface OpenAIClientLike {
 
 export interface OpenAIProviderOptions {
   apiKey: string;
+  /**
+   * Deployment model. Defaults to `OPENAI_DEFAULT_MODEL` (`gpt-6-luna`, a
+   * reasoning-family model routed to `/responses`). Wired from `OPENAI_MODEL`.
+   */
   model?: string;
   baseUrl?: string;
   /**
@@ -708,19 +852,23 @@ export interface OpenAIProviderOptions {
   /**
    * `tokenParamStyle` — controls which token-limit parameter is sent per
    * request. Defaults to `'auto'`, which uses `resolveTokenParam`'s heuristic
-   * regex to select `max_tokens` (classic families) or `max_completion_tokens`
-   * (gpt-5* and o-series). Set to `'max_tokens'` or `'max_completion_tokens'`
-   * to override the heuristic — useful for proxy gateways that lag OpenAI's
-   * rollout or for misclassified future models.
+   * to select `max_tokens` (classic families) or `max_completion_tokens`
+   * (the reasoning family per `isReasoningModel`). Set to `'max_tokens'` or
+   * `'max_completion_tokens'` to override the heuristic — useful for proxy
+   * gateways that lag OpenAI's rollout or for misclassified future models.
    *
    * Wired from `OPENAI_TOKEN_PARAM` env var (deployment.md § Config).
    */
   tokenParamStyle?: TokenParamStyle;
   /**
-   * `maxOutputTokens` — the output token budget sent per request. Defaults to
-   * `4096`, which is byte-identical to the previous hardcoded value. Raise this
-   * for reasoning-capable models (o-series, gpt-5) that consume more completion
-   * tokens without changing any other behavior.
+   * `maxOutputTokens` — the output token budget sent per request. When unset,
+   * `resolveOpenAIDefaultMaxOutputTokens(model)` picks it per request from the
+   * family of the model that request uses (the deployment model, or a
+   * `request_shaping.model` override): `4096` for classic models
+   * (byte-identical to the previous hardcoded value) and `32768` for the
+   * reasoning family (o-series, gpt-5+,
+   * gpt-6 / gpt-6.1, `chat-latest`), whose cap includes reasoning tokens. An
+   * explicit value always wins, regardless of family.
    *
    * Wired from `OPENAI_MAX_OUTPUT_TOKENS` env var (deployment.md § Config).
    */
@@ -736,9 +884,9 @@ export interface OpenAIProviderOptions {
   toolChoiceStyle?: ToolChoiceStyle;
   /**
    * `apiStyle` controls which endpoint `review()` posts to. Defaults to
-   * `'auto'`, which sends the model families that reject function tools on
-   * `/chat/completions` (gpt-5.6*, gpt-6+) to `/responses` and leaves every
-   * other model on `/chat/completions`. `'chat'` pins the old behavior;
+   * `'auto'`, which sends every reasoning-family model (`isReasoningModel`:
+   * o-series, gpt-5+, gpt-6 / gpt-6.1, `chat-latest`) to `/responses` and leaves
+   * every other model on `/chat/completions`. `'chat'` pins the old behavior;
    * `'responses'` uses `/responses` for every model.
    *
    * Wired from OPENAI_API_STYLE env var (deployment.md - Config).
@@ -769,6 +917,7 @@ export interface OpenAIProviderOptions {
  * | `output_tokens`      | `usage.completion_tokens`                    | `usage.output_tokens`                     |
  * | `cached_input_tokens`| `usage.prompt_tokens_details.cached_tokens`  | `usage.input_tokens_details.cached_tokens`|
  * | `reasoning_tokens`   | `usage.completion_tokens_details.reasoning_tokens` | `usage.output_tokens_details.reasoning_tokens` |
+ * | `cache_write_tokens` | `usage.prompt_tokens_details.cache_write_tokens` | `usage.input_tokens_details.cache_write_tokens` |
  *
  * `reasoning_tokens` is the field that answers the operating question behind
  * issue #40: whether a large `max_output_tokens` was consumed by reasoning or
@@ -787,6 +936,8 @@ export interface OpenAIUsageTelemetry {
   output_tokens?: number;
   cached_input_tokens?: number;
   reasoning_tokens?: number;
+  /** Prompt-cache write tokens, when the endpoint reports them. */
+  cache_write_tokens?: number;
 }
 
 interface ToolCall {
@@ -951,11 +1102,15 @@ export function extractUsage(
   const reasoning =
     detail('output_tokens_details', 'reasoning_tokens') ??
     detail('completion_tokens_details', 'reasoning_tokens');
+  const cacheWrite =
+    detail('input_tokens_details', 'cache_write_tokens') ??
+    detail('prompt_tokens_details', 'cache_write_tokens');
 
   if (input !== undefined) out.input_tokens = input;
   if (output !== undefined) out.output_tokens = output;
   if (cached !== undefined) out.cached_input_tokens = cached;
   if (reasoning !== undefined) out.reasoning_tokens = reasoning;
+  if (cacheWrite !== undefined) out.cache_write_tokens = cacheWrite;
   return out;
 }
 
@@ -1041,9 +1196,11 @@ function extractMessageContent(response: unknown): string {
  * (`https://api.openai.com/v1/chat/completions`), accessed over the standard
  * OpenAI REST shape.
  *
- * Key differentiator: `deterministic_seed: true` — when the caller supplies
- * `request_shaping.deterministic_seed` (an INT), it is threaded as `seed` into
- * the request. This is the only honest basis for declaring the capability.
+ * Key differentiator: `deterministic_seed: true` for a chat-routed model (e.g.
+ * `gpt-4o`) — when the caller supplies `request_shaping.deterministic_seed`
+ * (an INT), it is threaded as `seed` into the request. This is the only honest
+ * basis for declaring the capability, so a `/responses`-routed model —
+ * including the default `gpt-6-luna` — declares `false`.
  *
  * Invariants (ADR-002, api-contracts.md § Invariants and error semantics):
  *   - Network primitive (`fetch`) is confined to `client.ts`.
@@ -1055,12 +1212,36 @@ function extractMessageContent(response: unknown): string {
  *     Event taxonomy: `provider.called` / `provider.error`).
  */
 /**
- * Default output token budget. Matches the historical hardcoded value so that
- * deployments that do not set `OPENAI_MAX_OUTPUT_TOKENS` are byte-identical in
- * behavior. Raise via `OpenAIProviderOptions.maxOutputTokens` (or the env var)
- * for reasoning-capable models that may need a larger budget.
+ * Default output token budget for classic models. Matches the historical
+ * hardcoded value so that classic deployments that do not set
+ * `OPENAI_MAX_OUTPUT_TOKENS` are byte-identical in behavior.
  */
-const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
+/**
+ * Default output token budget for reasoning-family models (GPT-6 compat D7).
+ * The cap includes reasoning tokens, so the classic 4096 truncates a
+ * medium-effort reasoning review systematically and burns split-retries.
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS_REASONING = 32_768;
+
+/**
+ * `resolveOpenAIDefaultMaxOutputTokens` — the output cap used when neither
+ * `OpenAIProviderOptions.maxOutputTokens` nor `OPENAI_MAX_OUTPUT_TOKENS` is
+ * set: `DEFAULT_MAX_OUTPUT_TOKENS_REASONING` (32,768) when `isReasoningModel`,
+ * else `DEFAULT_MAX_OUTPUT_TOKENS` (4096).
+ *
+ * The single source for both default-cap sites — this adapter (resolved per
+ * request, for the model that request uses) and the worker's chunking
+ * reservation (`providerLimits.maxOutputTokens`, for the deployment model) —
+ * so a standalone provider and a worker-built one agree (GPT-6 compat spec
+ * § 6 G-9). An explicit value always wins.
+ *
+ * Exported for direct unit-testing and for the worker.
+ */
+export function resolveOpenAIDefaultMaxOutputTokens(model: string): number {
+  return isReasoningModel(model) ? DEFAULT_MAX_OUTPUT_TOKENS_REASONING : DEFAULT_MAX_OUTPUT_TOKENS;
+}
 
 export class OpenAIProvider implements Provider {
   readonly name = OPENAI_PROVIDER_NAME;
@@ -1070,7 +1251,13 @@ export class OpenAIProvider implements Provider {
   private readonly model: string;
   private readonly maxTokensPerCall: number | undefined;
   private readonly tokenParamStyle: TokenParamStyle;
-  private readonly maxOutputTokens: number;
+  /**
+   * The explicit `maxOutputTokens` option, if any. When undefined the cap is
+   * resolved per request by `resolveOpenAIDefaultMaxOutputTokens` from the
+   * model that request uses, so a `request_shaping.model` override gets its
+   * own family's default rather than the deployment model's.
+   */
+  private readonly explicitMaxOutputTokens: number | undefined;
   private readonly toolChoiceStyle: ToolChoiceStyle;
   private readonly apiStyle: ApiStyle;
   private readonly onUsage: ((usage: OpenAIUsageTelemetry) => void) | undefined;
@@ -1080,9 +1267,14 @@ export class OpenAIProvider implements Provider {
     this.apiStyle = options.apiStyle ?? 'auto';
     // Phase 2: derive tokenizer_family from the resolved model unless the
     // caller provides explicit capabilities (e.g. tests with a mock window).
+    // GPT-6 compat D1: max_context_tokens (maximum input tokens per call)
+    // follows the same precedence — explicit capabilities win, otherwise the
+    // per-model window.
     const baseCapabilities = options.capabilities ?? OPENAI_CAPABILITIES;
     this.capabilities = {
       ...baseCapabilities,
+      max_context_tokens:
+        options.capabilities?.max_context_tokens ?? resolveOpenAIContextWindow(this.model),
       tokenizer_family:
         options.capabilities?.tokenizer_family ?? resolveOpenAITokenizerFamily(this.model),
       // Capability honesty (ADR-005 § Rationale, contributing.md § "Declare
@@ -1101,7 +1293,7 @@ export class OpenAIProvider implements Provider {
     };
     this.maxTokensPerCall = options.maxTokensPerCall;
     this.tokenParamStyle = options.tokenParamStyle ?? 'auto';
-    this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+    this.explicitMaxOutputTokens = options.maxOutputTokens;
     this.toolChoiceStyle = options.toolChoiceStyle ?? 'auto';
     this.onUsage = options.onUsage;
     if (options.client !== undefined) {
@@ -1121,30 +1313,53 @@ export class OpenAIProvider implements Provider {
   }
 
   async review(input: ProviderReviewInput): Promise<ProviderReviewOutput> {
+    // D3: resolve per-request model and seed from request_shaping (conditional-assign).
+    // Resolved before the guard so the guard can bound by THIS model's window.
+    const model = input.request_shaping?.model ?? this.model;
+    // GPT-6 compat D7: the default output cap follows the model THIS request
+    // uses; an explicit `maxOutputTokens` applies to every model.
+    const maxOutputTokens =
+      this.explicitMaxOutputTokens ?? resolveOpenAIDefaultMaxOutputTokens(model);
+
     if (this.maxTokensPerCall !== undefined) {
       // Phase 2: unified estimator — counts the SAME serialized prompt the
       // batcher counts, eliminating the HOTSPOT-2/HOTSPOT-6 divergence.
       // Phase 4: throws `over_budget` (not `capability/cost_ceiling`) so the
       // orchestrator's discriminator is a single `kind === 'over_budget'` check
       // and the batch degrades (split/skip) instead of aborting the PR.
+      // GPT-6 compat D2: the cap is also bounded by the resolved model's input
+      // window. Explicit capabilities win for the deployment model; a
+      // `request_shaping.model` override gets its own per-model window, since
+      // `capabilities` describes the deployment model only. The guard reserves
+      // the output cap this request carries (`generation.max_output_tokens`
+      // when set, else `maxOutputTokens`): for 128K-family models the window is
+      // the total context. A non-finite `maxTokensPerCall` (NaN from a
+      // malformed env value) must not disable the window bound.
+      const windowForModel =
+        model === this.model
+          ? this.capabilities.max_context_tokens
+          : resolveOpenAIContextWindow(model);
+      const requestOutputCap =
+        input.request_shaping?.generation?.max_output_tokens ?? maxOutputTokens;
+      const guardCap = Number.isFinite(this.maxTokensPerCall)
+        ? this.maxTokensPerCall
+        : Number.POSITIVE_INFINITY;
+      const inputCap = Math.min(guardCap, windowForModel - requestOutputCap);
       const estimate = estimatePromptTokens(
         serializeForEstimate(input),
         this.capabilities.tokenizer_family,
       );
-      if (estimate > this.maxTokensPerCall) {
+      if (estimate > inputCap) {
         throw new ProviderErrorThrowable({
           kind: 'over_budget',
           estimated_tokens: estimate,
-          hard_cap_in: this.maxTokensPerCall,
-          message: `request exceeds per-call token budget: estimated ${estimate} tokens, cap ${this.maxTokensPerCall}`,
+          hard_cap_in: inputCap,
+          message: `request exceeds per-call token budget: estimated ${estimate} tokens, cap ${inputCap}`,
         });
       }
     }
 
     const prompt = buildPrompt(input);
-
-    // D3: resolve per-request model and seed from request_shaping (conditional-assign)
-    const model = input.request_shaping?.model ?? this.model;
 
     // D1: select the correct token-limit parameter for the resolved model.
     // `resolveTokenParam` applies the `tokenParamStyle` override (operator escape
@@ -1184,41 +1399,51 @@ export class OpenAIProvider implements Provider {
         ]
       : prompt.messages;
 
-    // Step 1: base args — model, prompt structure, and the deployment-level
-    // output token budget (`this.maxOutputTokens`, from OPENAI_MAX_OUTPUT_TOKENS
-    // or the 4096 default).
+    // Step 1: base args — model, prompt structure, and the output token budget
+    // (`maxOutputTokens`: OPENAI_MAX_OUTPUT_TOKENS, or the family-aware default
+    // of `resolveOpenAIDefaultMaxOutputTokens` for this request's model).
     let args: OpenAIChatCompletionsArgs = {
       model,
       messages: effectiveMessages,
       tools: [prompt.tool],
       tool_choice: toolChoice,
     };
-    args[tokenParam] = this.maxOutputTokens;
+    args[tokenParam] = maxOutputTokens;
 
     const seed = input.request_shaping?.deterministic_seed;
     if (typeof seed === 'number') {
       args.seed = seed;
     }
 
+    // Key-only config notes (G7 / GPT-6 compat G-1): the sampling strip below
+    // and the denylist drops. A provider has no channel to `config_notes` yet
+    // (ADR-007 § Trade-offs), so they stay local — never logged — and are
+    // collected in one place for when that channel exists.
+    const notes: string[] = [];
+
     // Step 2: apply normalized generation settings from request_shaping.generation.
     // Spec § 5.3 (AS-5, AS-7): generation fields override the deployment default.
     // Order is defaults → generation → provider_options (last wins, P5).
     // NOTE: `generation.seed` is NOT re-read here — the orchestrator maps it into
     // `request_shaping.deterministic_seed` (single seed source, spec § 5.3/5.4).
+    // GPT-6 compat D4: `temperature` / `top_p` are withheld from a reasoning
+    // model unless the operator set the effort to `'none'` explicitly. This runs
+    // BEFORE Step 3, so a passthrough temperature still rides through.
     const generation = input.request_shaping?.generation;
     if (generation !== undefined) {
+      const stripSampling = shouldStripSampling(
+        model,
+        resolveExplicitReasoningEffort(
+          input.request_shaping?.provider_options as Record<string, unknown> | undefined,
+        ),
+      );
       if (typeof generation.max_output_tokens === 'number') {
         // Overwrite the default token budget with the repo-config value (AS-5).
         // The token-param KEY is still chosen by resolveTokenParam so the right
         // field name is used for the resolved model family.
         args[tokenParam] = generation.max_output_tokens;
       }
-      if (typeof generation.temperature === 'number') {
-        args.temperature = generation.temperature;
-      }
-      if (typeof generation.top_p === 'number') {
-        args.top_p = generation.top_p;
-      }
+      applyGenerationSampling(args, generation, stripSampling, notes);
       // generation.seed is intentionally skipped here; it arrives via
       // deterministic_seed above (spec § 5.4 "single seed source").
     }
@@ -1229,11 +1454,12 @@ export class OpenAIProvider implements Provider {
     // G7: we do NOT log any key or value from providerOptionsBag.
     const providerOptionsBag = input.request_shaping?.provider_options;
     if (providerOptionsBag !== undefined && typeof providerOptionsBag === 'object') {
-      const { args: merged } = applyProviderOptions(
+      const { args: merged, droppedNotes } = applyProviderOptions(
         args,
         providerOptionsBag as Record<string, unknown>,
       );
       args = merged;
+      notes.push(...droppedNotes);
     }
 
     // D4: select the endpoint for the resolved model. `/responses` is used for
@@ -1283,8 +1509,8 @@ export class OpenAIProvider implements Provider {
     if (isOutputTruncated(response)) {
       throw new ProviderErrorThrowable({
         kind: 'output_truncated',
-        message: `openai response truncated: the model hit the output token cap (${this.maxOutputTokens})`,
-        requested_max_tokens: this.maxOutputTokens,
+        message: `openai response truncated: the model hit the output token cap (${maxOutputTokens})`,
+        requested_max_tokens: maxOutputTokens,
       });
     }
 
@@ -1331,21 +1557,24 @@ export class OpenAIProvider implements Provider {
     const prompt = buildRespondPrompt(input);
     const model = this.model;
     const tokenParam = resolveTokenParam(model, this.tokenParamStyle);
+    const maxOutputTokens =
+      this.explicitMaxOutputTokens ?? resolveOpenAIDefaultMaxOutputTokens(model);
 
     const args: OpenAITextCompletionArgs = { model, messages: prompt.messages };
-    args[tokenParam] = this.maxOutputTokens;
+    args[tokenParam] = maxOutputTokens;
 
+    // GPT-6 compat D5: `respond()` receives no `provider_options`, so the
+    // reasoning effort is always implicit — a reasoning model never gets
+    // `temperature` / `top_p`. `seed` and the output cap are kept. Notes are
+    // key-only and stay local, exactly as in `review()`.
+    const notes: string[] = [];
     const generation = input.generation;
     if (generation !== undefined) {
+      const stripSampling = shouldStripSampling(model, undefined);
       if (typeof generation.max_output_tokens === 'number') {
         args[tokenParam] = generation.max_output_tokens;
       }
-      if (typeof generation.temperature === 'number') {
-        args.temperature = generation.temperature;
-      }
-      if (typeof generation.top_p === 'number') {
-        args.top_p = generation.top_p;
-      }
+      applyGenerationSampling(args, generation, stripSampling, notes);
       if (typeof generation.seed === 'number') {
         args.seed = generation.seed;
       }
@@ -1377,8 +1606,8 @@ export class OpenAIProvider implements Provider {
       ) {
         throw new ProviderErrorThrowable({
           kind: 'output_truncated',
-          message: `openai respond output truncated: finish_reason is 'length' (output token cap: ${this.maxOutputTokens})`,
-          requested_max_tokens: this.maxOutputTokens,
+          message: `openai respond output truncated: finish_reason is 'length' (output token cap: ${maxOutputTokens})`,
+          requested_max_tokens: maxOutputTokens,
         });
       }
     }

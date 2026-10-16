@@ -15,11 +15,13 @@ import { CopilotProvider, type CopilotProviderOptions } from '@prisma-bot/provid
 import { FakeProvider } from '@prisma-bot/provider-fake';
 import {
   type ApiStyle,
+  OPENAI_DEFAULT_MODEL,
   OpenAIProvider,
   type OpenAIProviderOptions,
   type OpenAIUsageTelemetry,
   type TokenParamStyle,
   type ToolChoiceStyle,
+  resolveOpenAIDefaultMaxOutputTokens,
 } from '@prisma-bot/provider-openai';
 import {
   type JobPayload,
@@ -31,8 +33,13 @@ import {
 } from '@prisma-bot/shared';
 import IORedis from 'ioredis';
 import { type AskResult, runAsk } from './interactions.js';
-import { type RepoIdentity, type RepoLookup, runPipeline } from './pipeline/index.js';
-import { withCapabilityRemedy } from './provider-notices.js';
+import {
+  type ProviderLimits,
+  type RepoIdentity,
+  type RepoLookup,
+  runPipeline,
+} from './pipeline/index.js';
+import { reasoningModelNoFindingsNotice, withCapabilityRemedy } from './provider-notices.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
 import { fetchRepoConfig, resolvePrivilegedApproval } from './repo-config.js';
 import { resolveRepoIdentity } from './repo-identity.js';
@@ -57,7 +64,8 @@ import { resolveRepoIdentity } from './repo-identity.js';
  *      that boots and logs `worker.started` but cannot service real work
  *      until the operator configures one of the API keys.
  *
- * All adapters use `maxTokensPerCall = MAX_TOKENS_PER_PR` as a per-call input
+ * All adapters use `maxTokensPerCall = MAX_TOKENS_PER_PR` (when it parses to a
+ * positive number) as a per-call input
  * backstop (a soft cost-ceiling proxy per `docs/operational-runbooks.md`
  * § Numeric tunables). Phase 2 semantics: the guard now calls the UNIFIED
  * estimator (`estimatePromptTokens(serializeForEstimate(input), family)`) over
@@ -67,6 +75,10 @@ import { resolveRepoIdentity } from './repo-identity.js';
  * `MAX_TOKENS_PER_PR` is an optional override ceiling: if set, the effective
  * guard threshold = min(MAX_TOKENS_PER_PR, hard_cap_in). The guard still throws
  * `capability/cost_ceiling` on overage (Phase 4 reclassifies to `over_budget`).
+ * `buildProvider` also returns these limits as `providerLimits`, which the
+ * orchestrator uses to plan batches no larger than `MAX_TOKENS_PER_PR` and to
+ * reserve the adapter's resolved output cap (ADR-008 D2/D7), so the planner
+ * and the guard agree.
  * If both `ANTHROPIC_API_KEY` and `COPILOT_API_KEY` are set, Anthropic wins;
  * the operator must explicitly unset it to switch vendors. The chosen vendor
  * is observable via the `worker.provider.selected` log event.
@@ -81,16 +93,17 @@ const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? 'prisma-review-bot';
 const MAX_TOKENS_PER_PR = Number.parseInt(process.env.MAX_TOKENS_PER_PR ?? '120000', 10);
 
 /**
- * Resolve the output token budget for a given provider from env.
- *
- * Priority: provider-specific env var > `chunking.reserved_output_tokens`
- * config > fallback value (4096). The fallback is a last-resort default for
- * the static `buildProvider` call, before the per-job config is loaded; the
- * per-job config value is used when the provider is wired with config.
- *
- * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+ * `MAX_TOKENS_PER_PR` when it parsed to a finite positive number, else
+ * `undefined`. Both the adapters' `maxTokensPerCall` and the orchestrator's
+ * `providerLimits.maxTokensPerCall` are set only from this value: a malformed
+ * env value (NaN) would make every guard comparison false and disable the
+ * adapter's window bound, so the limit is omitted instead.
  */
-function resolveMaxOutputTokens(envVarName: string, fallback: number): number {
+const VALID_MAX_TOKENS_PER_PR: number | undefined =
+  Number.isFinite(MAX_TOKENS_PER_PR) && MAX_TOKENS_PER_PR > 0 ? MAX_TOKENS_PER_PR : undefined;
+
+/** An env var parsed as a positive integer, or `undefined` when unset or invalid. */
+function readPositiveIntEnv(envVarName: string): number | undefined {
   const raw = process.env[envVarName];
   if (raw !== undefined) {
     const parsed = Number.parseInt(raw, 10);
@@ -98,7 +111,26 @@ function resolveMaxOutputTokens(envVarName: string, fallback: number): number {
       return parsed;
     }
   }
-  return fallback;
+  return undefined;
+}
+
+/**
+ * Resolve the output token budget for a given provider from env.
+ *
+ * Priority: provider-specific env var (when it parses to a positive integer)
+ * > `fallback`. Nothing else is read: repo config such as
+ * `chunking.reserved_output_tokens` is not loaded when `buildProvider` runs.
+ * The resolved number is both the cap the adapter sends and, through
+ * `limitsFor` → `providerLimits.maxOutputTokens`, the output the orchestrator
+ * reserves when planning batches (reserved output = the max of
+ * `chunking.reserved_output_tokens`, this cap and `generation.max_output_tokens`;
+ * ADR-008 D7). The OpenAI arm reads its env var through `readPositiveIntEnv`
+ * instead, because its adapter resolves the default per request.
+ *
+ * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+ */
+function resolveMaxOutputTokens(envVarName: string, fallback: number): number {
+  return readPositiveIntEnv(envVarName) ?? fallback;
 }
 
 const log = (event: string, payload: Record<string, unknown> = {}): void => {
@@ -125,36 +157,63 @@ const tryGetSecret = async (
 };
 
 /**
+ * The per-call limits the orchestrator plans against. `MAX_TOKENS_PER_PR` is
+ * included only when it parsed to a positive number (a malformed env value
+ * leaves planning on `hard_cap_in` alone rather than poisoning it with NaN).
+ */
+const limitsFor = (maxOutputTokens: number): ProviderLimits => {
+  const limits: ProviderLimits = { maxOutputTokens };
+  if (VALID_MAX_TOKENS_PER_PR !== undefined) {
+    limits.maxTokensPerCall = VALID_MAX_TOKENS_PER_PR;
+  }
+  return limits;
+};
+
+/**
  * Build the `Provider` instance per the documented selection rule. When no
  * vendor key is present the worker still boots with a no-script
  * `FakeProvider`; this is documented above.
+ *
+ * Returns the adapter's configured limits alongside it (`providerLimits`),
+ * passed to every `runPipeline` call (ADR-008 D2/D7).
  */
-const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
+const buildProvider = async (
+  secretSource: SecretSource,
+): Promise<{ provider: Provider; providerLimits: ProviderLimits }> => {
   const anthropicKey = await tryGetSecret(secretSource, 'ANTHROPIC_API_KEY');
   if (anthropicKey !== undefined) {
+    // ANTHROPIC_MAX_OUTPUT_TOKENS — optional output token budget override.
+    // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
+    // finding-dense repos where the response truncates.
+    // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+    const maxOutputTokens = resolveMaxOutputTokens('ANTHROPIC_MAX_OUTPUT_TOKENS', 4096);
     const opts: AnthropicProviderOptions = {
       apiKey: anthropicKey,
-      maxTokensPerCall: MAX_TOKENS_PER_PR,
-      // ANTHROPIC_MAX_OUTPUT_TOKENS — optional output token budget override.
-      // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
-      // finding-dense repos where the response truncates.
-      // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
-      maxOutputTokens: resolveMaxOutputTokens('ANTHROPIC_MAX_OUTPUT_TOKENS', 4096),
+      maxOutputTokens,
     };
+    if (VALID_MAX_TOKENS_PER_PR !== undefined) {
+      opts.maxTokensPerCall = VALID_MAX_TOKENS_PER_PR;
+    }
     log('worker.provider.selected', { provider: 'anthropic' });
-    return new AnthropicProvider(opts);
+    return {
+      provider: new AnthropicProvider(opts),
+      providerLimits: limitsFor(maxOutputTokens),
+    };
   }
   const copilotKey = await tryGetSecret(secretSource, 'COPILOT_API_KEY');
   if (copilotKey !== undefined) {
+    // COPILOT_MAX_OUTPUT_TOKENS — optional output token budget override.
+    // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
+    // finding-dense repos where the response truncates.
+    // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
+    const maxOutputTokens = resolveMaxOutputTokens('COPILOT_MAX_OUTPUT_TOKENS', 4096);
     const opts: CopilotProviderOptions = {
       apiKey: copilotKey,
-      maxTokensPerCall: MAX_TOKENS_PER_PR,
-      // COPILOT_MAX_OUTPUT_TOKENS — optional output token budget override.
-      // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
-      // finding-dense repos where the response truncates.
-      // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
-      maxOutputTokens: resolveMaxOutputTokens('COPILOT_MAX_OUTPUT_TOKENS', 4096),
+      maxOutputTokens,
     };
+    if (VALID_MAX_TOKENS_PER_PR !== undefined) {
+      opts.maxTokensPerCall = VALID_MAX_TOKENS_PER_PR;
+    }
     const model = await tryGetSecret(secretSource, 'COPILOT_MODEL');
     if (model !== undefined) {
       opts.model = model;
@@ -164,14 +223,19 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
       opts.baseUrl = baseUrl;
     }
     log('worker.provider.selected', { provider: 'copilot' });
-    return new CopilotProvider(opts);
+    return {
+      provider: new CopilotProvider(opts),
+      providerLimits: limitsFor(maxOutputTokens),
+    };
   }
   const openaiKey = await tryGetSecret(secretSource, 'OPENAI_API_KEY');
   if (openaiKey !== undefined) {
     const opts: OpenAIProviderOptions = {
       apiKey: openaiKey,
-      maxTokensPerCall: MAX_TOKENS_PER_PR,
     };
+    if (VALID_MAX_TOKENS_PER_PR !== undefined) {
+      opts.maxTokensPerCall = VALID_MAX_TOKENS_PER_PR;
+    }
     const model = await tryGetSecret(secretSource, 'OPENAI_MODEL');
     if (model !== undefined) {
       opts.model = model;
@@ -194,12 +258,21 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
       opts.tokenParamStyle = tokenParamRaw as TokenParamStyle;
     }
     // OPENAI_MAX_OUTPUT_TOKENS — optional output token budget override.
-    // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
-    // reasoning-capable models (o-series, gpt-5) that may need a larger output
-    // window, or for finding-dense repos where the response truncates.
-    // See deployment.md § Config for the env var reference.
+    // Passed to the adapter only when set to a positive integer; it then
+    // applies to every model. Unset, the adapter resolves the family-aware
+    // default per request (ADR-008 D7: 4096 for classic models and 32768 for
+    // reasoning models — o-series, gpt-5+, gpt-6, chat-latest — whose cap also
+    // covers reasoning tokens), so a per-repo `model:` override gets its own
+    // family's default instead of the deployment model's. The orchestrator
+    // reserves the env value or the deployment model's default
+    // (`providerLimits.maxOutputTokens`). See deployment.md § Config.
     // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
-    opts.maxOutputTokens = resolveMaxOutputTokens('OPENAI_MAX_OUTPUT_TOKENS', 4096);
+    const envMaxOutputTokens = readPositiveIntEnv('OPENAI_MAX_OUTPUT_TOKENS');
+    if (envMaxOutputTokens !== undefined) {
+      opts.maxOutputTokens = envMaxOutputTokens;
+    }
+    const maxOutputTokens =
+      envMaxOutputTokens ?? resolveOpenAIDefaultMaxOutputTokens(model ?? OPENAI_DEFAULT_MODEL);
     // OPENAI_TOOL_CHOICE — optional override for the tool_choice parameter.
     // `auto` (default) applies the heuristic: `'required'` for reasoning models
     // (gpt-5*/o-series), forced-specific function object for classic models.
@@ -213,10 +286,10 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
       opts.toolChoiceStyle = toolChoiceRaw as ToolChoiceStyle;
     }
     // OPENAI_API_STYLE, an optional override for the endpoint `review()` posts to.
-    // `auto` (default) sends the model families that reject function tools on
-    // /chat/completions (gpt-5.6*, gpt-6+) to /responses and leaves every other
-    // model where it is. `chat` pins /chat/completions; `responses` uses
-    // /responses for every model.
+    // `auto` (default) sends every reasoning-family model (`isReasoningModel`:
+    // o-series, gpt-5+, gpt-6 / gpt-6.1, `chat-latest`) to /responses and leaves
+    // classic models (gpt-4o, gpt-4.1, …) on /chat/completions. `chat` pins
+    // /chat/completions; `responses` uses /responses for every model.
     // Invalid values are silently ignored and fall back to `auto`.
     // See deployment.md § Config and docs/model-compatibility.md for details.
     const apiStyleRaw = await tryGetSecret(secretSource, 'OPENAI_API_STYLE');
@@ -231,15 +304,21 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     opts.onUsage = (usage: OpenAIUsageTelemetry): void => {
       log('provider.usage', { provider: 'openai', ...usage });
     };
+    // With `OPENAI_MODEL` unset the adapter uses `OPENAI_DEFAULT_MODEL`
+    // (`gpt-6-luna`, ADR-008 D9), which routes to `/responses`; the output
+    // reservation above already follows that default.
     log('worker.provider.selected', { provider: 'openai' });
-    return new OpenAIProvider(opts);
+    return {
+      provider: new OpenAIProvider(opts),
+      providerLimits: limitsFor(maxOutputTokens),
+    };
   }
   log('worker.provider.selected', {
     provider: 'fake',
     reason:
       'no vendor API key set (ANTHROPIC_API_KEY, COPILOT_API_KEY, OPENAI_API_KEY); using FakeProvider with empty script',
   });
-  return new FakeProvider({ script: [] });
+  return { provider: new FakeProvider({ script: [] }), providerLimits: {} };
 };
 
 /**
@@ -454,7 +533,7 @@ const start = async (): Promise<void> => {
   connection.on('connect', () => log('worker.redis.connected', { redis_url: REDIS_URL }));
   connection.on('error', (err: Error) => log('worker.redis.error', { message: err.message }));
 
-  const provider = await buildProvider(secretSource);
+  const { provider, providerLimits } = await buildProvider(secretSource);
   const installationAuth = await buildInstallationAuth(secretSource);
   const repoLookup = buildRepoLookup(secretSource);
 
@@ -641,6 +720,7 @@ const start = async (): Promise<void> => {
         const result = await runPipeline(payload, {
           installationAuth,
           provider,
+          providerLimits,
           config,
           repoLookup,
           octokit,
@@ -706,7 +786,7 @@ const start = async (): Promise<void> => {
         } else if (result.outcome?.kind === 'no_findings') {
           if (result.outcome.detail?.reasoning_model_empty === true) {
             const modelName = result.outcome.detail.model;
-            replyBody = `Review produced no findings. The configured model (\`${modelName}\`) is a reasoning model and may be under-producing with this review flow. If you expected findings, try \`openai/gpt-4.1\`, or set \`OPENAI_TOOL_CHOICE=required\`. See \`docs/model-compatibility.md\`.`;
+            replyBody = reasoningModelNoFindingsNotice(modelName);
           } else {
             replyBody =
               'Review complete — no issues found. Check the **AI Code Review** check run for the full summary.';
@@ -776,10 +856,12 @@ const start = async (): Promise<void> => {
           // err.value.message is always non-empty (required by ProviderErrorSchema).
           const safeMsg = err.value.message;
           let providerReply: string;
-          if (kind === 'capability') {
+          if (err.value.kind === 'capability') {
+            // `param` / `code` select a targeted remedy (ADR-008 D11).
             providerReply = withCapabilityRemedy(
               `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the \`model\` setting in \`.github/review-bot.yml\` (or the provider's model env var). This is **not** a PR-size limit — the check run shows the same notice.`,
               safeMsg,
+              { param: err.value.param, code: err.value.code },
             );
           } else {
             providerReply = `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key. The **AI Code Review** check run shows the same notice.`;
@@ -910,6 +992,7 @@ const start = async (): Promise<void> => {
       const result = await runPipeline(payload, {
         installationAuth,
         provider,
+        providerLimits,
         config,
         repoLookup,
         octokit,
