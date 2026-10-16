@@ -1,0 +1,8 @@
+name = "gilgamesh"
+description = "Gilgamesh methodology agent; canonical content is installed under .eidolons/gilgamesh."
+developer_instructions = "Load .eidolons/gilgamesh/PERSONA.md and .eidolons/gilgamesh/SPEC.md. Eidolon display identity: Gilgamesh. Before work, load `.eidolons/cortex/agent-naming.md` and apply its task naming policy to supported display/title controls."
+# generated_by: eidolons
+# eidolons:managed model
+model = "gpt-6.1-sol"
+# eidolons:managed model_reasoning_effort
+model_reasoning_effort = "medium"

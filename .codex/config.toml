@@ -1,0 +1,5 @@
+[agents]
+# eidolons:managed default_subagent_model
+default_subagent_model = "gpt-6-luna"
+# eidolons:managed default_subagent_reasoning_effort
+default_subagent_reasoning_effort = "low"

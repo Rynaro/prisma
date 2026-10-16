@@ -4,18 +4,13 @@
 
 version: 1
 hosts:
-  wire: [claude-code]
-  shared_dispatch: false
+  wire: [claude-code, codex, copilot, cursor, opencode]
+  shared_dispatch: true
+  pointer_targets: [CLAUDE.md, AGENTS.md, .github/copilot-instructions.md]
 members:
   - name: atlas
     version: "^1.0.5"
     source: github:Rynaro/ATLAS
-  - name: spectra
-    version: "^4.2.10"
-    source: github:Rynaro/SPECTRA
-  - name: apivr
-    version: "^3.0.5"
-    source: github:Rynaro/APIVR-Delta
   - name: idg
     version: "^1.1.5"
     source: github:Rynaro/IDG
@@ -25,6 +20,15 @@ members:
   - name: vigil
     version: "^1.0.3"
     source: github:Rynaro/VIGIL
+  - name: ramza
+    version: ^1.1.0
+    source: github:Rynaro/Ramza
+  - name: vivi
+    version: ^1.4.0
+    source: github:Rynaro/Vivi
+  - name: gilgamesh
+    version: ^1.1.0
+    source: github:Rynaro/Gilgamesh
 # Optional documentation of the intended pipeline:
 # composition:
-#   pipeline: [atlas, spectra, apivr, idg]
+#   pipeline: [atlas, ramza, vivi, idg]

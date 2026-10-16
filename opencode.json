@@ -1,0 +1,65 @@
+{
+  "agent": {
+    "atlas": {
+      "permission": {
+        "task": {
+          "*": "deny",
+          "kupo": "allow",
+          "spectra": "allow",
+          "apivr": "allow"
+        }
+      }
+    },
+    "idg": {
+      "permission": {
+        "task": {
+          "*": "deny",
+          "kupo": "allow"
+        }
+      }
+    },
+    "forge": {
+      "permission": {
+        "task": {
+          "*": "deny",
+          "kupo": "allow"
+        }
+      }
+    },
+    "vigil": {
+      "permission": {
+        "task": {
+          "*": "deny",
+          "kupo": "allow"
+        }
+      }
+    },
+    "ramza": {
+      "permission": {
+        "task": {
+          "*": "deny",
+          "kupo": "allow",
+          "vivi": "allow",
+          "apivr": "allow"
+        }
+      }
+    },
+    "vivi": {
+      "permission": {
+        "task": {
+          "*": "deny",
+          "kupo": "allow",
+          "idg": "allow"
+        }
+      }
+    },
+    "gilgamesh": {
+      "permission": {
+        "task": {
+          "*": "deny",
+          "kupo": "allow"
+        }
+      }
+    }
+  }
+}
