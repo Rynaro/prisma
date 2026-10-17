@@ -19,6 +19,7 @@ import {
 import type { ProviderReviewInput } from '../../src/schemas/provider.js';
 import {
   SAFETY_MARGIN,
+  SAFETY_MARGIN_ANTHROPIC_V2,
   type SerializedPrompt,
   type TokenizerFamily,
   estimatePromptTokens,
@@ -125,6 +126,29 @@ describe('estimatePromptTokens', () => {
       const estimate = estimatePromptTokens(prompt, 'anthropic-approx');
       expect(estimate).toBeGreaterThan(0);
       expect(Number.isInteger(estimate)).toBe(true);
+    });
+  });
+
+  describe('anthropic-approx-v2 family (ADR-009 D7)', () => {
+    it('applies SAFETY_MARGIN_ANTHROPIC_V2: ceil(text.length / 4 * 1.55)', () => {
+      const prompt = serializeForEstimate(makeInput(1000));
+      const text = `${prompt.system}\n${prompt.user}\n${prompt.tool}`;
+      expect(estimatePromptTokens(prompt, 'anthropic-approx-v2')).toBe(
+        Math.ceil((text.length / 4) * 1.55),
+      );
+    });
+
+    it('is >= the legacy estimate and strictly above chars/4', () => {
+      const prompt = serializeForEstimate(makeInput(1000));
+      const text = `${prompt.system}\n${prompt.user}\n${prompt.tool}`;
+      const v2 = estimatePromptTokens(prompt, 'anthropic-approx-v2');
+      expect(v2).toBeGreaterThanOrEqual(estimatePromptTokens(prompt, 'anthropic-approx'));
+      expect(v2).toBeGreaterThan(text.length / 4);
+    });
+
+    it('pins the margins; the legacy margin is untouched', () => {
+      expect(SAFETY_MARGIN).toBe(1.15);
+      expect(SAFETY_MARGIN_ANTHROPIC_V2).toBe(1.55);
     });
   });
 

@@ -10,6 +10,7 @@ import {
   MAX_INSTRUCTION_BLOCK_BYTES,
   MAX_PATH_INSTRUCTIONS,
   NormalizedFindingSchema,
+  ProviderCapabilitiesSchema,
   ProviderErrorSchema,
   ProviderOptionsSchema,
   ProviderRespondInputSchema,
@@ -1301,6 +1302,33 @@ describe('Command parser (parseMentionCandidate + parseCommand + requiresWrite)'
       } as const;
       expect(ProviderErrorSchema.parse(value)).toEqual(value);
       expect(ProviderErrorSchema.safeParse({ ...value, retry_after_ms: -1 }).success).toBe(false);
+    });
+
+    it('round-trips schema_validation.code (ADR-009 D8); empty and unknown keys rejected', () => {
+      const value = { kind: 'schema_validation', message: 'x', code: 'refusal' } as const;
+      expect(ProviderErrorSchema.parse(value)).toEqual(value);
+      expect(ProviderErrorSchema.safeParse({ ...value, code: '' }).success).toBe(false);
+      expect(ProviderErrorSchema.safeParse({ ...value, extra: 1 }).success).toBe(false);
+      expect(
+        ProviderErrorSchema.safeParse({ kind: 'schema_validation', message: 'x' }).success,
+      ).toBe(true);
+    });
+
+    it('ProviderCapabilitiesSchema accepts anthropic-approx-v2 and rejects unknown families', () => {
+      const base = {
+        structured_output: true,
+        function_calling: true,
+        deterministic_seed: false,
+        max_context_tokens: 1000,
+      };
+      expect(
+        ProviderCapabilitiesSchema.safeParse({ ...base, tokenizer_family: 'anthropic-approx-v2' })
+          .success,
+      ).toBe(true);
+      expect(
+        ProviderCapabilitiesSchema.safeParse({ ...base, tokenizer_family: 'anthropic-approx-v3' })
+          .success,
+      ).toBe(false);
     });
 
     it('keeps the variants strict: the new keys are not accepted on other variants', () => {

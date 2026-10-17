@@ -39,6 +39,7 @@ const KNOWN_PROVIDERS = new Set(['openai', 'anthropic', 'copilot', 'fake']);
 
 // ---------------------------------------------------------------------------
 // Reasoning-family detector — shared single source of truth
+// (see also the "Claude model-ID parser" banner below `isReasoningModel`)
 // ---------------------------------------------------------------------------
 
 /**
@@ -97,6 +98,61 @@ const REASONING_MODEL_RE = /^(o[1-9]|gpt-(?:[5-9]|\d{2,})|chat-latest$)/i;
  */
 export function isReasoningModel(model: string): boolean {
   return REASONING_MODEL_RE.test(model);
+}
+
+// ---------------------------------------------------------------------------
+// Claude model-ID parser — shared single source of truth (ADR-009 D1)
+// ---------------------------------------------------------------------------
+
+export interface ClaudeModelId {
+  /** Lower-cased letters: opus | sonnet | haiku | fable | mythos | … */
+  family: string;
+  major: number;
+  /** `undefined` for `claude-opus-5` and when the second group is a date. */
+  minor: number | undefined;
+}
+
+const CLAUDE_MODEL_ID_RE = /claude-([a-z]+)-(\d+)(?:-(\d+))?/i;
+const DATE_GROUP_RE = /^\d{8}$/;
+
+/**
+ * `parseClaudeModelId` — parse a Claude model ID of the form
+ * `claude-<family>-<major>[-<minor>][-<date>]`.
+ *
+ * - Unanchored and case-insensitive, so gateway/Bedrock-style prefixes
+ *   (`us.anthropic.claude-opus-5-5`) and `CLAUDE-OPUS-5-5` parse.
+ * - The family must be letters, so version-first IDs (`claude-3-5-sonnet-latest`,
+ *   `claude-3-opus-20240229`) return `undefined`.
+ * - An 8-digit group is a date, never a version: `claude-opus-4-20250514` is
+ *   `{ opus, 4, undefined }`; an 8-digit major returns `undefined`.
+ *
+ * This is the ONLY Claude family source (ADR-009 G-2). The Anthropic adapter's
+ * tool-choice mode, default output cap, context window and tokenizer family,
+ * and the orchestrator's empty-review gate, all derive from it. Do not extend
+ * `REASONING_MODEL_RE` for Claude.
+ */
+export function parseClaudeModelId(model: string): ClaudeModelId | undefined {
+  const m = CLAUDE_MODEL_ID_RE.exec(model);
+  if (m === null) return undefined;
+  const family = m[1];
+  const majorRaw = m[2];
+  const minorRaw = m[3];
+  if (family === undefined || majorRaw === undefined) return undefined;
+  if (DATE_GROUP_RE.test(majorRaw)) return undefined;
+  const minor =
+    minorRaw === undefined || DATE_GROUP_RE.test(minorRaw)
+      ? undefined
+      : Number.parseInt(minorRaw, 10);
+  return { family: family.toLowerCase(), major: Number.parseInt(majorRaw, 10), minor };
+}
+
+/**
+ * `isClaudeAdaptiveThinkingModel` — `true` for Claude 5.x and later (adaptive
+ * thinking on by default; forced `tool_choice` is rejected or skips thinking).
+ */
+export function isClaudeAdaptiveThinkingModel(model: string): boolean {
+  const parsed = parseClaudeModelId(model);
+  return parsed !== undefined && parsed.major >= 5;
 }
 
 export interface ParsedModelSlug {

@@ -7,7 +7,8 @@
 //     after Phase 2.
 //   - For cl100k / o200k: exact local count via js-tiktoken.
 //   - For anthropic-approx: fast local heuristic (chars/4 x SAFETY_MARGIN)
-//     that NEVER under-counts.
+//     that NEVER under-counts. anthropic-approx-v2 uses the wider
+//     SAFETY_MARGIN_ANTHROPIC_V2 for the Claude 5.x / Opus 4.7+ tokenizers.
 //   - serializeForEstimate(input) builds a SerializedPrompt by reusing the
 //     SAME renderers the adapters use, guaranteeing estimator <-> wire agreement.
 //
@@ -39,8 +40,10 @@ import type { ProviderReviewInput } from '../schemas/provider.js';
  * - o200k: GPT-4o family / gpt-4.1 / o-series reasoning models (o1, o3, o4, gpt-5*).
  * - anthropic-approx: Anthropic Claude family (no local BPE; uses a
  *   conservative chars/4 x SAFETY_MARGIN heuristic).
+ * - anthropic-approx-v2: Claude 5.x and Opus 4.7+ tokenizers (up to ~35% more
+ *   tokens for the same text); chars/4 x SAFETY_MARGIN_ANTHROPIC_V2 (ADR-009 D7).
  */
-export type TokenizerFamily = 'cl100k' | 'o200k' | 'anthropic-approx';
+export type TokenizerFamily = 'cl100k' | 'o200k' | 'anthropic-approx' | 'anthropic-approx-v2';
 
 /**
  * The exact serialized form of the prompt the adapter will send on the wire.
@@ -92,6 +95,11 @@ const SERIALIZED_TOOL_SCHEMA: string = JSON.stringify({
 // Using 1.15 as the floor keeps the batcher conservative (never under-count).
 export const SAFETY_MARGIN = 1.15;
 
+// Safety margin for the anthropic-approx-v2 heuristic (Claude 5.x / Opus 4.7+).
+// Those tokenizers can emit up to ~35% more tokens than the legacy one, so the
+// margin is widened to stay on the never-under-count side (ADR-009 D7).
+export const SAFETY_MARGIN_ANTHROPIC_V2 = 1.55;
+
 type EncoderFamily = 'cl100k_base' | 'o200k_base';
 
 const encoderCache = new Map<EncoderFamily, ReturnType<typeof getEncoding>>();
@@ -117,6 +125,7 @@ function getEncoder(family: EncoderFamily): ReturnType<typeof getEncoding> {
  * - For cl100k / o200k: exact local BPE count via js-tiktoken over the
  *   concatenated system+user+tool string.
  * - For anthropic-approx: ceil(chars/4 x SAFETY_MARGIN), rounded up. Never under-counts.
+ * - For anthropic-approx-v2: ceil(chars/4 x SAFETY_MARGIN_ANTHROPIC_V2), rounded up.
  *
  * @param prompt  - The serialized prompt built by serializeForEstimate.
  * @param family  - The tokenizer family for the active provider/model.
@@ -128,6 +137,10 @@ export function estimatePromptTokens(prompt: SerializedPrompt, family: Tokenizer
   if (family === 'anthropic-approx') {
     // Fast local heuristic: chars / 4 x SAFETY_MARGIN, rounded up.
     return Math.ceil((text.length / 4) * SAFETY_MARGIN);
+  }
+
+  if (family === 'anthropic-approx-v2') {
+    return Math.ceil((text.length / 4) * SAFETY_MARGIN_ANTHROPIC_V2);
   }
 
   // Exact BPE count via js-tiktoken (cl100k_base for cl100k, o200k_base for o200k).

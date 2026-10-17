@@ -317,6 +317,11 @@ export const ProviderErrorSchema = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('schema_validation'),
       zod_issues: z.array(z.string()).optional(),
+      /**
+       * Vendor-neutral sub-classification; `refusal` = the provider's safety
+       * classifier declined (ADR-009 D8). Optional and additive.
+       */
+      code: z.string().min(1).optional(),
       ...ProviderErrorBase,
     })
     .strict(),
@@ -362,7 +367,8 @@ export type ProviderError = z.infer<typeof ProviderErrorSchema>;
  * `tokenizer_family` (Phase 2): the tokenizer family to use when estimating
  * prompt tokens for this adapter's model. The orchestrator reads this to pick
  * the correct `TokenizerFamily` for `estimatePromptTokens` and `planBatches`.
- *   - anthropic adapters → `'anthropic-approx'`
+ *   - anthropic adapters → `'anthropic-approx'` (Claude 4.x and older) or
+ *     `'anthropic-approx-v2'` (Claude 5.x, Opus 4.7+; ADR-009 D7)
  *   - openai adapters → `'o200k'` or `'cl100k'` per model family
  *   - copilot adapters → `'cl100k'`
  *
@@ -378,7 +384,7 @@ export const ProviderCapabilitiesSchema = z
      * Tokenizer family for accurate prompt-token estimation (Phase 2).
      * Used by `estimatePromptTokens` in `@prisma-bot/shared/tokens/estimator`.
      */
-    tokenizer_family: z.enum(['cl100k', 'o200k', 'anthropic-approx']),
+    tokenizer_family: z.enum(['cl100k', 'o200k', 'anthropic-approx', 'anthropic-approx-v2']),
   })
   .strict();
 export type ProviderCapabilities = z.infer<typeof ProviderCapabilitiesSchema>;

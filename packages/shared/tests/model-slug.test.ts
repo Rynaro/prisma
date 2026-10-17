@@ -7,7 +7,12 @@
  * See docs/_planning/config-dx/spec.md § 7.1 and § 4.
  */
 import { describe, expect, it } from 'vitest';
-import { isReasoningModel, parseModelSlug } from '../src/model-slug.js';
+import {
+  isClaudeAdaptiveThinkingModel,
+  isReasoningModel,
+  parseClaudeModelId,
+  parseModelSlug,
+} from '../src/model-slug.js';
 
 describe('parseModelSlug', () => {
   // ── AS-1: bare name → no provider prefix ──────────────────────────────────
@@ -199,6 +204,56 @@ describe('parseModelSlug', () => {
 // ---------------------------------------------------------------------------
 // isReasoningModel — unit tests (shared single source of truth)
 // ---------------------------------------------------------------------------
+
+describe('parseClaudeModelId / isClaudeAdaptiveThinkingModel (ADR-009 D1)', () => {
+  const adaptive: Array<[string, { family: string; major: number; minor: number | undefined }]> = [
+    ['claude-opus-5-5', { family: 'opus', major: 5, minor: 5 }],
+    ['claude-sonnet-5-5', { family: 'sonnet', major: 5, minor: 5 }],
+    ['claude-haiku-5-5', { family: 'haiku', major: 5, minor: 5 }],
+    ['claude-fable-5-1', { family: 'fable', major: 5, minor: 1 }],
+    ['claude-mythos-5-1', { family: 'mythos', major: 5, minor: 1 }],
+    ['claude-opus-5', { family: 'opus', major: 5, minor: undefined }],
+    ['claude-sonnet-5', { family: 'sonnet', major: 5, minor: undefined }],
+    ['claude-fable-5', { family: 'fable', major: 5, minor: undefined }],
+    ['claude-foo-6', { family: 'foo', major: 6, minor: undefined }],
+    ['us.anthropic.claude-opus-5-5', { family: 'opus', major: 5, minor: 5 }],
+    ['CLAUDE-OPUS-5-5', { family: 'opus', major: 5, minor: 5 }],
+  ];
+  it.each(adaptive)('%s parses and is adaptive-thinking', (id, parsed) => {
+    expect(parseClaudeModelId(id)).toEqual(parsed);
+    expect(isClaudeAdaptiveThinkingModel(id)).toBe(true);
+  });
+
+  const pre5: Array<[string, { family: string; major: number; minor: number | undefined }]> = [
+    ['claude-opus-4-8', { family: 'opus', major: 4, minor: 8 }],
+    ['claude-opus-4-6', { family: 'opus', major: 4, minor: 6 }],
+    ['claude-sonnet-4-6', { family: 'sonnet', major: 4, minor: 6 }],
+    ['claude-haiku-4-5', { family: 'haiku', major: 4, minor: 5 }],
+    ['claude-opus-4-20250514', { family: 'opus', major: 4, minor: undefined }],
+    ['claude-sonnet-4-5-20250929', { family: 'sonnet', major: 4, minor: 5 }],
+    ['claude-sonnet-4.5', { family: 'sonnet', major: 4, minor: undefined }],
+  ];
+  it.each(pre5)('%s parses and is not adaptive-thinking', (id, parsed) => {
+    expect(parseClaudeModelId(id)).toEqual(parsed);
+    expect(isClaudeAdaptiveThinkingModel(id)).toBe(false);
+  });
+
+  it.each([
+    'claude-3-5-sonnet-latest',
+    'claude-3-opus-20240229',
+    'gpt-6-astra',
+    'my-alias',
+    '',
+    'claude-opus-20250514',
+  ])('%j does not parse', (id) => {
+    expect(parseClaudeModelId(id)).toBeUndefined();
+    expect(isClaudeAdaptiveThinkingModel(id)).toBe(false);
+  });
+
+  it('isReasoningModel is untouched for Claude IDs', () => {
+    expect(isReasoningModel('claude-opus-5-5')).toBe(false);
+  });
+});
 
 describe('isReasoningModel', () => {
   // Reasoning-family models: should return true
