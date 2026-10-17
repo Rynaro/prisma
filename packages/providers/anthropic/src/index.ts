@@ -70,8 +70,13 @@ export const ANTHROPIC_OUTPUT_CONFIG_DENYLIST: ReadonlySet<string> = new Set(['f
 /**
  * Default model identifier. Centralized so it can be swapped in one place.
  * Model selection is treated as configuration, not as a vendor type.
+ *
+ * ADR-009 D11: `claude-3-5-sonnet-latest` (the previous default) is retired and
+ * returns a 404; the vendor's migration guidance for Sonnet 3.x is
+ * `claude-sonnet-5-5`. Override with `ANTHROPIC_MODEL` or a repo
+ * `model: anthropic/<id>`.
  */
-export const ANTHROPIC_DEFAULT_MODEL = 'claude-3-5-sonnet-latest';
+export const ANTHROPIC_DEFAULT_MODEL = 'claude-sonnet-5-5';
 
 /** `ANTHROPIC_TOOL_CHOICE` values. `auto` = use the per-model rule (ADR-009 R1). */
 export type AnthropicToolChoiceStyle = 'auto' | 'forced' | 'unforced';

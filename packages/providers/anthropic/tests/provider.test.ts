@@ -11,6 +11,7 @@ import {
 } from '@prisma-bot/shared';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  ANTHROPIC_DEFAULT_MODEL,
   ANTHROPIC_PASSTHROUGH_DENYLIST,
   ANTHROPIC_PROVIDER_NAME,
   ANTHROPIC_TOOL_NUDGE,
@@ -72,6 +73,9 @@ describe('AnthropicProvider', () => {
     expect(provider.capabilities.structured_output).toBe(true);
     expect(provider.capabilities.function_calling).toBe(true);
     expect(provider.capabilities.max_context_tokens).toBeGreaterThan(0);
+    // ADR-009 D11/D6/D7: the default model is claude-sonnet-5-5.
+    expect(provider.capabilities.max_context_tokens).toBe(1_000_000);
+    expect(provider.capabilities.tokenizer_family).toBe('anthropic-approx-v2');
   });
 
   it('happy path: tool_use response → schema-valid ProviderReviewOutput is returned', async () => {
@@ -138,6 +142,8 @@ describe('AnthropicProvider', () => {
       name: 'ProviderErrorThrowable',
       cause_kind: 'schema_validation',
     });
+    // The default model (claude-sonnet-5-5) is on the unforced path: one retry.
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   it('client throws → mapped through mapAnthropicError and re-thrown as ProviderErrorThrowable', async () => {
@@ -261,11 +267,35 @@ describe('AnthropicProvider', () => {
   // AC1.5 regression: default maxOutputTokens is 4096 (byte-identical to pre-Phase-1)
   it('AC1.5: default maxOutputTokens is 4096 (happy-path regression)', async () => {
     const create = vi.fn().mockResolvedValue(toolUseResponse({ findings: [] }));
-    // No maxOutputTokens option → defaults to 4096.
-    const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+    // No maxOutputTokens option → defaults to 4096 for a pre-5 model.
+    const provider = new AnthropicProvider({
+      apiKey: 'k',
+      model: 'claude-haiku-4-5',
+      client: { messages: { create } },
+    });
     await provider.review(validInput);
     const callArgs = create.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(callArgs.max_tokens).toBe(4096);
+  });
+
+  it('AC1.5b: default model claude-sonnet-5-5 sends max_tokens 16384', async () => {
+    const create = vi.fn().mockResolvedValue(toolUseResponse({ findings: [] }));
+    const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+    await provider.review(validInput);
+    const callArgs = create.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.max_tokens).toBe(16384);
+  });
+
+  it('default model flip (ADR-009 D11): claude-sonnet-5-5, unforced bundle, 1M window, v2 tokenizer', async () => {
+    expect(ANTHROPIC_DEFAULT_MODEL).toBe('claude-sonnet-5-5');
+    const create = vi.fn().mockResolvedValue(toolUseResponse({ findings: [] }));
+    const provider = new AnthropicProvider({ apiKey: 'k', client: { messages: { create } } });
+    await provider.review(validInput);
+    const callArgs = create.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs.model).toBe('claude-sonnet-5-5');
+    expect(callArgs.tool_choice).toEqual({ type: 'auto', disable_parallel_tool_use: true });
+    expect(provider.capabilities.max_context_tokens).toBe(1_000_000);
+    expect(provider.capabilities.tokenizer_family).toBe('anthropic-approx-v2');
   });
 
   describe('respond()', () => {
