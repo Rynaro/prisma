@@ -27,8 +27,8 @@ provider: anthropic
 
 # Optional. Model identifier passed to the provider adapter. Left commented out
 # so newcomers do not pin a model id by accident; the adapter selects a
-# Claude 4-class model when this key is absent.
-# model: claude-4-class-model-id
+# claude-sonnet-5-5 (ANTHROPIC_DEFAULT_MODEL) when this key is absent.
+# model: anthropic/claude-sonnet-5-5
 
 # Floors applied at the publication-cap stage. `severity_floor.inline` blocks
 # `low` and `info` severities from inline comments; `confidence_floor.inline`

@@ -105,7 +105,7 @@ A GitHub App with a deterministic review pipeline. A single Fastify ingress acce
 
 **One vendor boundary, zero lock-in.** The provider stage is the only non-deterministic component; the `Provider` interface ([ADR-002](./docs/architecture-decision-records/adr-002-provider-abstraction.md)) is the single line vendor-specific code crosses. Selection at runtime by environment precedence:
 
-1. `ANTHROPIC_API_KEY` → Anthropic Claude (reference adapter)
+1. `ANTHROPIC_API_KEY` → Anthropic Claude (reference adapter; default `claude-sonnet-5-5`, see [model-compatibility.md](docs/model-compatibility.md#anthropic))
 2. `COPILOT_API_KEY` → GitHub Copilot ([ADR-004](./docs/architecture-decision-records/adr-004-copilot-provider.md))
 3. `OPENAI_API_KEY` → OpenAI ([ADR-005](./docs/architecture-decision-records/adr-005-openai-provider.md), deterministic seed support)
 4. Fallback → `FakeProvider` (deterministic; powers the no-key eval path)
