@@ -61,13 +61,13 @@ Configuration is resolved in this order; each layer overrides the previous on a 
 - **Required.** Optional.
 - **Default.** `{}` (empty — all sub-keys absent, deployment defaults apply).
 - **Validation rule (plain English).** All sub-keys are optional and independently validated:
-  - `max_output_tokens`: positive integer. Overrides the deployment-level `OPENAI_MAX_OUTPUT_TOKENS` for this repo's requests. The token parameter key (`max_tokens` vs `max_completion_tokens`) is chosen by the adapter per model family — the config need not specify which. Default when the env var is unset: 4096 classic / 32768 reasoning.
+  - `max_output_tokens`: positive integer. Overrides the deployment-level `OPENAI_MAX_OUTPUT_TOKENS` for this repo's requests. The token parameter key (`max_tokens` vs `max_completion_tokens`) is chosen by the adapter per model family — the config need not specify which. Overrides `OPENAI_MAX_OUTPUT_TOKENS` / `ANTHROPIC_MAX_OUTPUT_TOKENS` for this repo's requests. Default when the env var is unset: OpenAI 4096 classic / 32768 reasoning; Anthropic 4096 Claude 4.x and older / 16384 Claude 5.x (see `docs/model-compatibility.md` § Anthropic).
   - `temperature`: number in `[0, 2]`. Values outside this range reject the file.
   - `top_p`: number in `[0, 1]`. Values outside this range reject the file.
   - `seed`: integer (any sign). Forwarded to the adapter as a determinism hint.
   - Unknown sub-keys are warned and ignored (consistent with the outer warn-and-ignore policy).
 - **Precedence.** `provider_options` (raw passthrough) overrides `generation` (normalized) which overrides deployment-level env defaults.
-- **Vendor note.** `generation` fields are normalized and translated by each adapter to its wire dialect. In this release only the OpenAI adapter translates them. Anthropic and Copilot adapters ignore `generation`; use `provider_options` for vendor-specific knobs.
+- **Vendor note.** `generation` fields are normalized and translated by each adapter to its wire dialect. Each adapter translates the fields it honors. The OpenAI and Copilot adapters honor `max_output_tokens`, `temperature`, `top_p` and `seed`, each under that adapter's own rules (for example, OpenAI drops sampling on reasoning models; see `docs/model-compatibility.md`). The Anthropic adapter honors `max_output_tokens` only and never reads `temperature`, `top_p` or `seed`. Use `provider_options` for vendor-specific knobs.
 - **Example.**
 
   ```yaml
@@ -95,9 +95,7 @@ Configuration is resolved in this order; each layer overrides the previous on a 
       reasoning_effort: low
       service_tier: flex
     anthropic:
-      thinking:
-        type: enabled
-        budget_tokens: 1024
+      effort: medium
   ```
 
 #### Denylist (OpenAI)
@@ -115,6 +113,30 @@ The following keys are **dropped** when present in `provider_options.openai`, an
 | `response_format` | Conflicts with the function-calling structured-output path. |
 
 `max_tokens`, `max_completion_tokens`, `seed`, `temperature`, and `top_p` are **not** denylisted — overriding them via `provider_options` is the intended escape-hatch pattern.
+
+#### Denylist (Anthropic)
+
+The following keys are **dropped** when present in `provider_options.anthropic`, and a key-only config note is recorded for each dropped key. They are Prisma-managed fields, or fields that would change the data boundary or the billed model (ADR-009 D4):
+
+| Dropped key | Reason |
+|---|---|
+| `model` | Resolved from `request_shaping.model` and the deployment model; passthrough must not retarget it. |
+| `messages` | Prisma-owned prompt. |
+| `system` | Prisma-owned system prompt, including the unforced-path nudge. |
+| `tools` | Must remain the single `submit_review_findings` tool. |
+| `tool_choice` | Chosen by `ANTHROPIC_TOOL_CHOICE` and the per-model rule (ADR-009 D1). |
+| `stream` | The pipeline consumes a single response; streaming breaks extraction. |
+| `betas` | Would add beta headers. Prisma does not opt into beta features (ADR-009 D9). |
+| `mcp_servers` | Would attach external tool servers (data boundary). |
+| `container` | Would attach a code-execution container (data boundary). |
+| `fallbacks` | Would route declined requests to another model, billed at that model's rate. Server-side fallbacks are deferred (ADR-009 D9). |
+
+Two nested rules apply as well:
+
+- `provider_options.anthropic.output_config.format` is dropped (note: `provider_options.anthropic.output_config.format ignored (Prisma-managed field)`). The rest of a plain-object `output_config` is kept.
+- A flat `provider_options.anthropic.effort` maps to `output_config.effort`. A native `output_config.effort` wins over it; when both are set, the flat key is dropped with a note.
+
+Every other key goes out verbatim, including `thinking`, `temperature`, `top_p`, `top_k`, `max_tokens` (which overrides the output cap for the request), `metadata`, `service_tier` and `inference_geo`. A 400 that results from one of those keys is classified as a `capability` error and gets an Anthropic remedy (see `docs/model-compatibility.md` § Anthropic).
 
 ### thresholds
 
@@ -491,7 +513,7 @@ estimator to count the exact serialized prompt (system + diff + tool schema +
 guidance), and the budget is computed as:
 
 ```
-window                 = provider.capabilities.max_context_tokens      # e.g., 200_000 (Anthropic), 128_000 classic OpenAI, 922_000 gpt-6 family, 272_000 chat-latest
+window                 = provider.capabilities.max_context_tokens      # e.g., 1_000_000 (Anthropic Claude 4.6+ and 5.x; 200_000 for Claude 4.5 and older), 128_000 classic OpenAI, 922_000 gpt-6 family, 272_000 chat-latest
 reserved_output        = chunking.reserved_output_tokens               # default 4096
 prompt_overhead        = chunking.prompt_overhead_tokens               # default 9000
 safety                 = ceil(chunking.safety_fraction × window)       # default: ceil(0.07 × window)

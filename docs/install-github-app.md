@@ -104,10 +104,16 @@ prisma ships with three production-ready provider adapters and one boot-only stu
 
 1. If `ANTHROPIC_API_KEY` is set → `AnthropicProvider` (the OQ-1 reference adapter at `packages/providers/anthropic`).
 2. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (per ADR-004; targets the GitHub Models inference endpoint at `https://models.github.ai/inference/chat/completions` over an OpenAI-compatible chat-completions surface).
-3. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (per ADR-005; targets `/chat/completions` for classic models and `/responses` for reasoning models (ADR-007), under `https://api.openai.com/v1`. The only adapter that honors a deterministic `seed` and a per-request model override via `request_shaping`).
+3. Else if `OPENAI_API_KEY` is set → `OpenAIProvider` (per ADR-005; targets `/chat/completions` for classic models and `/responses` for reasoning models (ADR-007), under `https://api.openai.com/v1`. `seed` is sent only on the chat endpoint, not on `/responses`; see [model-compatibility.md](model-compatibility.md)).
 4. Else → `FakeProvider({ script: [] })` (the worker boots and logs `worker.started` but every real job fails terminal — this is the dev-stub posture, not a production posture).
 
 **Set exactly one** of the keys for production-equivalent behavior. If more than one is set, the highest-precedence wins (Anthropic, then Copilot, then OpenAI); the operator must explicitly unset it to switch vendors. The chosen vendor is observable via the `worker.provider.selected` log event.
+
+Optional Anthropic overrides (consumed only when `ANTHROPIC_API_KEY` is set):
+
+- `ANTHROPIC_MODEL` — defaults to `claude-sonnet-5-5`. A retired ID such as `claude-3-5-sonnet-latest` returns 404, and the review says so with a remedy (see [model-compatibility.md § Anthropic](model-compatibility.md#anthropic)).
+- `ANTHROPIC_MAX_OUTPUT_TOKENS` — defaults to 4,096 for Claude 4.x and older and 16,384 for Claude 5.x. Applies to every model when set.
+- `ANTHROPIC_TOOL_CHOICE` — `auto` (default; Claude 5.x uses the unforced request) | `forced` | `unforced`.
 
 Optional OpenAI overrides (consumed only when `OPENAI_API_KEY` is set):
 

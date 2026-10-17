@@ -1,6 +1,6 @@
 # Model Compatibility
 
-This document describes how the review bot handles different OpenAI model families, the reasoning-model compatibility considerations, and the remedies available when a model under-produces findings or the API rejects a request parameter. Facts about GPT-6 and GPT-6.1 are as published by OpenAI on 2026-10-16; the error strings quoted below come partly from public bug reports and may change wording. See [ADR-008](architecture-decision-records/adr-008-gpt6-model-family-compatibility.md) for the decisions behind them.
+This document describes how the review bot handles different OpenAI and Anthropic model families, the reasoning-model compatibility considerations, and the remedies available when a model under-produces findings or the API rejects a request parameter. The Anthropic family is in [§ Anthropic](#anthropic). Facts about GPT-6 and GPT-6.1 are as published by OpenAI on 2026-10-16; the error strings quoted below come partly from public bug reports and may change wording. See [ADR-008](architecture-decision-records/adr-008-gpt6-model-family-compatibility.md) for the decisions behind them.
 
 ## Model families
 
@@ -250,6 +250,244 @@ Two rules keep the remedy honest:
 - When a gateway behind `OPENAI_BASE_URL` returns an `unsupported_parameter` error for a `param` that is not in the table (for example `store` or `reasoning`), the summary shows the generic capability notice. No remedy is guessed.
 
 Two related provider-error changes: a 429 with `code: insufficient_quota` is reported as a non-retryable `rate_limit` error (the job queue treats it as non-transient), and a 5xx error carries `retry_after_ms` when the response had a `Retry-After` header. See `docs/observability.md` § Event taxonomy (`provider.error`).
+
+## Anthropic
+
+This section covers the Anthropic adapter (`packages/providers/anthropic`) and the Claude 5.x model family. Facts are as published by Anthropic on 2026-10-16, as collected in the research digest; the error strings are the vendor's and may change wording. The decisions behind the adapter are in [ADR-009](architecture-decision-records/adr-009-anthropic-5x-model-family-compatibility.md).
+
+The adapter picks the request shape from the parsed model ID. An ID it cannot read (an alias or a gateway name) gets the forced request, a 4,096 cap, a 200,000-token window and the larger token estimate. See [Tool choice](#tool-choice) and [Context window and token estimate](#context-window-and-token-estimate).
+
+### Model families
+
+| Model | Example ID | Input window | Default output cap | Thinking by default | Tool-choice mode (`auto`) | Tokenizer family | Notes |
+|---|---|---|---|---|---|---|---|
+| Opus 5.5 | `claude-opus-5-5` | 1,000,000 | 16,384 | Yes (adaptive) | Unforced | `anthropic-approx-v2` | Default effort `medium`. Vendor default for new code. |
+| Sonnet 5.5 | `claude-sonnet-5-5` | 1,000,000 | 16,384 | Yes (adaptive) | Unforced | `anthropic-approx-v2` | Default model (`ANTHROPIC_DEFAULT_MODEL`). Default effort `high`. |
+| Haiku 5.5 | `claude-haiku-5-5` | 1,000,000 | 16,384 | Yes (adaptive) | Unforced | `anthropic-approx-v2` | Default effort `medium`. Price steps up above 100,000 prompt tokens; see [Long-prompt pricing](#long-prompt-pricing). |
+| Fable 5.1 | `claude-fable-5-1` | 1,000,000 | 16,384 | Yes (adaptive) | Unforced | `anthropic-approx-v2` | Opt-in only. Needs 30-day data retention; ZDR organizations get `400 invalid_request_error`. Default effort `high`. |
+| Other 5.x | `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5` | 1,000,000 | 16,384 | Yes (adaptive) | Unforced | `anthropic-approx-v2` | Same rules as 5.5. Any unrecognized major version of 6 or higher gets the same treatment. |
+| Opus 4.8 / 4.7 | `claude-opus-4-8`, `claude-opus-4-7` | 1,000,000 | 4,096 | No | Forced | `anthropic-approx-v2` | Thinking is off unless the repo bag enables it, which also raises the default cap to 16,384. |
+| Opus 4.6 | `claude-opus-4-6` | 1,000,000 | 4,096 | No | Forced | `anthropic-approx` | No `xhigh` effort. |
+| Sonnet 4.6 | `claude-sonnet-4-6` | 1,000,000 | 4,096 | No | Forced | `anthropic-approx` | No `xhigh` effort. |
+| Haiku 4.5 | `claude-haiku-4-5` | 200,000 | 4,096 | No | Forced | `anthropic-approx` | Accepts no `effort`; a configured value is a 400. |
+| Claude 4.5 and older (other than the rows above) | `claude-sonnet-4-5` | 200,000 | 4,096 | No | Forced | `anthropic-approx` | Accepts no `effort`. |
+| Retired 3.x | `claude-3-5-sonnet-latest`, `claude-3-5-sonnet-20241022`, `claude-3-7-sonnet-20250219`, `claude-3-opus-20240229` | n/a | n/a | n/a | n/a | n/a | Returns `404 not_found_error`. The adapter's former default was `claude-3-5-sonnet-latest`. |
+
+"Default output cap" applies when `ANTHROPIC_MAX_OUTPUT_TOKENS` is unset (see [Output cap](#output-cap)). "Tool-choice mode" is the adapter's choice for `ANTHROPIC_TOOL_CHOICE=auto`; the override is in [ANTHROPIC_TOOL_CHOICE](#anthropic_tool_choice). A model not listed is routed by the rules above: a parseable ID is judged by its major and minor version, and an ID that cannot be parsed gets the forced request, a 4,096 cap, a 200,000-token window and the v2 estimator. Vendor deprecations recorded in the digest (for example `claude-opus-4-1`, `claude-opus-4-20250514`) are not in the table; check the vendor's deprecation page for them.
+
+### Tool choice
+
+The review call asks the model to call one tool, `submit_review_findings`. How it is asked depends on the family:
+
+- **Forced (Claude 4.x and older, and aliases).** `tool_choice: { type: 'tool', name: 'submit_review_findings' }`, the historical request. It is never retried.
+- **Unforced (Claude 5.x, and any model whose repo bag enables thinking).** `tool_choice: { type: 'auto', disable_parallel_tool_use: true }`, with three additions:
+  - the tool is sent with `strict: true`, against a wire copy of the schema that keeps only the keywords Anthropic's strict mode accepts (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `description`), with `additionalProperties: false` on every object. The shared schema is unchanged, and Zod still enforces the bounds the wire copy drops (length, range and count limits);
+  - a short instruction is appended to the system prompt, saying to call the tool exactly once and that plain text is discarded;
+  - if the response has no `submit_review_findings` call, the adapter sends the same request once more. A second miss fails the batch with the message `anthropic response did not call 'submit_review_findings' (tool_choice auto) after 1 retry`.
+
+Forced tool choice is a 400 on Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1, so the rule sends those models down the unforced path. On Haiku 5.5, forced calls skip thinking (the response starts with the tool call), so Haiku 5.5 is also unforced. `auto` does not guarantee a call, which is why the presence check and the one retry exist. Each API call emits a `provider.usage` event, so a retried batch shows two.
+
+#### ANTHROPIC_TOOL_CHOICE
+
+| Value | Behavior |
+|---|---|
+| `auto` (default) | The rule above: Claude 5.x and thinking-enabled bags get unforced; everything else forced. |
+| `forced` | Always the forced request. Do not set this on a 5.x model: it is a 400 on Opus 5.5, Sonnet 5.5 and Fable 5.1, and it skips thinking on Haiku 5.5. |
+| `unforced` | Always the unforced request. |
+
+Any other value is ignored, and the rule applies. A repo bag with a `thinking` block of type `adaptive` or `enabled` turns the unforced path on, but a bag cannot turn it off, because `tool_choice` is denylisted.
+
+**Alias recipe.** A gateway name or alias in front of a 5.x model cannot be read by its version, so the rule sends it forced. Set both:
+
+```
+ANTHROPIC_TOOL_CHOICE=unforced
+ANTHROPIC_MAX_OUTPUT_TOKENS=16384
+```
+
+The first makes the request unforced. The second sets the thinking model's cap, because an alias gets 4,096 by default.
+
+### Strict tool schema
+
+The strict wire copy is a limitation, not a change of meaning. Dropped hints (`minLength`, `maxLength`, `minimum`, `maximum`, `maxItems`) are still checked after the response, and the validator enforces the highlights cap. What changes is that the model is told fewer bounds in the schema. If Anthropic's strict mode rejects a 5.x request for a schema reason (a 400 naming `strict` or the schema), the adapter's fix is to drop `strict: true` and keep the rest of the request shape; the revert is a one-line change, and the live smoke check (below) is how to find out.
+
+### Thinking and effort
+
+Prisma never sends a `thinking` block of its own. The model's default applies:
+
+- **Claude 5.x thinks adaptively, by default.** Thinking is always on for Opus 5.5 and Fable 5.1. `thinking: { type: 'disabled' }` and `thinking: { type: 'enabled', budget_tokens }` are 400s on the 5.x family (the exact rules vary by model, and Prisma sends neither).
+- **Claude 4.8 / 4.7 / 4.6 and Haiku 4.5 do not think by default.** An operator who sets `thinking` in `provider_options.anthropic` gets whatever the vendor accepts for that model. `thinking.type: 'enabled'` is deprecated on 4.6 and is a 400 on 4.7 and 4.8.
+
+Effort is sent only when a repo sets it, as `provider_options.anthropic.effort` (mapped to `output_config.effort`) or as native `output_config.effort`, which wins if both are set. The value is forwarded as written. Model defaults apply otherwise: `medium` on Opus 5.5 and Haiku 5.5, `high` on the other models.
+
+| Effort | Opus 5.5, Opus 5, Fable 5.1, Sonnet 5.5, Sonnet 5, Haiku 5.5 | Opus 4.8, Opus 4.7 | Opus 4.6, Sonnet 4.6 | Haiku 4.5, Sonnet 4.5 |
+|---|---|---|---|---|
+| `low` | Accepted | Accepted | Accepted | Error (400) |
+| `medium` | Accepted (default on Opus 5.5 and Haiku 5.5) | Accepted | Accepted | Error (400) |
+| `high` | Accepted (default on the other 5.x models) | Accepted (default) | Accepted (default) | Error (400) |
+| `xhigh` | Accepted | Accepted | Error (400): no `xhigh` on 4.6 | Error (400) |
+| `max` | Accepted | Accepted | Accepted | Error (400) |
+
+Lower `effort` rather than starving the cap. A smaller `max_tokens` truncates thinking and findings alike; a lower effort reduces how much the model thinks. If the effort is unsupported, the request returns a 400 that gets the effort remedy below.
+
+### Sampling parameters
+
+Prisma does not send `temperature`, `top_p` or `top_k` to Claude; `generation.temperature`, `generation.top_p` and `generation.seed` are never read by the Anthropic adapter. A passthrough of these keys through `provider_options.anthropic` is forwarded, and the vendor's rules then apply:
+
+- `temperature`, `top_p` and `top_k` are removed (400) on Fable 5 and 5.1, Opus 5.5, Opus 5, Opus 4.8, Opus 4.7 and Sonnet 5.
+- On Sonnet 5.5 and Haiku 5.5, only the defaults are accepted: `temperature` must be 1, `top_p` 0.99, sending both is a 400, and any `top_k` is a 400.
+- Assistant prefill (a trailing assistant turn) is a 400 on every 4.6 and newer model.
+
+The remedy for a 400 on these keys is in the table below.
+
+### Output cap
+
+`max_tokens` is required. Its default depends on the model:
+
+| Model | Default with `ANTHROPIC_MAX_OUTPUT_TOKENS` unset | Why |
+|---|---|---|
+| Claude 5.x | 16,384 | Thinking counts toward `max_tokens`, so a 4,096 cap truncates a thinking model before it reports findings. |
+| Claude 4.x and older, aliases | 4,096 | The historical default. |
+| Any model, when the repo bag sets `thinking` to `adaptive` or `enabled` | 16,384 | Same reason. |
+
+The precedence for a request, highest first: the repo's `provider_options.anthropic.max_tokens`, then `generation.max_output_tokens`, then `ANTHROPIC_MAX_OUTPUT_TOKENS` (which applies to every model), then the table above. A non-positive or non-numeric environment value is ignored. A response that stops on `max_tokens` is reported as `output_truncated` with the cap that was requested, and the orchestrator splits the batch.
+
+The pinned SDK does not guard non-streaming requests by size. Newer SDKs refuse a non-streaming request whose expected time exceeds about ten minutes, which is roughly `max_tokens` above 21,000. The adapter does not stream, so 16,384 is the ceiling it is designed for; a larger value needs a streaming change first.
+
+The batch planner's output reservation is derived from the model and the environment, not from the repo bag. A 4.x model with a `thinking` block in the bag therefore sends 16,384 while the planner reserves 4,096. An over-budget batch then degrades to a split rather than failing silently, but the planner's reservation is short for that configuration (see [ADR-009 § Trade-offs](architecture-decision-records/adr-009-anthropic-5x-model-family-compatibility.md#trade-offs)).
+
+### Context window and token estimate
+
+Input windows are 1,000,000 tokens for Claude 5.x and for Claude 4.6 and newer, and 200,000 for Claude 4.5 and older and for IDs the adapter does not recognize. The adapter uses the window of the model each request uses, reserving that request's output cap, and the guard fails a request over `min(MAX_TOKENS_PER_PR, window − output cap)` before it is sent. `MAX_TOKENS_PER_PR` is the binding limit at the default settings.
+
+The estimate uses one of two families:
+
+- `anthropic-approx-v2` (Claude 5.x, Opus 4.7 and newer, and unknown aliases): characters ÷ 4, times 1.55. The vendor reports that Sonnet 5.5 and Haiku 5.5 count the same text as about 30% more tokens than Sonnet 4.6 and Haiku 4.5, and the Opus 4.7 tokenizer uses between 1.0× and 1.35× the older count.
+- `anthropic-approx` (Claude 4.6 and older, and version-first IDs such as `claude-3-…`): characters ÷ 4, times 1.15.
+
+Unknown aliases get the larger estimate on purpose: over-counting only makes a batch smaller. The margin is an estimate, not a measurement; a count-tokens calibration is a follow-up (ADR-009 OQ-6).
+
+Known limitation: the `@bot ask` path guards its request with characters ÷ 4 and no margin, so on a 5.x model that guard can under-count by up to about 30%. The review path is unaffected.
+
+#### Long-prompt pricing
+
+Haiku 5.5's per-token price rises by a factor of five above 100,000 prompt tokens, according to the research digest (2026-10-16). `MAX_TOKENS_PER_PR` defaults to a value above that, so set it to `95000` or lower to keep every batch in the cheaper tier. The `MAX_TOKENS_PER_PR` setting is shared with the other providers; see [deployment.md](deployment.md).
+
+### Refusals
+
+A refusal is a safety classifier declining to review. Anthropic returns it as a normal response with `stop_reason: 'refusal'` and a `stop_details.category`, not as an error. The adapter:
+
+- checks for it before reading any content, and discards partial content;
+- reports it as a `schema_validation` error with `code: 'refusal'` and the category in the message;
+- never retries it, and never reads the vendor's explanation text into a message, log or notice.
+
+The categories are an open set. The ones the digest names are `cyber`, `bio`, `frontier_llm`, `reasoning_extraction` and `general_harms`, and `none` is shown when the vendor gives no category. Source-code vulnerability review is allowed under `cyber`, but benign security tooling can be declined, and security-related diffs are the most likely to be declined.
+
+Two notices carry the refusal. Both say it is not a configuration error:
+
+> Review unavailable — the provider's safety classifier declined to review this diff (category: `cyber`). This is not a configuration error; it can happen on security-related code. Re-run the review with the bot's `review` command, or pin a different model for this repository with `model:` in `.github/review-bot.yml`.
+
+The check-run summary prefixes this with the warning sign the capability notices use. When a chunked review declines only some batches, the rest of the review is published and the declined files are listed:
+
+> Not reviewed (the provider's safety classifier declined this section; category: `cyber`): a.ts, b.ts. This is not a configuration error; re-run the review or pin a different model with `model:` in `.github/review-bot.yml`.
+
+The note has a leading space, like the other "not reviewed" notes, and names no call budget. The categories shown are the ones reported for the declined batches, deduplicated.
+
+Server-side fallbacks, which would route a declined request to another model, are deferred (ADR-009 D9). Nothing in the adapter falls back to a different model. To change the model for a repository, use `model:` in `.github/review-bot.yml`.
+
+A command reply (`review` or `ask`) that fails with a refusal carries the same notice. Known gap: the check run carries the refusal notice, but the wording of a review command's reply may still read as a completed review (ADR-009 OQ-4).
+
+### Retired IDs and the 404 remedy
+
+A model ID that Anthropic has retired returns `404 not_found_error`. Such a request is not retried. The check-run summary (or the command reply) shows the remedy below. The deployment's model is set with `ANTHROPIC_MODEL`; a repo overrides it with `model: anthropic/<id>` in `.github/review-bot.yml`.
+
+```
+ANTHROPIC_MODEL=claude-sonnet-5-5
+```
+
+A deployment that never set `ANTHROPIC_MODEL` was failing every review with a 404 on the retired default. On upgrade it runs `claude-sonnet-5-5`, with the 5.x request shape. A deployment that pinned a 4.x model in the repo keeps the 4.x behavior: forced tool choice, a 4,096 cap, and the window its family has.
+
+### Remedies
+
+The adapter maps errors by their status and error type, not by their wording. A 400 whose type is `invalid_request_error` is a `capability` error whatever its message says, and a 404 is a `capability` error too; neither is retried. A 5xx, including 529, carries `retry_after_ms` when the response has a `Retry-After` header. Any other 400 is reported as a transport error with no remedy.
+
+When a `capability` error reaches the check run or the command reply, the first matching remedy below is appended. Each remedy begins with `Remedy:`, like the OpenAI remedies. A message that matches none of them shows the generic notice.
+
+| Trigger | Remedy text |
+|---|---|
+| The error code is `not_found_error` (404) | Remedy: the configured Claude model ID was not found — it is retired or misspelled (`claude-3-5-sonnet-latest` and every Claude 3.x ID are retired). Set `ANTHROPIC_MODEL`, or `model: anthropic/<id>` in `.github/review-bot.yml`, for example `claude-sonnet-5-5`. See `docs/model-compatibility.md` § Anthropic. |
+| The message mentions `tool_choice` and "not supported" | Remedy: this model rejects forced tool choice. Prisma sends `tool_choice: auto` to Claude 5.x model IDs automatically; for an alias or gateway name in front of a Claude 5.x model, set `ANTHROPIC_TOOL_CHOICE=unforced` (and `ANTHROPIC_MAX_OUTPUT_TOKENS=16384`), and unset `ANTHROPIC_TOOL_CHOICE=forced` if it is set. |
+| The message mentions `thinking.type` | Remedy: remove `provider_options.anthropic.thinking`. Claude 5.x thinks adaptively; use `provider_options.anthropic.effort` to control depth. |
+| The message mentions `output_config.effort` or `effort` | Remedy: this model does not support the configured `effort`. Claude 5.x accepts `low`, `medium`, `high`, `xhigh` or `max`; Claude 4.6 models have no `xhigh`; Haiku 4.5 and Sonnet 4.5 accept no effort. Change or remove `provider_options.anthropic.effort` (or `output_config.effort`). See `docs/model-compatibility.md` § Anthropic. |
+| The message mentions `temperature`, `top_p` or `top_k` | Remedy: remove `temperature` / `top_p` / `top_k` from `provider_options.anthropic`; Claude 5.x rejects them (Sonnet 5.5 and Haiku 5.5 accept only the defaults). |
+| The message says "prompt is too long" | Remedy: the request exceeded the model's context window. Lower `MAX_TOKENS_PER_PR` or `chunking.call_token_budget`. |
+
+The first matching row wins, so a 404 always gets the model-ID remedy.
+
+### Empty-review notice for Claude
+
+Claude 5.x thinks before it answers. When a review of a non-trivial diff returns no findings, the check-run summary and the command reply show this notice (the check-run summary prefixes it as it does the OpenAI notice). It is emitted only when files were sent to the provider and the configured model is a thinking model:
+
+> `<model>` thinks before answering (adaptive thinking) and reported no findings. If you expected some, check the `provider.usage` log event: `output_tokens` in the low tens means the model answered without thinking — unset `ANTHROPIC_TOOL_CHOICE=forced` if set; otherwise raise `provider_options.anthropic.effort` (Opus 5.5 and Haiku 5.5 default to `medium`). See docs/model-compatibility.md § Anthropic.
+
+Read the `provider.usage` event for the review (see [Token usage](#token-usage)). `output_tokens` in the low tens means the model answered without thinking, which is the forced-choice symptom. A large count with no findings means the cap was consumed by thinking; raise `ANTHROPIC_MAX_OUTPUT_TOKENS` or the effort. The gate reads the repo's configured model only, so a repo on the deployment default, or on an alias, gets no Claude notice.
+
+### Token usage
+
+Every Anthropic review call emits a `provider.usage` log event with `provider: 'anthropic'` and `endpoint: 'messages'`, and the model that was sent. Counts only, no content:
+
+- `input_tokens` is the total prompt: the uncached input plus the cache reads and cache writes.
+- `output_tokens` includes thinking.
+- `cached_input_tokens` is the cache reads, and `cache_write_tokens` is the cache writes.
+
+A field is omitted when the response did not report it. There is no reasoning-token field for Anthropic. The event fires once per API call, before the refusal and truncation checks, so a retried batch shows two events. `respond()` (the `@bot ask` flow) does not emit it.
+
+### Live smoke check
+
+The adapter's request shape is checked against the live API by a script that is run by hand. It is never run in CI, and it is not part of `pnpm test`. It costs a few cents per run, because it sends one small seeded-bug review per model.
+
+Read the key without putting it in shell history, then run the script from the repository root after `pnpm install`:
+
+```bash
+read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
+./node_modules/.bin/tsx scripts/smoke/anthropic-models.ts
+```
+
+The default models are `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5`. Options and inputs (from `scripts/smoke/anthropic-models.ts --help`, which makes no network call):
+
+- **Models.** Positional arguments, then the comma-separated `ANTHROPIC_SMOKE_MODELS`, then the defaults. `claude-fable-5-1` is opt-in and must be named explicitly, because it needs 30-day retention and ZDR organizations get a 400 for it. A model ID may contain letters, digits, `.`, `_`, `:` and `-`, up to 100 characters.
+- **`--effort <level>`.** Sends `provider_options.anthropic.effort` for every model, which the adapter maps to `output_config.effort`.
+- **`--allow-empty`.** A review that returns zero findings does not fail the run.
+- **`-h`, `--help`.** Prints usage and exits 0.
+- **`ANTHROPIC_TOOL_CHOICE`, `ANTHROPIC_MAX_OUTPUT_TOKENS`.** Read the same way the worker reads them, so the run exercises the same configuration.
+
+A missing `ANTHROPIC_API_KEY` exits with code 2 before any call is made, and any unknown flag does too.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Every model passed. |
+| `1` | At least one model failed (`FAIL`) or returned no findings (`EMPTY`), unless `--allow-empty` covers the `EMPTY` cases. An unexpected crash of the script also exits 1. |
+| `2` | Usage error, or `ANTHROPIC_API_KEY` is not set. |
+
+The run prints a header line, one verdict line per model, and a summary. The key, the prompt, the response content, the tool input and the vendor's explanation text are never printed. A verdict line has this shape (the values here are illustrative):
+
+```
+[anthropic-smoke] claude-sonnet-5-5 PASS findings=1 calls=1 tool_choice=auto strict=true max_tokens=16384 effort=default stop_reasons=tool_use input_tokens=1234 output_tokens=567 cached_input_tokens=0 cache_write_tokens=0 elapsed_ms=8000
+[anthropic-smoke] result: 3/3 PASS
+```
+
+A green run confirms the following:
+
+- No forced-choice 400 on Opus 5.5 or Sonnet 5.5, and the unforced request bundle is accepted.
+- Strict mode accepts the stripped schema. A 400 naming `strict` or the schema is the one-line revert described under [Strict tool schema](#strict-tool-schema).
+- The 16,384 cap does not truncate the seeded review.
+- Every 400 surfaces as a `capability` error with a code.
+- Usage counts are present in the `provider.usage` sums.
+
+The refusal path cannot be triggered on purpose. The smoke input is a plain correctness bug, deliberately not security code, so it does not trip `cyber`. The refusal path is covered offline by the tests listed in ADR-009.
+
+`calls=2` on a line means the unforced retry fired for that model.
 
 ## Configuration reference
 

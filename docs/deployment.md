@@ -75,6 +75,9 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector URL (per `observability.md` § Resolution of OQ-3 (recap) and § Sampling). When unset, telemetry export is disabled but the App still functions. | `config` |
 | `LOG_LEVEL` | Default log verbosity for `packages/shared/audit-log`; one of `debug`, `info`, `warn`, `error`. | `config` |
 | `INSTALLATION_REPLAY_WINDOW_SECONDS` | The replay-protection window for `X-GitHub-Delivery` per installation (per `system-design.md` § Queue and async model § Replay protection). Duplicate deliveries within the window short-circuit to `discarded_idempotent`. | `config` |
+| `ANTHROPIC_MODEL` | Optional override for the Anthropic adapter's deployment model. Unset means `claude-sonnet-5-5` (ADR-009 D11; the previous default `claude-3-5-sonnet-latest` is retired and returns 404). Read through the secret source like `OPENAI_MODEL`. Consumed only when `ANTHROPIC_API_KEY` is set. A repo `model: anthropic/<id>` still overrides it per request. See `docs/model-compatibility.md` § Anthropic. | `config` |
+| `ANTHROPIC_MAX_OUTPUT_TOKENS` | Optional output token budget for the Anthropic adapter, applied to every model. Unset: 4,096 for Claude 4.x and older and for unrecognized IDs; 16,384 for Claude 5.x, or when the repo's `provider_options.anthropic` enables thinking. Non-positive or non-numeric values are ignored. Values above about 21,000 need streaming on newer SDKs, which the adapter does not use. Consumed only when `ANTHROPIC_API_KEY` is set. See `docs/model-compatibility.md` § Output cap. | `config` |
+| `ANTHROPIC_TOOL_CHOICE` | Controls how the review tool is requested. `auto` (default) uses the per-model rule: Claude 5.x and thinking-enabled bags get the unforced request (`tool_choice: auto`, strict tool, one retry); everything else keeps forced choice. `forced` always forces the tool, which is a 400 on Opus 5.5, Sonnet 5.5 and Fable 5.1. `unforced` always uses the unforced request, for an alias in front of a 5.x model (pair it with `ANTHROPIC_MAX_OUTPUT_TOKENS=16384`). Invalid values are ignored. See `docs/model-compatibility.md` § Anthropic. | `config` |
 | `OPENAI_MODEL` | Optional override for the OpenAI adapter's default model (defaults to `gpt-6-luna`; was `gpt-4o`). The default is a reasoning-family model on `/responses`; set `OPENAI_MODEL=gpt-4o` to keep the classic `/chat/completions` behavior until its 2027-01-14 shutdown (see `docs/model-compatibility.md` § Default model). Consumed only when `OPENAI_API_KEY` is set. May also be set per-request via `request_shaping.model`. | `config` |
 | `OPENAI_BASE_URL` | Optional override for the OpenAI adapter's inference endpoint (defaults to `https://api.openai.com/v1`). Consumed only when `OPENAI_API_KEY` is set; useful for Azure OpenAI or a proxy gateway. | `config` |
 | `OPENAI_TOKEN_PARAM` | Controls which output-token cap parameter the OpenAI adapter sends per request. `auto` (default) applies a heuristic: `max_completion_tokens` for gpt-5*/o-series models, `max_tokens` for classic models (`gpt-4o`, `gpt-4`, `gpt-3.5-turbo`). Set to `max_tokens` or `max_completion_tokens` to override the heuristic — useful for proxy gateways that lag OpenAI's rollout or for misclassified future models. Invalid values are silently ignored and fall back to `auto`. Consumed only when `OPENAI_API_KEY` is set. | `config` |
@@ -94,7 +97,7 @@ Every variable is classified `secret`, `config`, or `tunable`. `secret` values a
 | `RETRY_TRANSIENT_BACKOFF_BASE_MS` | Initial backoff for transient retries (jittered). | `tunable` |
 | `RETRY_TRANSIENT_BACKOFF_MAX_MS` | Cap on backoff growth for transient retries. | `tunable` |
 | `RETRY_RATELIMIT_MAX_ATTEMPTS` | Maximum attempts for the **Rate-limited** retry class (`ProviderError.rate_limit`); honors `Retry-After` when provided. | `tunable` |
-| `MAX_TOKENS_PER_PR` | Per-PR token-cost ceiling proxy enforced by the active provider adapter (`packages/providers/anthropic` or `packages/providers/copilot`). | `tunable` |
+| `MAX_TOKENS_PER_PR` | Per-PR token-cost ceiling proxy enforced by the active provider adapter (`packages/providers/anthropic`, `packages/providers/copilot` or `packages/providers/openai`). Haiku 5.5 bills five times the price per token above 100,000 prompt tokens, so set this to `95000` or lower to keep every batch in the cheaper tier (see `docs/model-compatibility.md` § Anthropic, Long-prompt pricing). | `tunable` |
 | `MAX_TOKENS_PER_WINDOW_PER_INSTALLATION` | Per-installation token-cost ceiling proxy over a sliding window. | `tunable` |
 | `MAX_TOKENS_WINDOW_SECONDS` | Length of the sliding window for `MAX_TOKENS_PER_WINDOW_PER_INSTALLATION`. | `tunable` |
 | `OTEL_TRACES_SAMPLER_ARG` | Head-sample argument for the parent-based sampler (per `observability.md` § Sampling); a number in `[0,1]`. | `tunable` |
@@ -137,6 +140,10 @@ GITHUB_APP_WEBHOOK_SECRET=
 # Provider selection by precedence: ANTHROPIC_API_KEY, then COPILOT_API_KEY, then OPENAI_API_KEY.
 # Set exactly one for production-equivalent behavior.
 ANTHROPIC_API_KEY=
+# Optional Anthropic overrides; consumed only when ANTHROPIC_API_KEY is set.
+# ANTHROPIC_MODEL: default claude-sonnet-5-5
+# ANTHROPIC_MAX_OUTPUT_TOKENS: default 4096 Claude 4.x and older / 16384 Claude 5.x
+# ANTHROPIC_TOOL_CHOICE: auto (default) | forced | unforced
 COPILOT_API_KEY=
 OPENAI_API_KEY=
 

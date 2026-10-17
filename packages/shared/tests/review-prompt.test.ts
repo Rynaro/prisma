@@ -233,6 +233,26 @@ describe('renderPositiveFeedback', () => {
 });
 
 describe('buildToolInputSchema', () => {
+  it('shared tool schema bytes are pinned (OpenAI/Copilot wire)', () => {
+    // ADR-009 G-4: the shared schema is the OpenAI/Copilot wire body. The Anthropic
+    // strict copy is derived in the adapter and must never alter these bytes.
+    const BASE_DEFAULT =
+      '{"type":"object","additionalProperties":false,"required":["findings"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","line","severity","category","message","rationale","confidence"],"properties":{"path":{"type":"string","minLength":1},"line":{"type":"integer","minimum":1},"severity":{"type":"string","enum":["info","low","medium","high","critical"]},"category":{"type":"string","enum":["security","correctness","performance","tests","style","migration","dependency"]},"message":{"type":"string","minLength":1,"description":"A concise one-line headline (target ≤ 100 characters, hard cap 120) rendered verbatim as the bold title of the PR comment. State the problem only — put all reasoning, evidence, and detail in `rationale`."},"rationale":{"type":"string","minLength":1},"confidence":{"type":"number","minimum":0,"maximum":1},"suggested_fix":{"type":"string","minLength":1}}}}}}';
+    const BASE_MAX_ITEMS_3 =
+      '{"type":"object","additionalProperties":false,"required":["findings"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","line","severity","category","message","rationale","confidence"],"properties":{"path":{"type":"string","minLength":1},"line":{"type":"integer","minimum":1},"severity":{"type":"string","enum":["info","low","medium","high","critical"]},"category":{"type":"string","enum":["security","correctness","performance","tests","style","migration","dependency"]},"message":{"type":"string","minLength":1,"description":"A concise one-line headline (target ≤ 100 characters, hard cap 120) rendered verbatim as the bold title of the PR comment. State the problem only — put all reasoning, evidence, and detail in `rationale`."},"rationale":{"type":"string","minLength":1},"confidence":{"type":"number","minimum":0,"maximum":1},"suggested_fix":{"type":"string","minLength":1}}}},"highlights":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["message","rationale"],"properties":{"path":{"type":"string","minLength":1,"description":"Optional file this highlight refers to; MUST be one of the input files."},"message":{"type":"string","minLength":1,"maxLength":200,"description":"One line naming the good decision that was made in this diff."},"rationale":{"type":"string","minLength":1,"maxLength":500,"description":"Why that decision is good, grounded in the supplied hunks."}}},"maxItems":3}}}';
+    expect(JSON.stringify(buildToolInputSchema(undefined))).toBe(BASE_DEFAULT);
+    expect(JSON.stringify(buildToolInputSchema({ max_items: 3 }))).toBe(BASE_MAX_ITEMS_3);
+    for (const needle of [
+      '"minLength":1',
+      '"minimum":1',
+      '"maximum":1',
+      '"maxLength":200',
+      '"maxItems":3',
+    ]) {
+      expect(BASE_MAX_ITEMS_3).toContain(needle);
+    }
+  });
+
   it('tool input schema is byte-identical without positive feedback', () => {
     const legacy = {
       type: 'object',

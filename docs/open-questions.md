@@ -105,7 +105,7 @@ Entry shape: `ID`, `Question`, `Raised in`, `Blocking?`, `Owner`, `Target phase`
 - **Owner.** TBD.
 - **Target phase.** Phase 2 (resolved before contract tests are wired to a non-fake adapter).
 - **Resolution date.** 2026-04-30.
-- **Resolution.** Anthropic Claude (Claude 4-class model family) is the first reference LLM provider adapter. The exact model identifier is deferred to deployment configuration and is not pinned in source.
+- **Resolution.** Anthropic Claude (Claude 4-class model family) is the first reference LLM provider adapter. The exact model identifier is deferred to deployment configuration and is not pinned in source. Default model `claude-sonnet-5-5`, configurable via `ANTHROPIC_MODEL` (ADR-009 D11, ratified 2026-10-16); the Claude 5.x request shape is recorded in [ADR-009](architecture-decision-records/adr-009-anthropic-5x-model-family-compatibility.md).
 - **Rationale.** (a) Claude 4-class models offer strong tool-use and JSON-mode discipline that aligns with the Zod-validated boundary defined in ADR-002; (b) Claude's capability surface maps cleanly onto the `ProviderCapabilities` flag bag (structured-output mode, function/tool calling, deterministic-seed-equivalent behavior, declared max context); (c) the ADR-002 abstraction layer keeps the provider swappable, so this choice does not foreclose alternatives. Implementation rule: the Anthropic adapter lives in `packages/providers/anthropic` and must not export Anthropic-specific types or response shapes outside that package; downstream code only sees `ProviderReviewInput`, `ProviderReviewOutput`, `ProviderError`, and `ProviderCapabilities`.
 
 ### OQ-2 — Default values for publication caps and severity floor

@@ -24,7 +24,11 @@ import {
   runPipeline,
 } from '../../src/pipeline/index.js';
 import { type NoFindingsReasoningHint } from '../../src/pipeline/index.js';
-import { reasoningModelNoFindingsNotice } from '../../src/provider-notices.js';
+import {
+  declinedFilesNote,
+  reasoningModelNoFindingsNotice,
+  refusalNotice,
+} from '../../src/provider-notices.js';
 
 const REPO_ID: RepoIdentity = {
   owner: 'octocat',
@@ -2661,5 +2665,179 @@ describe('runPipeline — positive feedback + clean-review threading (S7)', () =
     const result = await runPipeline(makePayload(), deps);
     expect(result.outcome?.kind).toBe('oversized');
     expect(capturedExtras[0]).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-009 — Anthropic remedies, refusals and the Claude empty-review notice
+// ---------------------------------------------------------------------------
+
+const REFUSAL_MESSAGE = 'anthropic declined the request: stop_reason refusal (category: cyber)';
+
+const captureAllNotices = (deps: OrchestratorDeps): Array<string | undefined> => {
+  const captured: Array<string | undefined> = [];
+  deps.hooks = {
+    ...deps.hooks,
+    runPublish: async (ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice) => {
+      captured.push(notice);
+      const { publish: realPublish } = await import('@prisma-bot/github');
+      return realPublish(ranked, cfgArg, ctx, publisherDepsArg, roundIntent, notice);
+    },
+  };
+  return captured;
+};
+
+describe('runPipeline — Anthropic remedies and refusals (ADR-009)', () => {
+  it('capability error: an anthropic provider gets the Anthropic remedy (ADR-009 D10)', async () => {
+    const script = [
+      {
+        kind: 'error' as const,
+        error: {
+          kind: 'capability' as const,
+          code: 'not_found_error',
+          message: 'model: claude-3-5-sonnet-latest',
+        },
+      },
+    ];
+    const anthropicDeps = buildDeps({ provider: new FakeProvider({ name: 'anthropic', script }) });
+    const anthropicNotices = captureAllNotices(anthropicDeps);
+    await expect(runPipeline(makePayload(), anthropicDeps)).rejects.toBeInstanceOf(
+      ProviderErrorThrowable,
+    );
+    expect(anthropicNotices[0]).toContain('Remedy: the configured Claude model ID was not found');
+
+    // The same error from a non-Anthropic provider name gets no Anthropic remedy.
+    const otherDeps = buildDeps({ provider: new FakeProvider({ script }) });
+    const otherNotices = captureAllNotices(otherDeps);
+    await expect(runPipeline(makePayload(), otherDeps)).rejects.toBeInstanceOf(
+      ProviderErrorThrowable,
+    );
+    expect(otherNotices[0]).not.toContain('Claude model ID was not found');
+  });
+
+  it('refusal -> refusal notice, succeeded, no retry; plain schema_validation has no notice', async () => {
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: { kind: 'schema_validation', code: 'refusal', message: REFUSAL_MESSAGE },
+        },
+      ],
+    });
+    const logger = buildLogger();
+    const deps = buildDeps({ provider, logger });
+    const notices = captureAllNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('malformed_provider_output');
+    expect(notices).toEqual([refusalNotice(['cyber'])]);
+    const errorEvent = logger.events.find((e) => e.event === 'provider.error');
+    expect(errorEvent?.fields.code).toBe('refusal');
+
+    const plainDeps = buildDeps({
+      provider: new FakeProvider({
+        script: [
+          { kind: 'error', error: { kind: 'schema_validation', message: 'malformed output' } },
+        ],
+      }),
+    });
+    const plainNotices = captureAllNotices(plainDeps);
+    await runPipeline(makePayload(), plainDeps);
+    expect(plainNotices[0]).toBeUndefined();
+  });
+
+  const chunkedConfig = () =>
+    RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      comment_cap: { per_pr: 10, per_file: 5 },
+      chunking: {
+        enabled: true,
+        max_files: 200,
+        max_changed_lines: 12000,
+        max_provider_calls_per_pr: 6,
+        call_token_budget: 1,
+      },
+    });
+
+  it('chunked: a refused batch gets its own declined-files note; other batches still publish', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const provider = new FakeProvider({
+      script: [
+        {
+          kind: 'error',
+          error: { kind: 'schema_validation', code: 'refusal', message: REFUSAL_MESSAGE },
+        },
+        {
+          kind: 'output',
+          output: { findings: [makeFindingFixture({ path: 'src/file1.ts', line: 11 })] },
+        },
+      ],
+    });
+    const spy = buildOctokitSpy();
+    const deps = buildDeps({
+      provider,
+      octokitSpy: spy,
+      snapshot: snap,
+      config: chunkedConfig(),
+    });
+    const notices = captureAllNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('review_complete_chunked');
+    expect(spy.reviewCommentsCreate).toHaveLength(1);
+    expect(notices[0]).toContain(declinedFilesNote(['src/file0.ts'], ['cyber']));
+    expect(notices[0]).not.toContain('per-PR call budget');
+  });
+
+  it('chunked: every batch refused -> malformed_provider_output with the refusal notice', async () => {
+    const snap = buildChunkableSnapshot(2);
+    const refusal = {
+      kind: 'error' as const,
+      error: {
+        kind: 'schema_validation' as const,
+        code: 'refusal',
+        message: REFUSAL_MESSAGE,
+      },
+    };
+    const provider = new FakeProvider({ script: [refusal, refusal] });
+    const deps = buildDeps({ provider, snapshot: snap, config: chunkedConfig() });
+    const notices = captureAllNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.state).toBe('succeeded');
+    expect(result.outcome?.kind).toBe('malformed_provider_output');
+    expect(notices[0]).toBe(refusalNotice(['cyber']));
+  });
+});
+
+describe('runPipeline — Claude empty-review notice (ADR-009 D12)', () => {
+  it('Claude 5.x adaptive-thinking model gets the Claude notice; claude-haiku-4-5 gets none', async () => {
+    const config = RepoConfigSchema.parse({
+      mode: 'summary-plus-inline',
+      model: 'anthropic/claude-sonnet-5-5',
+    });
+    const deps = buildDeps({
+      provider: new FakeProvider({ script: [{ kind: 'output', output: { findings: [] } }] }),
+      config,
+    });
+    const notices = captureAllNotices(deps);
+    const result = await runPipeline(makePayload(), deps);
+    expect(result.outcome).toEqual({
+      kind: 'no_findings',
+      detail: { reasoning_model_empty: true, model: 'claude-sonnet-5-5' },
+    });
+    expect(notices[0]).toBe(`ℹ️ ${reasoningModelNoFindingsNotice('claude-sonnet-5-5')}`);
+    expect(notices[0]).toContain('adaptive thinking');
+
+    const haikuDeps = buildDeps({
+      provider: new FakeProvider({ script: [{ kind: 'output', output: { findings: [] } }] }),
+      config: RepoConfigSchema.parse({
+        mode: 'summary-plus-inline',
+        model: 'anthropic/claude-haiku-4-5',
+      }),
+    });
+    const haikuNotices = captureAllNotices(haikuDeps);
+    const haiku = await runPipeline(makePayload(), haikuDeps);
+    expect(haiku.outcome?.kind).toBe('review_complete');
+    expect(haikuNotices[0] ?? '').not.toContain('adaptive thinking');
   });
 });

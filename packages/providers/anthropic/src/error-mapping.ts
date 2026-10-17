@@ -14,9 +14,16 @@ import type { ProviderError } from '@prisma-bot/shared';
  *   - network / timeout / connection           → `transport`, retryable: true
  *   - HTTP 401, 403                             → `auth`
  *   - HTTP 429                                  → `rate_limit` (with retry_after_ms)
- *   - HTTP 5xx                                  → `transport`, retryable: true
- *   - HTTP 400 with invalid model / capability  → `capability`
+ *   - HTTP 5xx (incl. 529)                      → `transport`, retryable: true
+ *                                                 (+ retry_after_ms when present)
+ *   - HTTP 404 (any body)                       → `capability`, code `not_found_error`
+ *   - HTTP 400 `invalid_request_error`          → `capability`, code `invalid_request_error`
+ *   - any other HTTP 400                        → `transport`, retryable: false
  *   - anything else                             → `transport`, retryable: false
+ *
+ * ADR-009 D10: every `invalid_request_error` is non-transient regardless of
+ * wording (the old keyword heuristic missed "prompt is too long", billing
+ * 400s, ...), and a 404 is a retired/misspelled model ID.
  */
 
 const SAFE_MESSAGE_FALLBACK = 'anthropic provider error';
@@ -200,20 +207,21 @@ export function mapAnthropicError(err: unknown): ProviderError {
   }
 
   if (status !== undefined && status >= 500 && status < 600) {
-    return { kind: 'transport', message: safe, retryable: true };
+    const out: ProviderError = { kind: 'transport', message: safe, retryable: true };
+    const retryAfterMs = readRetryAfterMs(err);
+    if (retryAfterMs !== undefined) {
+      out.retry_after_ms = retryAfterMs;
+    }
+    return out;
+  }
+
+  if (status === 404) {
+    return { kind: 'capability', message: safe, code: 'not_found_error' };
   }
 
   if (status === 400) {
-    const type = readErrorType(err);
-    const lowerMessage = (rawMessage ?? '').toLowerCase();
-    const looksLikeCapability =
-      type === 'invalid_request_error' &&
-      (lowerMessage.includes('model') ||
-        lowerMessage.includes('unsupported') ||
-        lowerMessage.includes('capability') ||
-        lowerMessage.includes('tool'));
-    if (looksLikeCapability) {
-      return { kind: 'capability', message: safe };
+    if (readErrorType(err) === 'invalid_request_error') {
+      return { kind: 'capability', message: safe, code: 'invalid_request_error' };
     }
     return { kind: 'transport', message: safe, retryable: false };
   }

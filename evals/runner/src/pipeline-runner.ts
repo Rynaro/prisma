@@ -150,10 +150,12 @@ const toFakeStep = (step: ProviderScriptStep): FakeStep => {
     return { kind: 'error', error: value };
   }
   if (step.error.kind === 'schema_validation') {
-    const value: ProviderError =
-      step.error.zod_issues !== undefined
-        ? { kind: 'schema_validation', message, zod_issues: step.error.zod_issues }
-        : { kind: 'schema_validation', message };
+    const value: ProviderError = {
+      kind: 'schema_validation',
+      message,
+      ...(step.error.zod_issues !== undefined ? { zod_issues: step.error.zod_issues } : {}),
+      ...(step.error.code !== undefined ? { code: step.error.code } : {}),
+    };
     return { kind: 'error', error: value };
   }
   if (step.error.kind === 'auth') {

@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   capabilityRemedyNotice,
+  declinedFilesNote,
+  isRefusalError,
   reasoningModelNoFindingsNotice,
+  refusalCategoryFromMessage,
+  refusalNotice,
   withCapabilityRemedy,
 } from '../src/provider-notices.js';
 
@@ -152,5 +156,131 @@ describe('reasoningModelNoFindingsNotice', () => {
 
   it('carries no leading emoji (call sites add their own prefix)', () => {
     expect(reasoningModelNoFindingsNotice('o3').startsWith('`o3`')).toBe(true);
+  });
+});
+
+describe('capabilityRemedyNotice — Anthropic (ADR-009 D10)', () => {
+  const meta = (code?: string) => ({ provider: 'anthropic', ...(code ? { code } : {}) });
+  const TOOL_CHOICE_400 = 'tool_choice: type "tool" and "any" are not supported for this model.';
+  const THINKING_400 =
+    '"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.';
+  const EFFORT_400 =
+    "output_config.effort 'xhigh' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.";
+  const ROLE_400 = "role 'system' is not supported on this model";
+  const TOO_LONG_400 = 'prompt is too long: 1048576 tokens > 1000000 maximum';
+  const CREDIT_400 = 'Your credit balance is too low to access the Anthropic API.';
+
+  it('a not_found_error names ANTHROPIC_MODEL and claude-sonnet-5-5', () => {
+    const remedy = capabilityRemedyNotice(
+      'model: claude-3-5-sonnet-latest',
+      meta('not_found_error'),
+    );
+    expect(remedy).toContain('ANTHROPIC_MODEL');
+    expect(remedy).toContain('claude-sonnet-5-5');
+    expect(remedy?.startsWith('Remedy:')).toBe(true);
+  });
+
+  it('a forced tool_choice 400 names ANTHROPIC_TOOL_CHOICE=unforced', () => {
+    expect(capabilityRemedyNotice(TOOL_CHOICE_400, meta('invalid_request_error'))).toContain(
+      'ANTHROPIC_TOOL_CHOICE=unforced',
+    );
+  });
+
+  it('the thinking.type 400 gets the thinking remedy, not the effort one', () => {
+    const remedy = capabilityRemedyNotice(THINKING_400, meta('invalid_request_error'));
+    expect(remedy).toContain('remove `provider_options.anthropic.thinking`');
+    expect(remedy).not.toContain('does not support the configured `effort`');
+  });
+
+  it('the effort 400 gets the effort remedy', () => {
+    expect(capabilityRemedyNotice(EFFORT_400, meta('invalid_request_error'))).toContain(
+      'does not support the configured `effort`',
+    );
+  });
+
+  it('a sampling 400 gets the sampling remedy', () => {
+    expect(
+      capabilityRemedyNotice('temperature: Input should be 1', meta('invalid_request_error')),
+    ).toContain('remove `temperature` / `top_p` / `top_k`');
+  });
+
+  it('prompt is too long gets the budget remedy', () => {
+    expect(capabilityRemedyNotice(TOO_LONG_400, meta('invalid_request_error'))).toContain(
+      'MAX_TOKENS_PER_PR',
+    );
+  });
+
+  it('role/system and credit-balance 400s get no remedy (generic notice stands)', () => {
+    expect(capabilityRemedyNotice(ROLE_400, meta('invalid_request_error'))).toBeUndefined();
+    expect(capabilityRemedyNotice(CREDIT_400, meta('invalid_request_error'))).toBeUndefined();
+  });
+
+  it('negatives: other providers and OpenAI remedies are unaffected', () => {
+    expect(capabilityRemedyNotice(TOOL_CHOICE_400, { provider: 'openai' })).toBeUndefined();
+    const incident = capabilityRemedyNotice(INCIDENT_MESSAGE);
+    expect(capabilityRemedyNotice(INCIDENT_MESSAGE, { provider: 'anthropic' })).not.toBe(incident);
+    expect(capabilityRemedyNotice(INCIDENT_MESSAGE, { provider: 'anthropic' })).toBeUndefined();
+    expect(capabilityRemedyNotice(INCIDENT_MESSAGE, { provider: 'openai' })).toBe(incident);
+    expect(
+      capabilityRemedyNotice('model: x', { provider: 'anthropic', code: 'not_found_error' }),
+    ).not.toContain('OPENAI_');
+  });
+});
+
+describe('refusal notices (ADR-009 D8)', () => {
+  it('refusalCategoryFromMessage extracts the category, else none', () => {
+    expect(
+      refusalCategoryFromMessage(
+        'anthropic declined the request: stop_reason refusal (category: cyber)',
+      ),
+    ).toBe('cyber');
+    expect(refusalCategoryFromMessage('malformed output')).toBe('none');
+  });
+
+  it('isRefusalError keys on schema_validation + code refusal', () => {
+    expect(isRefusalError({ kind: 'schema_validation', code: 'refusal', message: 'x' })).toBe(true);
+    expect(isRefusalError({ kind: 'schema_validation', message: 'x' })).toBe(false);
+    expect(isRefusalError({ kind: 'auth', message: 'x' })).toBe(false);
+  });
+
+  it('refusalNotice names the classifier, the category, and says it is not a config error', () => {
+    const notice = refusalNotice(['cyber']);
+    expect(notice).toContain('safety classifier');
+    expect(notice).toContain('`cyber`');
+    expect(notice).toContain('not a configuration error');
+    expect(notice).toContain('`review` command');
+    expect(refusalNotice([])).toContain('`none`');
+  });
+
+  it('declinedFilesNote starts with a space and lists the paths', () => {
+    const note = declinedFilesNote(['a.ts', 'b.ts'], ['cyber']);
+    expect(note.startsWith(' ')).toBe(true);
+    expect(note).toContain('a.ts, b.ts');
+    expect(note).toContain('`cyber`');
+    expect(note).not.toContain('max_provider_calls_per_pr');
+  });
+});
+
+describe('reasoningModelNoFindingsNotice — Claude (ADR-009 D12)', () => {
+  it('Claude 5.x gets the adaptive-thinking text', () => {
+    const notice = reasoningModelNoFindingsNotice('claude-sonnet-5-5');
+    for (const needle of [
+      'adaptive thinking',
+      'provider.usage',
+      'output_tokens',
+      'ANTHROPIC_TOOL_CHOICE=forced',
+      'provider_options.anthropic.effort',
+      'docs/model-compatibility.md',
+    ]) {
+      expect(notice).toContain(needle);
+    }
+    expect(notice).not.toContain('reasoning_tokens');
+    expect(notice).not.toContain('OPENAI_');
+  });
+
+  it('the OpenAI text is byte-identical', () => {
+    expect(reasoningModelNoFindingsNotice('gpt-6-astra')).toBe(
+      "`gpt-6-astra` is a reasoning model and reported no findings. If you expected some, check the `provider.usage` log event: `reasoning_tokens` near zero means the model skipped reasoning (do not set `reasoning_effort: 'none'`; unset `OPENAI_TOOL_CHOICE=forced`); a large count with an empty result usually means a tight output cap — raise `OPENAI_MAX_OUTPUT_TOKENS` (≥ 25,000 on GPT-6) or the effort. See docs/model-compatibility.md.",
+    );
   });
 });
