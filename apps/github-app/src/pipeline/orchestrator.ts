@@ -41,11 +41,26 @@ import {
   type RankedFindings,
   type RejectionLogEntry,
   type RepoConfig,
+  isClaudeAdaptiveThinkingModel,
   isReasoningModel,
   parseModelSlug,
 } from '@prisma-bot/shared';
 import type { TokenizerFamily } from '@prisma-bot/shared';
-import { reasoningModelNoFindingsNotice, withCapabilityRemedy } from '../provider-notices.js';
+import {
+  declinedFilesNote,
+  isRefusalError,
+  reasoningModelNoFindingsNotice,
+  refusalCategoryFromMessage,
+  refusalNotice,
+  withCapabilityRemedy,
+} from '../provider-notices.js';
+
+/**
+ * Models that think before answering and so can return an empty review when
+ * thinking is skipped: the OpenAI reasoning family OR Claude 5.x+ (ADR-009 D12).
+ */
+const thinksBeforeAnswering = (m: string): boolean =>
+  isReasoningModel(m) || isClaudeAdaptiveThinkingModel(m);
 
 /**
  * `runPipeline` — single-function orchestrator that wires the Phase 5.1–5.5
@@ -395,7 +410,7 @@ const buildEmptyReviewNotice = (
   }
   let notice = `ℹ️ No issues were reported at or above your configured inline floors (severity ≥ ${sevFloor}, confidence ≥ ${confFloor.toFixed(2)}). The PR looks clean to the model, or the bar is set high for it — lower \`confidence_floor.inline\` / \`severity_floor.inline\` if you expected more.`;
   const slug = parseModelSlug(config.model, config.provider);
-  if (slug.model !== undefined && isReasoningModel(slug.model)) {
+  if (slug.model !== undefined && thinksBeforeAnswering(slug.model)) {
     notice += ` ${reasoningModelNoFindingsNotice(slug.model)}`;
   }
   return notice;
@@ -413,6 +428,9 @@ const providerErrorDetailFields = (value: ProviderError): Record<string, unknown
   if (value.kind === 'capability') {
     if (value.param !== undefined) fields.param = value.param;
     if (value.code !== undefined) fields.code = value.code;
+  }
+  if (value.kind === 'schema_validation' && value.code !== undefined) {
+    fields.code = value.code;
   }
   if (
     (value.kind === 'transport' || value.kind === 'rate_limit') &&
@@ -825,7 +843,7 @@ export const runPipeline = async (
         ? withCapabilityRemedy(
             `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the model setting in \`.github/review-bot.yml\` (or the provider's model env var). This is not a PR-size limit.`,
             safeMsg,
-            { param: err.value.param, code: err.value.code },
+            { param: err.value.param, code: err.value.code, provider: deps.provider.name },
           )
         : `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key.`;
     try {
@@ -993,6 +1011,9 @@ export const runPipeline = async (
     const allHighlights: ProviderReviewOutputHighlight[] = [];
     const failedBatches: number[] = [];
     const truncatedFiles: string[] = [];
+    // ADR-009 D8: files of batches the provider's safety classifier declined.
+    const declinedFiles: string[] = [];
+    const declinedCategories: string[] = [];
 
     // Phase 4: files that could not be reviewed because of call-budget drops
     // (from batchPlan.notReviewed) or guard-trip exhaustion. Both surfaces
@@ -1272,6 +1293,13 @@ export const runPipeline = async (
           if (kind === 'schema_validation') {
             // Partial failure: drop this batch's findings, continue.
             // The merged output will be marked partial in the notice.
+            if (isRefusalError(batchErr.value)) {
+              for (const f of batch) {
+                if (!declinedFiles.includes(f.path)) declinedFiles.push(f.path);
+              }
+              const category = refusalCategoryFromMessage(batchErr.value.message);
+              if (!declinedCategories.includes(category)) declinedCategories.push(category);
+            }
             failedBatches.push(batchIdx);
             continue;
           }
@@ -1318,6 +1346,7 @@ export const runPipeline = async (
         reasonMessage: 'review unavailable: all batches returned malformed output',
         rejections: [rejection],
         resolvedHeadSha: deps.resolvedHeadSha,
+        ...(declinedFiles.length > 0 ? { notice: refusalNotice(declinedCategories) } : {}),
       });
       logger.emit('publisher.published', {
         ...trace,
@@ -1376,7 +1405,9 @@ export const runPipeline = async (
       notReviewedFiles.length > 0
         ? `Reviewed the ${batchPlan.batches.length} highest-risk section(s) (large PR).`
         : `Reviewed in ${batchPlan.batches.length} section(s) (large PR).`;
-    const chunkedNotice = `${reviewedSectionsPrefix}${partialNote}${skippedFileNote}${truncatedFileNote}${notReviewedNote}`;
+    const declinedFileNote =
+      declinedFiles.length > 0 ? declinedFilesNote(declinedFiles, declinedCategories) : '';
+    const chunkedNotice = `${reviewedSectionsPrefix}${partialNote}${skippedFileNote}${truncatedFileNote}${declinedFileNote}${notReviewedNote}`;
 
     // Feed the merged output into the EXISTING validator → ranker → publisher
     // tail. This is unchanged — dedupe and caps apply to the whole PR.
@@ -1531,6 +1562,10 @@ export const runPipeline = async (
           reasonMessage: 'review unavailable: provider returned malformed output',
           rejections: [rejection],
           resolvedHeadSha: deps.resolvedHeadSha,
+          // ADR-009 D8: a refusal is not a configuration error; say so.
+          ...(isRefusalError(err.value)
+            ? { notice: refusalNotice([refusalCategoryFromMessage(err.value.message)]) }
+            : {}),
         });
         logger.emit('publisher.published', {
           ...trace,
@@ -1583,7 +1618,7 @@ export const runPipeline = async (
     const slug = parseModelSlug(deps.config.model, deps.config.provider);
     const resolvedModelName = slug.model;
 
-    const isReasoning = resolvedModelName !== undefined && isReasoningModel(resolvedModelName);
+    const isReasoning = resolvedModelName !== undefined && thinksBeforeAnswering(resolvedModelName);
 
     if (isReasoning && resolvedModelName !== undefined) {
       // Build the reasoning-model notice text.

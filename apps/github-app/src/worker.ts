@@ -10,7 +10,13 @@ import {
   buildReviewCommentsClient,
   envSecretSource,
 } from '@prisma-bot/github';
-import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/provider-anthropic';
+import {
+  ANTHROPIC_DEFAULT_MODEL,
+  AnthropicProvider,
+  type AnthropicProviderOptions,
+  type AnthropicUsageTelemetry,
+  resolveAnthropicDefaultMaxOutputTokens,
+} from '@prisma-bot/provider-anthropic';
 import { CopilotProvider, type CopilotProviderOptions } from '@prisma-bot/provider-copilot';
 import { FakeProvider } from '@prisma-bot/provider-fake';
 import {
@@ -39,7 +45,13 @@ import {
   type RepoLookup,
   runPipeline,
 } from './pipeline/index.js';
-import { reasoningModelNoFindingsNotice, withCapabilityRemedy } from './provider-notices.js';
+import {
+  isRefusalError,
+  reasoningModelNoFindingsNotice,
+  refusalCategoryFromMessage,
+  refusalNotice,
+  withCapabilityRemedy,
+} from './provider-notices.js';
 import { BullMqJobConsumer, type JobOutcome } from './queue/index.js';
 import { fetchRepoConfig, resolvePrivilegedApproval } from './repo-config.js';
 import { resolveRepoIdentity } from './repo-identity.js';
@@ -51,7 +63,10 @@ import { resolveRepoIdentity } from './repo-identity.js';
  *
  * Provider selection (deterministic, in precedence order):
  *   1. If `ANTHROPIC_API_KEY` is set → `AnthropicProvider` (OQ-1 reference
- *      adapter; preserves existing behavior).
+ *      adapter; preserves existing behavior). Honors optional
+ *      `ANTHROPIC_MODEL` (default `claude-sonnet-5-5`),
+ *      `ANTHROPIC_MAX_OUTPUT_TOKENS` and `ANTHROPIC_TOOL_CHOICE`
+ *      (`auto` | `forced` | `unforced`; ADR-009).
  *   2. Else if `COPILOT_API_KEY` is set → `CopilotProvider` (GitHub Models
  *      inference endpoint; per `.spectra/plans/copilot-vendor/spec.yaml`).
  *      Honors optional `COPILOT_MODEL` and `COPILOT_BASE_URL` overrides.
@@ -124,8 +139,9 @@ function readPositiveIntEnv(envVarName: string): number | undefined {
  * `limitsFor` → `providerLimits.maxOutputTokens`, the output the orchestrator
  * reserves when planning batches (reserved output = the max of
  * `chunking.reserved_output_tokens`, this cap and `generation.max_output_tokens`;
- * ADR-008 D7). The OpenAI arm reads its env var through `readPositiveIntEnv`
- * instead, because its adapter resolves the default per request.
+ * ADR-008 D7). The OpenAI and Anthropic arms read their env var through
+ * `readPositiveIntEnv` instead, because their adapters resolve the default per
+ * request.
  *
  * Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
  */
@@ -182,19 +198,36 @@ const buildProvider = async (
 ): Promise<{ provider: Provider; providerLimits: ProviderLimits }> => {
   const anthropicKey = await tryGetSecret(secretSource, 'ANTHROPIC_API_KEY');
   if (anthropicKey !== undefined) {
-    // ANTHROPIC_MAX_OUTPUT_TOKENS — optional output token budget override.
-    // Defaults to 4096 (= chunking.reserved_output_tokens default). Raise for
-    // finding-dense repos where the response truncates.
-    // Per chunking-stability-spec.md § Phase 1 "New/changed config knobs".
-    const maxOutputTokens = resolveMaxOutputTokens('ANTHROPIC_MAX_OUTPUT_TOKENS', 4096);
-    const opts: AnthropicProviderOptions = {
-      apiKey: anthropicKey,
-      maxOutputTokens,
-    };
+    const opts: AnthropicProviderOptions = { apiKey: anthropicKey };
     if (VALID_MAX_TOKENS_PER_PR !== undefined) {
       opts.maxTokensPerCall = VALID_MAX_TOKENS_PER_PR;
     }
-    log('worker.provider.selected', { provider: 'anthropic' });
+    // ANTHROPIC_MODEL — optional deployment model (ADR-009 D11). Unset means
+    // the adapter default (`claude-sonnet-5-5`). A repo `model: anthropic/<id>`
+    // still overrides it per request.
+    const model = await tryGetSecret(secretSource, 'ANTHROPIC_MODEL');
+    if (model !== undefined) opts.model = model;
+    // ANTHROPIC_MAX_OUTPUT_TOKENS — optional output token budget override that
+    // applies to every model. Unset: the adapter resolves 4096 (Claude 4.x and
+    // older) or 16384 (Claude 5.x) per request.
+    const envMaxOutputTokens = readPositiveIntEnv('ANTHROPIC_MAX_OUTPUT_TOKENS');
+    if (envMaxOutputTokens !== undefined) opts.maxOutputTokens = envMaxOutputTokens;
+    const maxOutputTokens =
+      envMaxOutputTokens ??
+      resolveAnthropicDefaultMaxOutputTokens(model ?? ANTHROPIC_DEFAULT_MODEL);
+    // ANTHROPIC_TOOL_CHOICE — auto (default; per-model rule) | forced | unforced.
+    // Invalid values are ignored.
+    const toolChoiceRaw = await tryGetSecret(secretSource, 'ANTHROPIC_TOOL_CHOICE');
+    if (toolChoiceRaw === 'auto' || toolChoiceRaw === 'forced' || toolChoiceRaw === 'unforced') {
+      opts.toolChoiceStyle = toolChoiceRaw;
+    }
+    opts.onUsage = (usage: AnthropicUsageTelemetry): void => {
+      log('provider.usage', { provider: 'anthropic', ...usage });
+    };
+    log('worker.provider.selected', {
+      provider: 'anthropic',
+      model: model ?? ANTHROPIC_DEFAULT_MODEL,
+    });
     return {
       provider: new AnthropicProvider(opts),
       providerLimits: limitsFor(maxOutputTokens),
@@ -861,7 +894,7 @@ const start = async (): Promise<void> => {
             providerReply = withCapabilityRemedy(
               `⚠️ Review unavailable — the AI provider rejected the request (capability: ${safeMsg}). This usually means the configured model is unavailable to your API key or incompatible with this integration. Check the \`model\` setting in \`.github/review-bot.yml\` (or the provider's model env var). This is **not** a PR-size limit — the check run shows the same notice.`,
               safeMsg,
-              { param: err.value.param, code: err.value.code },
+              { param: err.value.param, code: err.value.code, provider: provider.name },
             );
           } else {
             providerReply = `⚠️ Review unavailable — the AI provider rejected the credentials (authentication failure: ${safeMsg}). Check the provider API key. The **AI Code Review** check run shows the same notice.`;
@@ -872,6 +905,22 @@ const start = async (): Promise<void> => {
               repo,
               issue_number: pr_number,
               body: providerReply,
+            });
+          } catch {
+            // fail-open
+          }
+          throw err;
+        }
+        if (isRefusalError(err.value)) {
+          // ADR-009 D8: the safety classifier declined. Not a configuration
+          // error and not worth the generic "Sorry…" text; classifyRetry still
+          // maps schema_validation to non_transient, so this is not re-run.
+          try {
+            await issueComments.createReply({
+              owner,
+              repo,
+              issue_number: pr_number,
+              body: refusalNotice([refusalCategoryFromMessage(err.value.message)]),
             });
           } catch {
             // fail-open
