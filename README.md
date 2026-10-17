@@ -34,7 +34,7 @@ make eval
 cat evals/last-report.md
 ```
 
-**Expected result:** `24 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
+**Expected result:** `26 passed, 0 failed`. The report shows the per-scenario published-Check shape the bot would produce in production — rendered against the deterministic `FakeProvider`, no live API key required.
 
 Smoke test (end-to-end stack — app, worker, Redis, signed webhook, teardown; ~45 seconds):
 
@@ -67,7 +67,7 @@ For non-interactive deployment (answers from environment variables):
 bash deploy/install.sh --yes
 ```
 
-Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.15.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
+Images are published to `ghcr.io/rynaro/prisma-bot` (`v0.16.0`, `latest`, immutable `sha-<short>` per commit). Full reference: [docs/deployment.md](./docs/deployment.md).
 
 Prefer Kamal? An alternative single-host path using Kamal + kamal-proxy (native TLS) with a
 Redis accessory is documented in [docs/deployment-kamal.md](./docs/deployment-kamal.md). The
@@ -217,9 +217,9 @@ Allowed values: `@` (default), `$`, `!`, `/`. With `command_marker: "$"`, write 
 
 ## Status
 
-**v0.15.0** — GPT-6 / GPT-6.1 compatibility (#43). The OpenAI provider now supports `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol` and `chat-latest`; the default model changes from `gpt-4o` to `gpt-6-luna` (set `OPENAI_MODEL=gpt-4o` to opt out until its 2027-01-14 snapshot shutdown). The output cap is family-aware (32,768 reasoning / 4096 classic, env var wins) and the input ceiling is per-model (922,000 for gpt-6 / 6.1, 272,000 for `chat-latest`, 128,000 otherwise). Sampling parameters are dropped for reasoning models unless effort is explicitly `none`, and `unsupported_value` / `unsupported_parameter` errors surface with `param`-aware remedies.
+**v0.16.0** — Claude 5.x compatibility (#45). The Anthropic provider now supports `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5` and `claude-fable-5-1`. The default model changes from the retired `claude-3-5-sonnet-latest` (which returned 404) to `claude-sonnet-5-5`; set `ANTHROPIC_MODEL` to choose another, and per-repo `model: anthropic/…` is now honored. Claude 5.x reviews use `auto` tool choice with a strict tool schema and one retry instead of the forced tool call these models reject, a 16,384-token output cap (4096 for older models; `ANTHROPIC_MAX_OUTPUT_TOKENS` wins) and a 1M-token window. Safety refusals get their own notice and are never retried, and retired-model 404s and rejected requests now surface as `capability` errors with remedies. See [ADR-009](./docs/architecture-decision-records/adr-009-anthropic-5x-model-family-compatibility.md) and [docs/model-compatibility.md § Anthropic](./docs/model-compatibility.md#anthropic).
 
-- 1134 tests across 58 files, all passing · 24/24 deterministic eval scenarios PASS
+- 1312 tests across 58 files, all passing · 26/26 deterministic eval scenarios PASS
 - Containerized CI (typecheck, lint, test) on every push and PR
 - TypeScript · Node >=22 <23 · pnpm 9.15.0 workspace monorepo
 - Container images: `ghcr.io/rynaro/prisma-bot`
