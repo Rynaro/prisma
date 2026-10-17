@@ -229,6 +229,8 @@ const ProviderErrorFixtureSchema = z
     retry_after_ms: z.number().int().nonnegative().optional(),
     missing_capability: z.string().min(1).optional(),
     zod_issues: z.array(z.string()).optional(),
+    /** Vendor-neutral sub-classification on `schema_validation` (e.g. `refusal`; ADR-009 D8). */
+    code: z.string().min(1).optional(),
   })
   .strict();
 

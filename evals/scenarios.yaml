@@ -63,6 +63,14 @@ scenarios:
     name: "GPT-6 reasoning model (gpt-6-astra) returns empty findings — shared notice emitted"
     fixture: fixtures/reasoning-model-empty-review-gpt6.yaml
     tags: ["reasoning_model_compatibility", "false_positive_rate"]
+  - id: thinking-model-empty-review-claude
+    name: "Claude 5.x adaptive-thinking model (claude-sonnet-5-5) returns empty findings — Claude notice emitted"
+    fixture: fixtures/thinking-model-empty-review-claude.yaml
+    tags: ["reasoning_model_compatibility", "false_positive_rate"]
+  - id: refusal-declined-review
+    name: "Provider safety classifier declines the review — refusal notice emitted"
+    fixture: fixtures/refusal-declined-review.yaml
+    tags: ["provider_schema_failure_handling"]
   - id: positive-feedback-highlights
     name: "Positive feedback: highlights capped at max_items"
     fixture: fixtures/positive-feedback-highlights.yaml
