@@ -1,7 +1,11 @@
 import type { ProviderReviewInput } from '@prisma-bot/shared';
-import { IMMUTABLE_SYSTEM_PROMPT, renderUserMessage } from '@prisma-bot/shared';
+import {
+  IMMUTABLE_SYSTEM_PROMPT,
+  buildToolInputSchema,
+  renderUserMessage,
+} from '@prisma-bot/shared';
 import { describe, expect, it } from 'vitest';
-import { buildPrompt } from '../src/prompt.js';
+import { buildPrompt, toAnthropicStrictSchema } from '../src/prompt.js';
 
 const inputBase: ProviderReviewInput = {
   files: [
@@ -114,5 +118,77 @@ describe('buildPrompt', () => {
       properties: { highlights?: { maxItems: number } };
     };
     expect(schema.properties.highlights?.maxItems).toBe(2);
+  });
+});
+
+describe('toAnthropicStrictSchema (ADR-009 D2)', () => {
+  const schemas = [
+    ['without positive feedback', undefined],
+    ['with positive feedback', { max_items: 3 }],
+  ] as const;
+
+  it.each(schemas)('%s: drops length/range keywords and keeps the structure', (_l, feedback) => {
+    const source = buildToolInputSchema(feedback);
+    const before = structuredClone(source);
+    const strict = toAnthropicStrictSchema(source);
+    const text = JSON.stringify(strict);
+    for (const dropped of ['minLength', 'maxLength', 'minimum', 'maximum', 'maxItems']) {
+      expect(text).not.toContain(dropped);
+    }
+    for (const kept of [
+      '"type"',
+      '"properties"',
+      '"required"',
+      '"enum"',
+      '"description"',
+      '"items"',
+    ]) {
+      expect(text).toContain(kept);
+    }
+    // Input is never mutated.
+    expect(source).toEqual(before);
+    const finding = (
+      strict as { properties: { findings: { items: { properties: Record<string, unknown> } } } }
+    ).properties.findings.items.properties;
+    expect(Object.keys(finding)).toEqual(
+      Object.keys(
+        (
+          before as unknown as {
+            properties: { findings: { items: { properties: Record<string, unknown> } } };
+          }
+        ).properties.findings.items.properties,
+      ),
+    );
+    expect(text).toContain('"info","low","medium","high","critical"');
+    expect(text).toContain('"security","correctness"');
+    if (feedback !== undefined) {
+      expect(text).toContain('"highlights"');
+    }
+  });
+
+  it('every object node has additionalProperties: false', () => {
+    const walk = (node: unknown): void => {
+      if (typeof node !== 'object' || node === null) return;
+      const record = node as Record<string, unknown>;
+      if (record.type === 'object') {
+        expect(record.additionalProperties).toBe(false);
+      }
+      for (const value of Object.values(record)) walk(value);
+    };
+    walk(toAnthropicStrictSchema(buildToolInputSchema({ max_items: 3 })));
+  });
+
+  it('adds additionalProperties: false to an object node that lacks it', () => {
+    expect(
+      toAnthropicStrictSchema({ type: 'object', properties: { a: { type: 'object' } } }),
+    ).toEqual({
+      type: 'object',
+      properties: { a: { type: 'object', additionalProperties: false } },
+      additionalProperties: false,
+    });
+  });
+
+  it('drops an unknown keyword (allowlist, not denylist)', () => {
+    expect(toAnthropicStrictSchema({ type: 'string', pattern: 'x' })).toEqual({ type: 'string' });
   });
 });
