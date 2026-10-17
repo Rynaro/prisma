@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" width="1280" height="320" role="img" aria-labelledby="t d">
+  <title id="t">prisma</title>
+  <desc id="d">Vendor-independent AI code review for GitHub PRs</desc>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M210 70 L314 250 L106 250 Z" stroke="#1f2328" stroke-width="6"/>
+    <line x1="24" y1="160" x2="158" y2="160" stroke="#8c959f" stroke-width="5" stroke-linecap="round"/>
+    <line x1="262" y1="160" x2="600" y2="60" stroke="#cf222e" stroke-width="5" stroke-linecap="round"/>
+    <line x1="262" y1="160" x2="600" y2="100" stroke="#bc4c00" stroke-width="5" stroke-linecap="round"/>
+    <line x1="262" y1="160" x2="600" y2="140" stroke="#9a6700" stroke-width="5" stroke-linecap="round"/>
+    <line x1="262" y1="160" x2="600" y2="180" stroke="#1a7f37" stroke-width="5" stroke-linecap="round"/>
+    <line x1="262" y1="160" x2="600" y2="220" stroke="#0969da" stroke-width="5" stroke-linecap="round"/>
+    <line x1="262" y1="160" x2="600" y2="260" stroke="#8250df" stroke-width="5" stroke-linecap="round"/>
+  </g>
+  <g font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1f2328">
+    <text x="700" y="168" font-size="96" font-weight="700" letter-spacing="-2">prisma</text>
+    <text x="703" y="210" font-size="22" font-weight="400" fill="#59636e">Vendor-independent AI code review for GitHub PRs</text>
+  </g>
+</svg>
