@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+  <title id="title">Prisma mark</title>
+  <desc id="desc">A geometric P with a transparent open counter.</desc>
+  <g transform="translate(16 16)">
+    <path fill="#3D5FDB" fill-rule="evenodd" d="M16 120V32L40 8H88L112 32V64L88 88H48V120Z M48 32H80L88 40V56L80 64H48Z"/>
+    <path fill="#25B8C8" d="M40 8H88L112 32L88 40L80 32H48Z"/>
+    <path fill="#755AD6" d="M112 32V64L88 88L80 64L88 56V40Z"/>
+    <path fill="#5452B8" d="M88 88H48V64H80Z"/>
+  </g>
+</svg>

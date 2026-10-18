@@ -1,7 +1,10 @@
 <div align="center">
 
 <p>
-  <picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/prisma-banner-dark.svg"><img alt="prisma — vendor-independent AI code review" src="docs/assets/prisma-banner-light.svg" width="720"></picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/prisma-banner-dark.svg">
+    <img alt="prisma — vendor-independent AI code review" src="docs/assets/prisma-banner-light.svg" width="560">
+  </picture>
 </p>
 
 **Vendor-independent AI code review for GitHub pull requests.**

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+  <title id="title">Prisma monochrome mark for light backgrounds</title>
+  <desc id="desc">A geometric P with a transparent open counter.</desc>
+  <g transform="translate(16 16)">
+    <path fill="#182338" fill-rule="evenodd" d="M16 120V32L40 8H88L112 32V64L88 88H48V120Z M48 32H80L88 40V56L80 64H48Z"/>
+  </g>
+</svg>
